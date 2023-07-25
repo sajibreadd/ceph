@@ -1459,8 +1459,9 @@ TEST(BlueFS, test_log_runway_2) {
   ASSERT_EQ(0, fs.mount());
   ASSERT_EQ(0, fs.maybe_verify_layout({ BlueFS::BDEV_DB, false, false }));
   // longer transaction than current runway
-  std::string longdir(max_log_runway * 2, 'a');
-  std::string longfile(max_log_runway * 2, 'b');
+  size_t name_length = max_log_runway * 2;
+  std::string longdir(name_length, 'a');
+  std::string longfile(name_length, 'b');
   {
     BlueFS::FileWriter *h;
     ASSERT_EQ(0, fs.mkdir(longdir));

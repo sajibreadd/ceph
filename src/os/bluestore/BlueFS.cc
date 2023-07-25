@@ -3155,17 +3155,16 @@ void BlueFS::_extend_log(uint64_t amount) {
   }
   ll.release();
   uint64_t allocated_before_extension = log.writer->file->fnode.get_allocated();
+  vselector->sub_usage(log.writer->file->vselector_hint, log.writer->file->fnode);
   amount = round_up_to(amount, super.block_size);
   int r = _allocate(
       vselector->select_prefer_bdev(log.writer->file->vselector_hint),
       amount,
       0,
-      &log.writer->file->fnode,
-      [&](const bluefs_extent_t& e) {
-        vselector->add_usage(log.writer->file->vselector_hint, e);
-      });
+      &log.writer->file->fnode);
   ceph_assert(r == 0);
   dout(10) << "extended log by 0x" << std::hex << amount << " bytes " << dendl;
+  vselector->add_usage(log.writer->file->vselector_hint, log.writer->file->fnode);
 
   bluefs_transaction_t log_extend_transaction;
   log_extend_transaction.seq = log.t.seq;
@@ -3178,13 +3177,12 @@ void BlueFS::_extend_log(uint64_t amount) {
   _pad_bl(bl, super.block_size);
   log.writer->append(bl);
   ceph_assert(allocated_before_extension >= log.writer->get_effective_write_pos());
+  log.t.seq = log.seq_live;
 
   // before sync_core we advance the seq
   {
     std::unique_lock<ceph::mutex> l(dirty.lock);
-    dirty.seq_live++;
-    log.seq_live++;
-    log.t.seq++;
+    _log_advance_seq();
   }
 }
 
