@@ -1496,6 +1496,7 @@ void PgScrubber::set_op_parameters(requested_scrub_t& request)
 
 void PgScrubber::scrub_compare_maps()
 {
+  dout(0) << "scrub_compare_maps--> " << m_pg->pg_id << "yes" << dendl;
   dout(10) << __func__ << " has maps, analyzing" << dendl;
 
   // construct authoritative scrub map for type-specific scrubbing
@@ -1903,6 +1904,8 @@ void PgScrubber::scrub_finish()
   dout(10) << __func__ << " before flags: " << m_flags
 	   << ". repair state: " << (state_test(PG_STATE_REPAIR) ? "repair" : "no-repair")
 	   << ". deep_scrub_on_error: " << m_flags.deep_scrub_on_error << dendl;
+  dout(0) << "m_omap_stats.large_omap_objects-->" << 
+      m_omap_stats.large_omap_objects << dendl;
 
   ceph_assert(m_pg->is_locked());
   ceph_assert(is_queued_or_active());
@@ -2005,13 +2008,19 @@ void PgScrubber::scrub_finish()
 	    history.last_clean_scrub_stamp = now;
 	  stats.stats.sum.num_shallow_scrub_errors = m_shallow_errors;
 	  stats.stats.sum.num_deep_scrub_errors = m_deep_errors;
+    dout(0) << "stats.stats.sum.num_large_omap_objects-->" << 
+      stats.stats.sum.num_large_omap_objects << dendl;
 	  stats.stats.sum.num_large_omap_objects = m_omap_stats.large_omap_objects;
 	  stats.stats.sum.num_omap_bytes = m_omap_stats.omap_bytes;
 	  stats.stats.sum.num_omap_keys = m_omap_stats.omap_keys;
 	  dout(25) << "scrub_finish shard " << m_pg_whoami
 		   << " num_omap_bytes = " << stats.stats.sum.num_omap_bytes
 		   << " num_omap_keys = " << stats.stats.sum.num_omap_keys << dendl;
+    dout(0) << "m_omap_stats.large_omap_objects, stats.stats.sum.num_large_omap_objects-->" << 
+      m_omap_stats.large_omap_objects << " " << stats.stats.sum.num_large_omap_objects << dendl;
 	} else {
+    dout(0) << "got error--> m_omap_stats.large_omap_objects, stats.stats.sum.num_large_omap_objects-->" << 
+      m_omap_stats.large_omap_objects << " " << stats.stats.sum.num_large_omap_objects << dendl;
 	  stats.stats.sum.num_shallow_scrub_errors = m_shallow_errors;
 	  // XXX: last_clean_scrub_stamp doesn't mean the pg is not inconsistent
 	  // because of deep-scrub errors
@@ -2045,12 +2054,15 @@ void PgScrubber::scrub_finish()
   }
 
   cleanup_on_finish();
+  dout(0) << "Done cleanup" << dendl;
   if (do_auto_scrub) {
     request_rescrubbing(m_pg->m_planned_scrub);
   }
 
   if (m_pg->is_active() && m_pg->is_primary()) {
+    dout(0) << "Sharing pg info" << dendl;
     m_pg->recovery_state.share_pg_info();
+    dout(0) << "Shared pg info" << dendl;
   }
 }
 

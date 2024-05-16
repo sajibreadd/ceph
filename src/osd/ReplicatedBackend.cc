@@ -975,6 +975,7 @@ Message * ReplicatedBackend::generate_subop(
     tid, at_version);
 
   // ship resulting transaction, log entries, and pg_stats
+  dout(0) << "ReplicatedBackend::generate_subop--> " << pinfo.pgid << ", " << peer << dendl;
   if (!parent->should_send_op(peer, soid)) {
     ObjectStore::Transaction t;
     encode(t, wr->get_data());

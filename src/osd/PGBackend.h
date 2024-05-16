@@ -626,7 +626,7 @@ typedef std::shared_ptr<const OSDMap> OSDMapRef;
      const std::map<pg_shard_t,ScrubMap*> &maps,
      const std::set<hobject_t> &master_set,
      omap_stat_t& omap_stats,
-     std::ostream &warnstream) const;
+     std::ostream &warnstream);
 
    static PGBackend *build_pg_backend(
      const pg_pool_t &pool,

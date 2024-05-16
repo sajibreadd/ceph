@@ -824,7 +824,7 @@ void PG::publish_stats_to_osd()
 {
   if (!is_primary())
     return;
-
+  dout(0) << "publishing stats--> " << pg_id << ", " << pg_whoami.osd << dendl;
   ceph_assert(m_scrubber);
   recovery_state.update_stats_wo_resched(
     [scrubber = m_scrubber.get()](pg_history_t& hist,
@@ -836,6 +836,13 @@ void PG::publish_stats_to_osd()
   auto stats =
     recovery_state.prepare_stats_for_publish(pg_stats_publish, unstable_stats);
   if (stats) {
+    if (stats.has_value()) {
+      dout(0) << "here is the stats--> " << pg_id << ", " 
+      << stats.value().stats.sum.num_large_omap_objects << dendl;
+    }
+    else {
+      dout(0) << "stat doesn't have value" << dendl;
+    }
     pg_stats_publish = std::move(stats);
   }
 }

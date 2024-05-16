@@ -2493,7 +2493,7 @@ void PrimaryLogPG::do_op(OpRequestRef& op)
   }
 
   op->mark_started();
-
+  dout(0) << "executing--> " << info.pgid.pgid << dendl;
   execute_ctx(ctx);
   utime_t prepare_latency = ceph_clock_now();
   prepare_latency -= op->get_dequeued_time();

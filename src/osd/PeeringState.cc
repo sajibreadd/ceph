@@ -554,6 +554,58 @@ bool PeeringState::should_restart_peering(
   return false;
 }
 
+void PeeringState::printStackTrace() {
+  constexpr int max_frames = 64;
+  void* addrlist[max_frames + 1];
+  int addrlen = backtrace(addrlist, sizeof(addrlist) / sizeof(void*));
+  if (addrlen == 0) {
+    dout(0) << "No stack trace available." << dendl;
+    return;
+  }
+
+  // Resolve addresses to function names
+  char** symbollist = backtrace_symbols(addrlist, addrlen);
+  char* demangled_name;
+  for (int i = 0; i < addrlen; ++i) { // Start from 0 to include current function
+    char* begin_name = nullptr;
+    char* begin_offset = nullptr;
+    char* end_offset = nullptr;
+
+    // Find parentheses and +address offset surrounding the mangled name
+    for (char* p = symbollist[i]; *p; ++p) {
+      if (*p == '(') begin_name = p;
+      else if (*p == '+') begin_offset = p;
+      else if (*p == ')' && begin_offset) {
+        end_offset = p;
+        break;
+      }
+    }
+
+    if (begin_name && begin_offset && end_offset && begin_name < begin_offset) {
+      *begin_name++ = '\0';
+      *begin_offset++ = '\0';
+      *end_offset = '\0';
+
+      // Demangle the mangled name
+      int status;
+      demangled_name = abi::__cxa_demangle(begin_name, nullptr, nullptr, &status);
+      if (status == 0 && demangled_name != nullptr) {
+        std::cout << "  " << symbollist[i] << ": " << demangled_name << "+" << begin_offset << std::endl;
+        free(demangled_name);
+      } 
+      else {
+        // Demangling failed, fallback to mangled name
+        dout(0) << "  " << symbollist[i] << ": " << begin_name << "+" << begin_offset << dendl;
+      }
+    } 
+    else {
+      // Unable to parse line, print raw stack trace line
+      dout(0) << "  " << symbollist[i] << dendl;
+    }
+  }
+  free(symbollist);
+}
+
 /* Called before initializing peering during advance_map */
 void PeeringState::start_peering_interval(
   const OSDMapRef lastmap,
@@ -561,6 +613,13 @@ void PeeringState::start_peering_interval(
   const vector<int>& newacting, int new_acting_primary,
   ObjectStore::Transaction &t)
 {
+  dout(0) << "start_peering_interval1--> " << info.pgid << "yes " 
+  << info.stats.stats.sum.num_large_omap_objects << dendl;
+  dout(0) << "printing newup--> " << newup << dendl;;
+  dout(0) << "printing new_up_primary--> " << new_up_primary << dendl;
+  dout(0) << "printing newacting--> " << newacting << dendl;;
+  dout(0) << "printing new_acting_primary--> " << new_acting_primary << dendl;
+  // printStackTrace();
   const OSDMapRef osdmap = get_osdmap();
 
   set_last_peering_reset();
@@ -744,6 +803,8 @@ void PeeringState::start_peering_interval(
     psdout(10) << " acting empty, but i am up[0], clearing pg_temp" << dendl;
     pl->queue_want_pg_temp(acting);
   }
+  dout(0) << "start_peering_interval2--> " << info.pgid << "yes " 
+  << info.stats.stats.sum.num_large_omap_objects << dendl;
 }
 
 void PeeringState::on_new_interval()

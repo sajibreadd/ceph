@@ -250,6 +250,7 @@ struct PeeringCtxWrapper {
 /* Encapsulates PG recovery process */
 class PeeringState : public MissingLoc::MappingInfo {
 public:
+  void printStackTrace();
   struct PeeringListener : public EpochSource {
     /// Prepare t with written information
     virtual void prepare_write(

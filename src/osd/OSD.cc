@@ -2702,6 +2702,7 @@ void OSD::asok_command(
 
   else if (prefix == "status") {
     lock_guard l(osd_lock);
+    print_stats();
     f->open_object_section("status");
     f->dump_stream("cluster_fsid") << superblock.cluster_fsid;
     f->dump_stream("osd_fsid") << superblock.osd_fsid;
@@ -4392,11 +4393,43 @@ PerfCounters* OSD::create_recoverystate_perf()
   return recoverystate_perf;
 }
 
+void OSD::print_stats() {
+  // MPGStats* mpg_stats = collect_pg_stats();
+  // dout(0) << "printing pg stats starts--->" << dendl;
+  // for (auto& [key, val] : mpg_stats->pg_stat) {
+  //   dout(0) << "[key, val] of pg-->" << key << "......" 
+  //     << val.stats.sum.num_large_omap_objects << dendl;
+  // }
+  std::shared_lock l{map_lock};
+  dout(0) << "printing stats-->" << dendl;
+
+  osd_stat_t cur_stat = service.get_osd_stat();
+  cur_stat.os_perf_stat = store->get_cur_stats();
+
+  auto m = new MPGStats(monc->get_fsid(), get_osdmap_epoch());
+  m->osd_stat = cur_stat;
+
+  std::lock_guard lec{min_last_epoch_clean_lock};
+  min_last_epoch_clean = get_osdmap_epoch();
+  min_last_epoch_clean_pgs.clear();
+
+  vector<PGRef> pgs;
+  _get_pgs(&pgs);
+  dout(0) << "printing size of pgs vector--> " << pgs.size() << dendl;
+  for (auto& pg : pgs) {
+    pg->with_pg_stats([&](const pg_stat_t& s, epoch_t lec) {
+      dout(0) << "pg stats--> " << pg->pg_id.pgid << ", " 
+      << s.stats.sum.num_large_omap_objects << dendl;
+    });
+  }
+}
+
 int OSD::shutdown()
 {
   // vstart overwrites osd_fast_shutdown value in the conf file -> force the value here!
   //cct->_conf->osd_fast_shutdown = true;
-
+  dout(0) << "rebuild successfull" << dendl;
+  print_stats();
   dout(0) << "Fast Shutdown: - cct->_conf->osd_fast_shutdown = "
 	  << cct->_conf->osd_fast_shutdown
 	  << ", null-fm = " << store->has_null_manager() << dendl;
@@ -7838,6 +7871,11 @@ MPGStats* OSD::collect_pg_stats()
 	min_last_epoch_clean_pgs.push_back(pg->pg_id.pgid);
       });
   }
+  dout(0) << "sending pg stats to monitor--->" << dendl;
+  for (auto& [key, val] : m->pg_stat) {
+    dout(0) << "[key, val] of pg-->" << key << "......" 
+      << val.stats.sum.num_large_omap_objects << dendl;
+  }
   store_statfs_t st;
   bool per_pool_stats = true;
   bool per_pool_omap_stats = false;
@@ -9902,12 +9940,14 @@ bool OSD::op_is_discardable(const MOSDOp *op)
 
 void OSD::enqueue_op(spg_t pg, OpRequestRef&& op, epoch_t epoch)
 {
+  dout(0) << "equeuing op for pg--> " << pg << "yes" << dendl;
   const utime_t stamp = op->get_req()->get_recv_stamp();
   const utime_t latency = ceph_clock_now() - stamp;
   const unsigned priority = op->get_req()->get_priority();
   const int cost = op->get_req()->get_cost();
   const uint64_t owner = op->get_req()->get_source().num();
   const int type = op->get_req()->get_type();
+  dout(0) << "reading reuqest--> " << pg << "yes--> " << *op->get_req() << dendl;
 
   dout(15) << "enqueue_op " << op << " prio " << priority
            << " type " << type
@@ -9931,11 +9971,13 @@ void OSD::enqueue_op(spg_t pg, OpRequestRef&& op, epoch_t epoch)
   op->mark_queued_for_pg();
   logger->tinc(l_osd_op_before_queue_op_lat, latency);
   if (PGRecoveryMsg::is_recovery_msg(op)) {
+    dout(0) << "is_recovery_msg--> " << pg << dendl;
     op_shardedwq.queue(
       OpSchedulerItem(
         unique_ptr<OpSchedulerItem::OpQueueable>(new PGRecoveryMsg(pg, std::move(op))),
         cost, priority, stamp, owner, epoch));
   } else {
+    dout(0) << "not is_recovery_msg--> " << pg << dendl;
     op_shardedwq.queue(
       OpSchedulerItem(
         unique_ptr<OpSchedulerItem::OpQueueable>(new PGOpItem(pg, std::move(op))),

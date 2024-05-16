@@ -1280,8 +1280,10 @@ out:
 void PGBackend::be_omap_checks(const map<pg_shard_t,ScrubMap*> &maps,
   const set<hobject_t> &master_set,
   omap_stat_t& omap_stats,
-  ostream &warnstream) const
+  ostream &warnstream)
 {
+  dout(0) << "be_omap_checks--> omap_stats.large_omap_objects-->" 
+    << omap_stats.large_omap_objects << dendl;
   bool needs_omap_check = false;
   for (const auto& map : maps) {
     if (map.second->has_large_omap_object_errors || map.second->has_omap_keys) {
@@ -1313,6 +1315,12 @@ void PGBackend::be_omap_checks(const map<pg_shard_t,ScrubMap*> &maps,
         osdmap->map_to_pg(k.pool, k.oid.name, k.get_key(), k.nspace, &pg);
         pg_t mpg = osdmap->raw_pg_to_pg(pg);
         omap_stats.large_omap_objects++;
+        dout(0) << "Large omap object found. Object: " << k
+                   << " PG: " << pg << " (" << mpg << ")"
+                   << "large_omap_objects: " << omap_stats.large_omap_objects
+                   << " Key count: " << obj.large_omap_object_key_count
+                   << " Size (bytes): " << obj.large_omap_object_value_size
+                   << dendl;
         warnstream << "Large omap object found. Object: " << k
                    << " PG: " << pg << " (" << mpg << ")"
                    << " Key count: " << obj.large_omap_object_key_count

@@ -1082,6 +1082,7 @@ public:
                           const std::set <std::string> &changed) override;
   void update_log_config();
   void check_config();
+  void print_stats();
 
 protected:
 
