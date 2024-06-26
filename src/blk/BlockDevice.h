@@ -151,6 +151,7 @@ public:
   CephContext* cct;
   typedef void (*aio_callback_t)(void *handle, void *aio);
   void collect_alerts(osd_alert_list_t& alerts, const std::string& device_name);
+  void add_stalled_read_event();
 
 private:
   ceph::mutex ioc_reap_lock = ceph::make_mutex("BlockDevice::ioc_reap_lock");
@@ -193,7 +194,6 @@ protected:
   // of the drive.  The zones 524-52155 are sequential zones.
   uint64_t conventional_region_size = 0;
   uint64_t zone_size = 0;
-  void add_stalled_read_event();
 
 public:
   aio_callback_t aio_callback;
