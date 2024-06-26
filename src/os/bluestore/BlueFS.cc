@@ -93,6 +93,13 @@ public:
 	r = admin_socket->register_command("bluefs debug_inject_read_zeros", hook,
 					   "Injects 8K zeros into next BlueFS read. Debug only.");
 	ceph_assert(r == 0);
+        r = admin_socket->register_command("bluefs debug_inject_slow_read "
+                                           "name=device,type=CephString,req=true "
+                                           "name=count,type=CephInt,req=true "
+                                           "name=delay,type=CephFloat,req=true",
+                                           hook,
+                                           "Generate artificial slow read events to device.");
+        ceph_assert(r == 0);
       }
     }
     return hook;
@@ -175,6 +182,30 @@ private:
       f->flush(out);
     } else if (command == "bluefs debug_inject_read_zeros") {
       bluefs->inject_read_zeros++;
+    } else if (command == "bluefs debug_inject_slow_read") {
+      std::string device;
+      int64_t count;
+      double delay;
+      cmd_getval(cmdmap, "device", device);
+      cmd_getval(cmdmap, "count", count);
+      cmd_getval(cmdmap, "delay", delay);
+      std::vector<std::string> devnames{"wal","db","slow"};
+      std::chrono::duration<double> delay_time(delay);
+      for (size_t d = 0; d < 3; d++) {
+        if (devnames[d] == device) {
+          if (bluefs->bdev[d]) {
+            for (int64_t i = 0; i < count; i++) {
+              if (i != 0) std::this_thread::sleep_for(delay_time);
+              bluefs->bdev[d]->add_stalled_read_event();
+            }
+          } else {
+            errss << "Device " << device << " does not exist" << std::endl;
+            return -EINVAL;
+          }
+          return 0;
+        }
+      }
+      errss << "Device must be one of " << devnames << std::endl;
     } else {
       errss << "Invalid command" << std::endl;
       return -ENOSYS;
