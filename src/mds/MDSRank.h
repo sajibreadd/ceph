@@ -45,6 +45,10 @@
 #include "osdc/Journaler.h"
 #include "MDSMetaRequest.h"
 
+#ifdef WITH_CEPHFS_NOTIFICATION
+#include "MDSKafka.h"
+#endif
+
 // Full .h import instead of forward declaration for PerfCounter, for the
 // benefit of those including this header and using MDSRank::logger
 #include "common/perf_counters.h"
@@ -638,6 +642,12 @@ class MDSRank {
     bool standby_replaying = false;  // true if current replay pass is in standby-replay mode
     uint64_t extraordinary_events_dump_interval = 0;
     double inject_journal_corrupt_dentry_first = 0.0;
+protected:
+
+#ifdef WITH_CEPHFS_NOTIFICATION
+    void send_notification_info_to_peers(const ref_t<Message>& m);
+#endif
+
 private:
     bool send_status = true;
 
@@ -649,6 +659,10 @@ private:
     inline static const std::string SCRUB_STATUS_KEY = "scrub status";
 
     bool client_eviction_dump = false;
+
+#ifdef WITH_CEPHFS_NOTIFICATION
+    bool is_notification_info(const cref_t<Message>& m);
+#endif
 
     void get_task_status(std::map<std::string, std::string> *status);
     void schedule_update_timer_task();
