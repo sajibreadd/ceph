@@ -37,6 +37,11 @@ using namespace std::literals::string_view_literals;
 #include "Mutation.h"
 #include "MDSContext.h"
 
+#ifdef WITH_CEPHFS_NOTIFICATION
+#include "MDSKafka.h"
+#endif
+#include "MDSNotificationManager.h"
+
 class OSDMap;
 class LogEvent;
 class EMetaBlob;
@@ -121,6 +126,14 @@ public:
   time last_recalled() const {
     return last_recall_state;
   }
+
+#ifdef WITH_CEPHFS_NOTIFICATION
+  int add_kafka_topic(const std::string &topic_name,
+                              const connection_t &connection);
+  int remove_kafka_topic(const std::string& topic_name);
+  int add_udp_endpoint(const std::string& name, const std::string& ip, int port);
+  int remove_udp_endpoint(const std::string& name);
+#endif
 
   void handle_client_session(const cref_t<MClientSession> &m);
   void _session_logged(Session *session, uint64_t state_seq, bool open, version_t pv,
@@ -525,6 +538,7 @@ private:
   MDCache *mdcache;
   MDLog *mdlog;
   PerfCounters *logger = nullptr;
+  std::unique_ptr <MDSNotificationManager> notification_manager;
 
   // OSDMap full status, used to generate CEPHFS_ENOSPC on some operations
   bool is_full = false;
