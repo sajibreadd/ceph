@@ -37,6 +37,7 @@ using namespace std::literals::string_view_literals;
 #include "Mutation.h"
 #include "MDSContext.h"
 
+// class MDSNotificationManager;
 class OSDMap;
 class LogEvent;
 class EMetaBlob;

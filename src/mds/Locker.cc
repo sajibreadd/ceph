@@ -93,7 +93,7 @@ void Locker::dispatch(const cref_t<Message> &m)
   case CEPH_MSG_CLIENT_CAPS:
     handle_client_caps(ref_cast<MClientCaps>(m));
     break;
-  case CEPH_MSG_CLIENT_CAPRELEASE:
+  case CEPH_MSG_CLIENT_CAPRELEASE: 
     handle_client_cap_release(ref_cast<MClientCapRelease>(m));
     break;
   case CEPH_MSG_CLIENT_LEASE:
@@ -4027,11 +4027,13 @@ bool Locker::_do_cap_update(CInode *in, Capability *cap,
 			    const cref_t<MClientCaps> &m, const ref_t<MClientCaps> &ack,
 			    bool *need_flush)
 {
-  dout(10) << "_do_cap_update dirty " << ccap_string(dirty)
+  dout(1) << "_do_cap_update dirty " << ccap_string(dirty)
 	   << " issued " << ccap_string(cap ? cap->issued() : 0)
 	   << " wanted " << ccap_string(cap ? cap->wanted() : 0)
 	   << " on " << *in << dendl;
   ceph_assert(in->is_auth());
+  mds->notification_manager->push_notification(mds->get_nodeid(), in,
+                                               CEPH_MDS_NOTIFY_MODIFY, false);
   client_t client = m->get_source().num();
   const auto& latest = in->get_projected_inode();
 
@@ -4040,7 +4042,6 @@ bool Locker::_do_cap_update(CInode *in, Capability *cap,
   bool change_max = false;
   uint64_t old_max = latest->get_client_range(client);
   uint64_t new_max = old_max;
-  
   if (in->is_file()) {
     bool forced_change_max = false;
     dout(20) << "inode is file" << dendl;

@@ -552,8 +552,9 @@ MDSRank::MDSRank(
 
   server = new Server(this, &metrics_handler);
   locker = new Locker(this, mdcache);
-
+  notification_manager = std::make_unique<MDSNotificationManager>(this);
   quiesce_db_manager.reset(new QuiesceDbManager());
+
 
   _heartbeat_reset_grace = g_conf().get_val<uint64_t>("mds_heartbeat_reset_grace");
   heartbeat_grace = g_conf().get_val<double>("mds_heartbeat_grace");
@@ -1066,10 +1067,13 @@ bool MDSRank::_dispatch(const cref_t<Message> &m, bool new_msg)
   if (quiesce_dispatch(m)) {
     return true;
   }
-
   if (is_stale_message(m)) {
     return true;
   }
+  if (is_notification_info(m)) {
+    return true;
+  }
+
   // do not proceed if this message cannot be handled
   if (!is_valid_message(m)) {
     return false;
@@ -1173,6 +1177,26 @@ bool MDSRank::_dispatch(const cref_t<Message> &m, bool new_msg)
 
   update_mlogger();
   return true;
+}
+
+void MDSRank::send_to_peers(const ref_t<Message> &m) {
+  set<mds_rank_t> up;
+  get_mds_map()->get_up_mds_set(up);
+  for (const auto &r : up) {
+    if (r == get_nodeid()) {
+      continue;
+    }
+    send_message_mds(m, r);
+  }
+}
+
+bool MDSRank::is_notification_info(const cref_t<Message> &m) {
+  if (m->get_type() == MSG_MDS_NOTIFICATION_INFO_KAFKA_TOPIC ||
+      m->get_type() == MSG_MDS_NOTIFICATION_INFO_UDP_ENDPOINT) {
+    notification_manager->dispatch(m);
+    return true;
+  }
+  return false;
 }
 
 void MDSRank::update_mlogger()
@@ -1473,7 +1497,6 @@ private:
   mds_rank_t who;
   ref_t<Message> m;
 };
-
 
 int MDSRank::send_message_mds(const ref_t<Message>& m, mds_rank_t mds)
 {
@@ -2160,6 +2183,7 @@ void MDSRank::active_start()
   finish_contexts(g_ceph_context, waiting_for_active);  // kick waiters
 
   quiesce_agent_setup();
+  notification_manager->init();
 }
 
 void MDSRank::recovery_done(int oldstate)
@@ -2453,6 +2477,7 @@ void MDSRankDispatcher::handle_mds_map(
         ceph_assert(oldstate == MDSMap::STATE_ACTIVE);
         stopping_start();
       }
+
     }
   }
 
@@ -3098,6 +3123,49 @@ void MDSRankDispatcher::handle_asok_command(
   } else if (command == "quiesce db") {
     command_quiesce_db(cmdmap, on_finish);
     return;
+  } else if (command == "add_topic") {
+    std::string endpoint_name;
+    std::string topic_name, broker, username;
+    std::string password;
+    bool use_ssl;
+    std::optional<std::string> ca_location, mechanism;
+    cmd_getval(cmdmap, "topic_name", topic_name);
+    cmd_getval(cmdmap, "endpoint_name", endpoint_name);
+    cmd_getval(cmdmap, "broker", broker);
+    if (!cmd_getval(cmdmap, "use_ssl", use_ssl)) {
+      use_ssl = false;
+    }
+    cmd_getval(cmdmap, "username", username);
+    cmd_getval(cmdmap, "password", password);
+    std::string ca, mch;
+    if (cmd_getval(cmdmap, "ca_location", ca)) {
+      ca_location = ca;
+    }
+    if (cmd_getval(cmdmap, "mechanism", mch)) {
+      mechanism = mch;
+    }
+    r = notification_manager->add_kafka_topic(
+        topic_name, endpoint_name, broker, use_ssl, username, password,
+        ca_location, mechanism, true, true);
+  } else if (command == "remove_topic") {
+    std::string topic_name, endpoint_name;
+    cmd_getval(cmdmap, "topic_name", topic_name);
+    cmd_getval(cmdmap, "endpoint_name", endpoint_name);
+    r = notification_manager->remove_kafka_topic(topic_name, endpoint_name,
+                                                 true, true);
+  }
+  else if (command == "add_udp_endpoint") {
+    std::string ip, name;
+    int64_t port;
+    cmd_getval(cmdmap, "entity", name);
+    cmd_getval(cmdmap, "ip", ip);
+    cmd_getval(cmdmap, "port", port);
+    r = notification_manager->add_udp_endpoint(name, ip, (int)port, true, true);
+  }
+  else if (command == "remove_udp_endpoint") {
+    std::string name;
+    cmd_getval(cmdmap, "entity", name);
+    r = notification_manager->remove_udp_endpoint(name, true, true);
   } else {
     r = -CEPHFS_ENOSYS;
   }
