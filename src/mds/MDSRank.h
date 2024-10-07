@@ -265,6 +265,10 @@ class MDSRank {
     uint64_t get_global_id() const {
       return monc->get_global_id();
     }
+    
+#ifdef WITH_CEPHFS_NOTIFICATION
+    void send_notification_info_to_peers(const ref_t<Message>& m);
+#endif
 
     // Daemon lifetime functions: these guys break the abstraction
     // and call up into the parent MDSDaemon instance.  It's kind
@@ -663,11 +667,6 @@ class MDSRank {
     bool standby_replaying = false;  // true if current replay pass is in standby-replay mode
     uint64_t extraordinary_events_dump_interval = 0;
     double inject_journal_corrupt_dentry_first = 0.0;
-protected:
-
-#ifdef WITH_CEPHFS_NOTIFICATION
-    void send_notification_info_to_peers(const ref_t<Message>& m);
-#endif
 
 private:
     bool send_status = true;

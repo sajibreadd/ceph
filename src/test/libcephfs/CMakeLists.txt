@@ -11,6 +11,9 @@ if(WITH_LIBCEPHFS)
     deleg.cc
     monconfig.cc
   )
+  if (WITH_CEPHFS_NOTIFICATION)
+    target_sources(ceph_test_libcephfs PRIVATE notification_endpoint_api.cc)
+  endif()
   target_link_libraries(ceph_test_libcephfs
     ceph-common
     cephfs

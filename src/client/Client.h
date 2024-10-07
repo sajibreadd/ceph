@@ -400,6 +400,19 @@ public:
   int unlinkat(int dirfd, const char *relpath, int flags, const UserPerm& perm);
   int rename(const char *from, const char *to, const UserPerm& perm, std::string alternate_name="");
 
+#ifdef WITH_CEPHFS_NOTIFICATION
+  // notifications
+  int add_kafka_topic(const char *topic_name, const char *broker,
+                            bool use_ssl, const char *user,
+                            const char *password, const char *ca_location,
+                            const char *mechanism, const UserPerm &perm);
+  int remove_kafka_topic(const char* topic_name,
+                               const UserPerm &perm);
+  int add_udp_endpoint(const char* name, const char* ip,
+                             int port, const UserPerm &perm);
+  int remove_udp_endpoint(const char* name, const UserPerm &perm);
+#endif
+
   // dirs
   int mkdir(const char *path, mode_t mode, const UserPerm& perm, std::string alternate_name="");
   int mkdirat(int dirfd, const char *relpath, mode_t mode, const UserPerm& perm,
