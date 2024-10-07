@@ -1198,11 +1198,7 @@ bool MDSRank::is_notification_info(const cref_t<Message> &m) {
       server->remove_kafka_topic(req->topic_name);
     }
     return true;
-<<<<<<< HEAD
   } else if (m->get_type() == MSG_MDS_NOTIFICATION_INFO_UDP_ENDPOINT) {
-=======
-  } else if (m->get_type() == MSG_MDS_NOTIFICATION_INFO_KAFKA_TOPIC) {
->>>>>>> a2cbf540416 (Notification interface added in mds)
     const auto &req = ref_cast<MNotificationInfoUDPEndpoint>(m);
     if (!req->is_remove) {
       server->add_udp_endpoint(req->name, req->ip, req->port);

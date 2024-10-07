@@ -33,6 +33,11 @@
 #include "cephfs_features.h"
 #include "MDSContext.h"
 
+#ifdef WITH_CEPHFS_NOTIFICATION
+#include "messages/MNotificationInfoKafkaTopic.h"
+#include "messages/MNotificationInfoUDPEndpoint.h"
+#endif
+
 #include "msg/Messenger.h"
 
 #include "osdc/Objecter.h"
@@ -244,6 +249,21 @@ void Server::create_logger()
                    "Request type rename snapshot latency");
   plb.add_time_avg(l_mdss_req_snapdiff_latency, "req_snapdiff_latency",
 		   "Request type snapshot difference latency");
+
+#ifdef WITH_CEPHFS_NOTIFICATION
+  plb.add_time_avg(l_mdss_req_add_kafka_topic_latency,
+                 "req_add_kafka_topic_latency",
+                 "Request type add kafka topic latency");
+  plb.add_time_avg(l_mdss_req_remove_kafka_topic_latency,
+                 "req_remove_kafka_topic_latency",
+                 "Request type remove kafka topic latency");
+  plb.add_time_avg(l_mdss_req_add_udp_endpoint_latency,
+                 "req_add_udp_endpoint_latency",
+                 "Request type add udp endpoint latency");
+  plb.add_time_avg(l_mdss_req_remove_udp_endpoint_latency,
+                 "req_remove_udp_endpoint_latency",
+                 "Request type remove udp endpoint latency");
+#endif
 
   plb.set_prio_default(PerfCountersBuilder::PRIO_DEBUGONLY);
   plb.add_u64_counter(l_mdss_dispatch_client_request, "dispatch_client_request",
@@ -2207,6 +2227,22 @@ void Server::perf_gather_op_latency(const cref_t<MClientRequest> &req, utime_t l
   case CEPH_MDS_OP_READDIR_SNAPDIFF:
     code = l_mdss_req_snapdiff_latency;
     break;
+
+#ifdef WITH_CEPHFS_NOTIFICATION
+  case CEPH_MDS_OP_ADD_KAFKA_TOPIC:
+    code = l_mdss_req_add_kafka_topic_latency;
+    break;
+  case CEPH_MDS_OP_REMOVE_KAFKA_TOPIC:
+    code = l_mdss_req_remove_kafka_topic_latency;
+    break;
+  case CEPH_MDS_OP_ADD_UDP_ENDPOINT:
+    code = l_mdss_req_add_udp_endpoint_latency;
+    break;
+  case CEPH_MDS_OP_REMOVE_UDP_ENDPOINT:
+    code = l_mdss_req_remove_udp_endpoint_latency;
+    break;
+#endif
+
   default:
     dout(1) << ": unknown client op" << dendl;
     return;
@@ -2863,6 +2899,21 @@ void Server::dispatch_client_request(const MDRequestRef& mdr)
   case CEPH_MDS_OP_READDIR_SNAPDIFF:
     handle_client_readdir_snapdiff(mdr);
     break;
+#ifdef WITH_CEPHFS_NOTIFICATION
+  // notifications
+  case CEPH_MDS_OP_ADD_KAFKA_TOPIC:
+    handle_client_add_kafka_topic(mdr);
+    break;
+  case CEPH_MDS_OP_REMOVE_KAFKA_TOPIC:
+    handle_client_remove_kafka_topic(mdr);
+    break;
+  case CEPH_MDS_OP_ADD_UDP_ENDPOINT:
+    handle_client_add_udp_endpoint(mdr);
+    break;
+  case CEPH_MDS_OP_REMOVE_UDP_ENDPOINT:
+    handle_client_remove_udp_endpoint(mdr);
+    break;
+#endif
 
   default:
     dout(1) << " unknown client op " << req->get_op() << dendl;
@@ -11994,12 +12045,113 @@ bool Server::build_snap_diff(
 }
 
 #ifdef WITH_CEPHFS_NOTIFICATION
+
+// FIXME handling user rights
+void Server::handle_client_add_kafka_topic(const MDRequestRef &mdr) {
+  const cref_t<MClientRequest> &req = mdr->client_request;
+  KafkaTopicPayload payload;
+  if (req->get_data().length()) {
+    try {
+      auto iter = req->get_data().cbegin();
+      decode(payload, iter);
+    } catch (const ceph::buffer::error &e) {
+      // backward compat -- client sends xattr bufferlist. however,
+      // that is not used anywhere -- so (log and) ignore.
+      dout(1) << ": no data in kafka topic payload" << dendl;
+      respond_to_request(mdr, -CEPHFS_EINVAL);
+      return;
+    }
+  }
+  int r = add_kafka_topic(payload.topic_name,
+                          connection_t(payload.broker, payload.use_ssl,
+                                       payload.user, payload.password,
+                                       payload.ca_location, payload.mechanism));
+  if (r == 0) {
+    auto m = make_message<MNotificationInfoKafkaTopic>(
+        payload.topic_name, payload.broker, payload.use_ssl, payload.user,
+        payload.password, payload.ca_location, payload.mechanism);
+    mds->send_notification_info_to_peers(m);
+  }
+  respond_to_request(mdr, r);
+}
+
+void Server::handle_client_remove_kafka_topic(const MDRequestRef &mdr) {
+  const cref_t<MClientRequest> &req = mdr->client_request;
+  KafkaTopicPayload payload;
+  if (req->get_data().length()) {
+    try {
+      auto iter = req->get_data().cbegin();
+      decode(payload, iter);
+    } catch (const ceph::buffer::error &e) {
+      // backward compat -- client sends xattr bufferlist. however,
+      // that is not used anywhere -- so (log and) ignore.
+      dout(1) << ": no data in kafka topic payload" << dendl;
+      respond_to_request(mdr, -CEPHFS_EINVAL);
+      return;
+    }
+  }
+  int r = remove_kafka_topic(payload.topic_name);
+  if (r == 0) {
+    auto m =
+        make_message<MNotificationInfoKafkaTopic>(payload.topic_name, true);
+    mds->send_notification_info_to_peers(m);
+  }
+  respond_to_request(mdr, r);
+}
+
+void Server::handle_client_add_udp_endpoint(const MDRequestRef &mdr) {
+  const cref_t<MClientRequest> &req = mdr->client_request;
+  UDPEndpointPayload payload;
+  if (req->get_data().length()) {
+    try {
+      auto iter = req->get_data().cbegin();
+      decode(payload, iter);
+    } catch (const ceph::buffer::error &e) {
+      // backward compat -- client sends xattr bufferlist. however,
+      // that is not used anywhere -- so (log and) ignore.
+      dout(1) << ": no data in udp endpoint payload" << dendl;
+      respond_to_request(mdr, -CEPHFS_EINVAL);
+      return;
+    }
+  }
+  int r = add_udp_endpoint(payload.name, payload.ip, payload.port);
+  if (r == 0) {
+    auto m = make_message<MNotificationInfoUDPEndpoint>(
+        payload.name, payload.ip, payload.port);
+    mds->send_notification_info_to_peers(m);
+  }
+  respond_to_request(mdr, r);
+}
+
+void Server::handle_client_remove_udp_endpoint(const MDRequestRef &mdr) {
+  const cref_t<MClientRequest> &req = mdr->client_request;
+  UDPEndpointPayload payload;
+  if (req->get_data().length()) {
+    try {
+      auto iter = req->get_data().cbegin();
+      decode(payload, iter);
+    } catch (const ceph::buffer::error &e) {
+      // backward compat -- client sends xattr bufferlist. however,
+      // that is not used anywhere -- so (log and) ignore.
+      dout(1) << ": no data in udp endpoint payload" << dendl;
+      respond_to_request(mdr, -CEPHFS_EINVAL);
+      return;
+    }
+  }
+  int r = remove_udp_endpoint(payload.name);
+  if (r == 0) {
+    auto m = make_message<MNotificationInfoUDPEndpoint>(payload.name, true);
+    mds->send_notification_info_to_peers(m);
+  }
+  respond_to_request(mdr, r);
+}
+
 int Server::add_kafka_topic(const std::string &topic_name,
                             const connection_t &connection) {
   return notification_manager->add_kafka_topic(topic_name, connection);
 }
 
-int Server::remove_kafka_topic(const std::string& topic_name) {
+int Server::remove_kafka_topic(const std::string &topic_name) {
   return notification_manager->remove_kafka_topic(topic_name);
 }
 
@@ -12008,7 +12160,7 @@ int Server::add_udp_endpoint(const std::string &name, const std::string &ip,
   return notification_manager->add_udp_endpoint(name, ip, port);
 }
 
-int Server::remove_udp_endpoint(const std::string& name) {
+int Server::remove_udp_endpoint(const std::string &name) {
   return notification_manager->remove_udp_endpoint(name);
 }
 #endif
