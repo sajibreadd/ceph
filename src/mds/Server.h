@@ -89,6 +89,14 @@ enum {
   l_mdss_cap_revoke_eviction,
   l_mdss_cap_acquisition_throttle,
   l_mdss_req_getvxattr_latency,
+
+#ifdef WITH_CEPHFS_NOTIFICATION
+  l_mdss_req_add_kafka_topic_latency,
+  l_mdss_req_remove_kafka_topic_latency,
+  l_mdss_req_add_udp_endpoint_latency,
+  l_mdss_req_remove_udp_endpoint_latency,
+#endif
+
   l_mdss_last,
 };
 
@@ -128,6 +136,10 @@ public:
   }
 
 #ifdef WITH_CEPHFS_NOTIFICATION
+  void handle_client_add_kafka_topic(const MDRequestRef& mdr);
+  void handle_client_remove_kafka_topic(const MDRequestRef& mdr);
+  void handle_client_add_udp_endpoint(const MDRequestRef& mdr);
+  void handle_client_remove_udp_endpoint(const MDRequestRef& mdr);
   int add_kafka_topic(const std::string &topic_name,
                               const connection_t &connection);
   int remove_kafka_topic(const std::string& topic_name);
