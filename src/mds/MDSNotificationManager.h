@@ -1,32 +1,49 @@
 #pragma once
-
 #include "CDentry.h"
 #include "CInode.h"
+#include "MDSRank.h"
+#include "common/ceph_context.h"
+#include "include/buffer.h"
+#include <bits/stdc++.h>
 
 #ifdef WITH_CEPHFS_NOTIFICATION
 #include "MDSKafka.h"
 #include "MDSNotificationMessage.h"
 #include "MDSUDPEndpoint.h"
-#endif
+#include "messages/MNotificationInfoKafkaTopic.h"
+#include "messages/MNotificationInfoUDPEndpoint.h"
 
-#include "common/ceph_context.h"
-#include "include/buffer.h"
-#include <bits/stdc++.h>
+class MDSKafkaManager;
+class MDSUDPManager;
+#endif
 
 class MDSNotificationManager {
 public:
-  MDSNotificationManager(CephContext *cct);
+  MDSNotificationManager(MDSRank *mds);
+  void init();
+
+  // incoming notification endpoints
+  void dispatch(const cref_t<Message> &m);
 
 #ifdef WITH_CEPHFS_NOTIFICATION
   int add_kafka_topic(const std::string &topic_name,
-                       const connection_t &connection);
-  int remove_kafka_topic(const std::string &topic_name);
-  int add_udp_endpoint(const std::string &name, const std::string &ip,
-                        int port);
-  int remove_udp_endpoint(const std::string &name);
+                      const std::string &endpoint_name,
+                      const std::string &broker, bool use_ssl,
+                      const std::string &user, const std::string &password,
+                      const std::optional<std::string> &ca_location,
+                      const std::optional<std::string> &mechanism,
+                      bool write_into_disk, bool send_peers);
+  int remove_kafka_topic(const std::string &topic_name,
+                         const std::string &endpoint_name, bool write_into_disk,
+                         bool send_peers);
+  int add_udp_endpoint(const std::string &name, const std::string &ip, int port,
+                       bool write_into_disk, bool send_peers);
+  int remove_udp_endpoint(const std::string &name, bool write_into_disk,
+                          bool send_peers);
 #endif
 
-  void push_notification(int32_t whoami, CInode *in, uint64_t notify_mask);
+  void push_notification(int32_t whoami, CInode *in, uint64_t notify_mask,
+                         bool projected = true);
   void push_notification_link(int32_t whoami, CInode *targeti, CDentry *destdn,
                               uint64_t notify_mask_for_target,
                               uint64_t notify_mask_for_link);
@@ -36,7 +53,6 @@ public:
                               uint64_t notify_mask);
 
 private:
-
 #ifdef WITH_CEPHFS_NOTIFICATION
   std::unique_ptr<MDSKafkaManager> kafka_manager;
   std::unique_ptr<MDSUDPManager> udp_manager;
@@ -47,4 +63,5 @@ private:
   CephContext *cct;
   std::atomic<uint64_t> cur_notification_seq_id;
   std::string session_id;
+  MDSRank *mds;
 };

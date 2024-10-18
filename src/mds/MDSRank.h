@@ -44,10 +44,8 @@
 #include "MetricsHandler.h"
 #include "osdc/Journaler.h"
 #include "MDSMetaRequest.h"
+#include "MDSNotificationManager.h"
 
-#ifdef WITH_CEPHFS_NOTIFICATION
-#include "MDSKafka.h"
-#endif
 
 // Full .h import instead of forward declaration for PerfCounter, for the
 // benefit of those including this header and using MDSRank::logger
@@ -155,6 +153,7 @@ class MgrClient;
 class Finisher;
 class ScrubStack;
 class C_ExecAndReply;
+class MDSNotificationManager;
 
 /**
  * The public part of this class's interface is what's exposed to all
@@ -200,6 +199,7 @@ class MDSRank {
     }
 
     bool is_daemon_stopping() const;
+    void send_to_peers(const ref_t<Message>& m);
 
     MDSTableClient *get_table_client(int t);
     MDSTableServer *get_table_server(int t);
@@ -426,6 +426,7 @@ class MDSRank {
 
     SnapServer *snapserver = nullptr;
     SnapClient *snapclient = nullptr;
+    std::unique_ptr <MDSNotificationManager> notification_manager;
 
     SessionMap sessionmap;
 
@@ -642,11 +643,6 @@ class MDSRank {
     bool standby_replaying = false;  // true if current replay pass is in standby-replay mode
     uint64_t extraordinary_events_dump_interval = 0;
     double inject_journal_corrupt_dentry_first = 0.0;
-protected:
-
-#ifdef WITH_CEPHFS_NOTIFICATION
-    void send_notification_info_to_peers(const ref_t<Message>& m);
-#endif
 
 private:
     bool send_status = true;
@@ -660,9 +656,7 @@ private:
 
     bool client_eviction_dump = false;
 
-#ifdef WITH_CEPHFS_NOTIFICATION
     bool is_notification_info(const cref_t<Message>& m);
-#endif
 
     void get_task_status(std::map<std::string, std::string> *status);
     void schedule_update_timer_task();

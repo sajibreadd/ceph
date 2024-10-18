@@ -1588,3 +1588,21 @@ options:
   default: 5000
   services:
   - mds
+- name: mds_notification_dir_mask
+  type: uint 
+  level: advanced
+  desc: This indicates which events are subscribed to for any operations on directories
+  long_desc: There are certain events mentioned. This mask represents OR of those event flag.
+    which filter out events for directories.
+  default: 130943
+  services:
+  - mds
+- name: mds_notification_file_mask
+  type: uint 
+  level: advanced
+  desc: This indicates which events are subscribed to for any operations on files
+  long_desc: There are certain events mentioned. This mask represents OR of those event flag.
+    which filter out events for files.
+  default: 65535
+  services:
+  - mds
