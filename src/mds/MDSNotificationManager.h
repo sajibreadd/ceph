@@ -1,29 +1,36 @@
 #pragma once
-
 #include "CDentry.h"
 #include "CInode.h"
+#include "MDSRank.h"
+#include "common/ceph_context.h"
+#include "include/buffer.h"
+#include <bits/stdc++.h>
 
 #ifdef WITH_CEPHFS_NOTIFICATION
 #include "MDSKafka.h"
 #include "MDSNotificationMessage.h"
 #include "MDSUDPEndpoint.h"
-#endif
 
-#include "common/ceph_context.h"
-#include "include/buffer.h"
-#include <bits/stdc++.h>
+class MDSKafkaManager;
+class MDSUDPManager;
+#endif
 
 class MDSNotificationManager {
 public:
-  MDSNotificationManager(CephContext *cct);
+  MDSNotificationManager(MDSRank *mds);
+  void init();
 
 #ifdef WITH_CEPHFS_NOTIFICATION
-  int add_kafka_topic(const std::string &topic_name,
-                       const connection_t &connection);
-  int remove_kafka_topic(const std::string &topic_name);
-  int add_udp_endpoint(const std::string &name, const std::string &ip,
-                        int port);
-  int remove_udp_endpoint(const std::string &name);
+  int add_kafka_topic(const std::string &topic_name, const std::string &broker,
+                      bool use_ssl, const std::string &user,
+                      const std::string &password,
+                      const std::optional<std::string> &ca_location,
+                      const std::optional<std::string> &mechanism,
+                      bool write_into_disk);
+  int remove_kafka_topic(const std::string &topic_name, bool write_into_disk);
+  int add_udp_endpoint(const std::string &name, const std::string &ip, int port,
+                       bool write_into_disk);
+  int remove_udp_endpoint(const std::string &name, bool write_into_disk);
 #endif
 
   void push_notification(int32_t whoami, CInode *in, uint64_t notify_mask);
@@ -36,7 +43,6 @@ public:
                               uint64_t notify_mask);
 
 private:
-
 #ifdef WITH_CEPHFS_NOTIFICATION
   std::unique_ptr<MDSKafkaManager> kafka_manager;
   std::unique_ptr<MDSUDPManager> udp_manager;

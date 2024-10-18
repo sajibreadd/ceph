@@ -3,6 +3,129 @@
 
 #define dout_subsys ceph_subsys_mds
 
+MDSUDPConnection::MDSUDPConnection(const std::string &ip, int port)
+    : ip(ip), port(port) {}
+
+void MDSUDPConnection::encode(ceph::buffer::list &bl) const {
+  ENCODE_START(1, 1, bl);
+  encode(ip, bl);
+  encode(port, bl);
+  ENCODE_FINISH(bl);
+}
+
+void MDSUDPConnection::dump(ceph::Formatter *f) const {
+  f->dump_string("ip", ip);
+  f->dump_bool("port", port);
+}
+
+void MDSUDPConnection::generate_test_instances(
+    std::list<MDSUDPConnection *> &o) {
+  o.push_back(new MDSUDPConnection);
+}
+
+void MDSUDPConnection::decode(ceph::buffer::list::const_iterator &iter) {
+  DECODE_START(1, iter);
+  decode(ip, iter);
+  decode(port, iter);
+  DECODE_FINISH(iter);
+}
+
+MDSUDPDriver::MDSUDPDriver(MDSRank *mds, const std::string &object_name)
+    : mds(mds), object_name(object_name) {}
+
+int MDSUDPDriver::load_data(std::map<std::string, bufferlist> &mp) {
+  int r = update_omap(std::map<std::string, bufferlist>());
+  if (r < 0) {
+    return r;
+  }
+  C_SaferCond sync_finisher;
+  ObjectOperation op;
+  op.omap_get_vals("", "", UINT_MAX, &mp, NULL, NULL);
+  mds->objecter->read(object_t(object_name),
+                      object_locator_t(mds->get_metadata_pool()), op,
+                      CEPH_NOSNAP, NULL, 0, &sync_finisher);
+  r = sync_finisher.wait();
+  if (r < 0) {
+    lderr(mds->cct) << "Error reading omap values from object '" << object_name
+                    << "':" << cpp_strerror(r) << dendl;
+  }
+  return r;
+}
+
+int MDSUDPDriver::update_omap(const std::map<std::string, bufferlist> &mp) {
+  C_SaferCond sync_finisher;
+  ObjectOperation op;
+  op.omap_set(mp);
+  mds->objecter->mutate(
+      object_t(object_name), object_locator_t(mds->get_metadata_pool()), op,
+      SnapContext(), ceph::real_clock::now(), 0, &sync_finisher);
+  int r = sync_finisher.wait();
+  if (r < 0) {
+    lderr(mds->cct) << "Error updating omap of object '" << object_name
+                    << "':" << cpp_strerror(r) << dendl;
+  }
+  return r;
+}
+
+int MDSUDPDriver::remove_keys(const std::set<std::string> &st) {
+  C_SaferCond sync_finisher;
+  ObjectOperation op;
+  op.omap_rm_keys(st);
+  mds->objecter->mutate(
+      object_t(object_name), object_locator_t(mds->get_metadata_pool()), op,
+      SnapContext(), ceph::real_clock::now(), 0, &sync_finisher);
+  int r = sync_finisher.wait();
+  if (r < 0) {
+    lderr(mds->cct) << "Error removing keys from omap of object '"
+                    << object_name << "':" << cpp_strerror(r) << dendl;
+  }
+  return r;
+}
+
+int MDSUDPDriver::add_endpoint(const std::string &name,
+                               const MDSUDPConnection &connection) {
+  std::map<std::string, bufferlist> mp;
+  bufferlist bl;
+  encode(connection, bl);
+  mp[name] = std::move(bl);
+  int r = update_omap(mp);
+  return r;
+}
+
+int MDSUDPDriver::remove_endpoint(const std::string &name) {
+  std::set<std::string> st;
+  st.insert(name);
+  int r = remove_keys(st);
+  return r;
+}
+
+MDSUDPManager::MDSUDPManager(MDSRank *mds) : cct(mds->cct) {
+  driver = std::make_unique<MDSUDPDriver>(mds, "mds_udp_endpoints");
+}
+
+int MDSUDPManager::init() {
+  std::map<std::string, bufferlist> mp;
+  int r = driver->load_data(mp);
+  if (r < 0) {
+    lderr(cct) << "Error occurred while initilizing UDP endpoints" << dendl;
+    return r;
+  }
+  for (auto &[key, val] : mp) {
+    try {
+      MDSUDPConnection connection;
+      auto iter = val.cbegin();
+      decode(connection, iter);
+      add_endpoint(key, connection, false);
+    } catch (const ceph::buffer::error &e) {
+      ldout(cct, 1)
+          << "No value exist in the omap of object 'mds_udp_endpoints' "
+             "for udp entity name '"
+          << key << "'" << dendl;
+    }
+  }
+  return r;
+}
+
 int MDSUDPManager::send(
     const std::shared_ptr<MDSNotificationMessage> &message) {
   std::shared_lock<std::shared_mutex> lock(endpoint_mutex);
@@ -17,34 +140,60 @@ int MDSUDPManager::send(
   return 0;
 }
 
-int MDSUDPManager::add_endpoint(const std::string &name, const std::string &ip,
-                                int port) {
+int MDSUDPManager::add_endpoint(const std::string &name,
+                                const MDSUDPConnection &connection,
+                                bool write_into_disk) {
   std::unique_lock<std::shared_mutex> lock(endpoint_mutex);
+  std::shared_ptr<MDSUDPEndpoint> new_endpoint;
   auto it = endpoints.find(name);
+  int r = 0;
   if (it == endpoints.end() && endpoints.size() >= MAX_CONNECTIONS_DEFAULT) {
     ldout(cct, 1) << "UDP connect: max connections exceeded" << dendl;
-    return -CEPHFS_ENOMEM;
+    r = -CEPHFS_ENOMEM;
+    goto error_occurred;
   }
-  std::shared_ptr<MDSUDPEndpoint> new_endpoint =
-      MDSUDPEndpoint::create(cct, name, ip, port);
+  new_endpoint = MDSUDPEndpoint::create(cct, name, connection);
   if (!new_endpoint) {
     ldout(cct, 1) << "UDP connect: udp endpoint creation failed" << dendl;
-    return -CEPHFS_ECANCELED;
+    r = -CEPHFS_ECANCELED;
+    goto error_occurred;
   }
   endpoints[name] = new_endpoint;
+  if (write_into_disk) {
+    r = driver->add_endpoint(name, connection);
+    if (r < 0) {
+      goto error_occurred;
+    }
+  }
   ldout(cct, 1) << "UDP endpoint with entity name '" << name
-                  << "' is added successfully" << dendl;
-  return 0;
+                << "' is added successfully" << dendl;
+  return r;
+error_occurred:
+  lderr(cct) << "UDP endpoint with entity name '" << name
+             << "' can not be added, failed with an error:" << cpp_strerror(r)
+             << dendl;
+  return r;
 }
 
-int MDSUDPManager::remove_endpoint(const std::string &name) {
+int MDSUDPManager::remove_endpoint(const std::string &name,
+                                   bool write_into_disk) {
   std::unique_lock<std::shared_mutex> lock(endpoint_mutex);
+  int r = 0;
   auto it = endpoints.find(name);
   if (it != endpoints.end()) {
     endpoints.erase(it);
-    ldout(cct, 1) << "UDP endpoint with entity name '" << name
-                  << "' is removed successfully" << dendl;
-    return 0;
+    if (write_into_disk) {
+      r = driver->remove_endpoint(name);
+    }
+    if (r == 0) {
+      ldout(cct, 1) << "UDP endpoint with entity name '" << name
+                    << "' is removed successfully" << dendl;
+    } else {
+      lderr(cct) << "UDP endpoint '" << name
+                 << "' can not be removed, failed with an error:"
+                 << cpp_strerror(r) << dendl;
+    }
+    return r;
   }
   ldout(cct, 1) << "No UDP endpoint exist with entity name '" << name << "'"
                 << dendl;
@@ -52,9 +201,10 @@ int MDSUDPManager::remove_endpoint(const std::string &name) {
 }
 
 MDSUDPEndpoint::MDSUDPEndpoint(CephContext *cct, const std::string &name,
-                               const std::string &ip, int port)
-    : cct(cct), name(name), socket(io_context), ip(ip), port(port),
-      endpoint(boost::asio::ip::address::from_string(ip), port) {
+                               const MDSUDPConnection &connection)
+    : cct(cct), name(name), socket(io_context), connection(connection),
+      endpoint(boost::asio::ip::address::from_string(connection.ip),
+               connection.port) {
   try {
     boost::system::error_code ec;
     socket.open(boost::asio::ip::udp::v4(), ec);
@@ -68,13 +218,12 @@ MDSUDPEndpoint::MDSUDPEndpoint(CephContext *cct, const std::string &name,
   }
 }
 
-std::shared_ptr<MDSUDPEndpoint> MDSUDPEndpoint::create(CephContext *cct,
-                                                       const std::string &name,
-                                                       const std::string &ip,
-                                                       int port) {
+std::shared_ptr<MDSUDPEndpoint>
+MDSUDPEndpoint::create(CephContext *cct, const std::string &name,
+                       const MDSUDPConnection &connection) {
   try {
     std::shared_ptr<MDSUDPEndpoint> endpoint =
-        std::make_shared<MDSUDPEndpoint>(cct, name, ip, port);
+        std::make_shared<MDSUDPEndpoint>(cct, name, connection);
     return endpoint;
   } catch (...) {
   }

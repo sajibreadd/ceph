@@ -2,40 +2,96 @@
 #include "include/uuid.h"
 #define dout_subsys ceph_subsys_mds
 
-MDSNotificationManager::MDSNotificationManager(CephContext *cct)
-    : cct(cct), cur_notification_seq_id(0) {
+MDSNotificationManager::MDSNotificationManager(MDSRank *mds)
+    : cct(mds->cct), cur_notification_seq_id(0) {
 #ifdef WITH_CEPHFS_NOTIFICATION
   uuid_d uid;
   uid.generate_random();
   session_id = uid.to_string();
-  kafka_manager = std::make_unique<MDSKafkaManager>(cct);
-  udp_manager = std::make_unique<MDSUDPManager>(cct);
+  kafka_manager = std::make_unique<MDSKafkaManager>(mds);
+  udp_manager = std::make_unique<MDSUDPManager>(mds);
+#endif
+}
+
+void MDSNotificationManager::init() {
+#ifdef WITH_CEPHFS_NOTIFICATION
+  int r = kafka_manager->init();
+  if (r < 0) {
+    kafka_manager = nullptr;
+  }
+  r = udp_manager->init();
+  if (r < 0) {
+    udp_manager = nullptr;
+  }
 #endif
 }
 
 #ifdef WITH_CEPHFS_NOTIFICATION
-int MDSNotificationManager::add_kafka_topic(const std::string &topic_name,
-                                            const connection_t &connection) {
-  return kafka_manager->add_topic(topic_name, connection);
+int MDSNotificationManager::add_kafka_topic(
+    const std::string &topic_name, const std::string &broker, bool use_ssl,
+    const std::string &user, const std::string &password,
+    const std::optional<std::string> &ca_location,
+    const std::optional<std::string> &mechanism, bool write_into_disk) {
+  if (!kafka_manager) {
+    ldout(cct, 1)
+        << "Kafka topic '" << topic_name
+        << "' creation failed as kafka manager is not initialized correctly"
+        << dendl;
+    return -CEPHFS_EFAULT;
+  }
+  return kafka_manager->add_topic(topic_name,
+                                  MDSKafkaConnection(broker, use_ssl, user,
+                                                     password, ca_location,
+                                                     mechanism),
+                                  write_into_disk);
 }
 
-int MDSNotificationManager::remove_kafka_topic(const std::string &topic_name) {
-  return kafka_manager->remove_topic(topic_name);
+int MDSNotificationManager::remove_kafka_topic(const std::string &topic_name,
+                                               bool write_into_disk) {
+  if (!kafka_manager) {
+    ldout(cct, 1)
+        << "Kafka topic '" << topic_name
+        << "' removal failed as kafka manager is not initialized correctly"
+        << dendl;
+    return -CEPHFS_EFAULT;
+  }
+  return kafka_manager->remove_topic(topic_name, write_into_disk);
 }
 
 int MDSNotificationManager::add_udp_endpoint(const std::string &name,
-                                             const std::string &ip, int port) {
-  return udp_manager->add_endpoint(name, ip, port);
+                                             const std::string &ip, int port,
+                                             bool write_into_disk) {
+  if (!udp_manager) {
+    ldout(cct, 1)
+        << "UDP endpoint '" << name
+        << "' creation failed as udp manager is not initialized correctly"
+        << dendl;
+    return -CEPHFS_EFAULT;
+  }
+  return udp_manager->add_endpoint(name, MDSUDPConnection(ip, port),
+                                   write_into_disk);
 }
 
-int MDSNotificationManager::remove_udp_endpoint(const std::string &name) {
-  return udp_manager->remove_endpoint(name);
+int MDSNotificationManager::remove_udp_endpoint(const std::string &name,
+                                                bool write_into_disk) {
+  if (!udp_manager) {
+    ldout(cct, 1)
+        << "UDP endpoint '" << name
+        << "' removal failed as udp manager is not initialized correctly"
+        << dendl;
+    return -CEPHFS_EFAULT;
+  }
+  return udp_manager->remove_endpoint(name, write_into_disk);
 }
 
 void MDSNotificationManager::push_notification(
     const std::shared_ptr<MDSNotificationMessage> &message) {
-  kafka_manager->send(message);
-  udp_manager->send(message);
+  if (kafka_manager) {
+    kafka_manager->send(message);
+  }
+  if (udp_manager) {
+    udp_manager->send(message);
+  }
 }
 #endif
 

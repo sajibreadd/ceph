@@ -1,6 +1,7 @@
 #pragma once
 
 #include "MDSNotificationMessage.h"
+#include "MDSRank.h"
 #include "common/ceph_context.h"
 #include "include/buffer.h"
 #include <bits/stdc++.h>
@@ -9,8 +10,9 @@
 #include <string>
 
 class MDSKafka;
+class MDSKafkaTopic;
 
-struct connection_t {
+struct MDSKafkaConnection {
   std::string broker;
   bool use_ssl;
   std::string user;
@@ -18,27 +20,50 @@ struct connection_t {
   std::optional<std::string> ca_location;
   std::optional<std::string> mechanism;
   uint64_t hash_key;
-  connection_t() = default;
-  connection_t(const std::string &broker, bool use_ssl, const std::string &user,
-               const std::string &password,
-               const std::optional<std::string> &ca_location,
-               const std::optional<std::string> &mechanism);
+  MDSKafkaConnection() = default;
+  MDSKafkaConnection(const std::string &broker, bool use_ssl,
+                     const std::string &user, const std::string &password,
+                     const std::optional<std::string> &ca_location,
+                     const std::optional<std::string> &mechanism);
   void combine_hash();
   std::string to_string() const { return broker + ":" + user; }
+  void encode(ceph::buffer::list &bl) const;
+  void decode(ceph::buffer::list::const_iterator &iter);
+  void dump(ceph::Formatter *f) const;
+  static void generate_test_instances(std::list<MDSKafkaConnection *> &o);
+};
+
+WRITE_CLASS_ENCODER(MDSKafkaConnection)
+
+class MDSKafkaDriver {
+public:
+  MDSKafkaDriver(MDSRank *mds, const std::string &object_name);
+  int load_data(std::map<std::string, bufferlist> &mp);
+  int add_topic(const std::string &topic_name,
+                const MDSKafkaConnection &connection);
+  int remove_topic(const std::string &topic_name);
+
+private:
+  MDSRank *mds;
+  std::string object_name;
+  int update_omap(const std::map<std::string, bufferlist> &mp);
+  int remove_keys(const std::set<std::string> &st);
 };
 
 class MDSKafkaManager {
 public:
-  MDSKafkaManager(CephContext *cct);
-  int add_topic(const std::string &topic_name, const connection_t &connection);
-  int remove_topic(const std::string &topic_name);
+  MDSKafkaManager(MDSRank *mds);
+  int init();
+  void activate();
+  void pause();
+  int add_topic(const std::string &topic_name,
+                const MDSKafkaConnection &connection, bool write_into_disk);
+  int remove_topic(const std::string &topic_name, bool write_into_disk);
   int send(const std::shared_ptr<MDSNotificationMessage> &message);
   CephContext *cct;
 
 private:
   void run();
-  void start_worker();
-  void stop_worker();
   uint64_t publish(const std::shared_ptr<MDSNotificationMessage> &message);
   uint64_t polling(int read_timeout);
   static const size_t MAX_CONNECTIONS_DEFAULT = 32;
@@ -50,7 +75,8 @@ private:
   std::mutex queue_mutex;
   std::queue<std::shared_ptr<MDSNotificationMessage>> message_queue;
   std::thread worker;
-  std::atomic<bool> stop_flag;
+  std::unique_ptr<MDSKafkaDriver> driver;
+  std::atomic<bool> paused;
 };
 
 class MDSKafkaTopic {
@@ -66,6 +92,7 @@ public:
   static void kafka_topic_deleter(rd_kafka_topic_t *topic_ptr);
   std::unique_ptr<rd_kafka_topic_t, decltype(&kafka_topic_deleter)>
       kafka_topic_ptr{nullptr, kafka_topic_deleter};
+  friend class MDSKafkaManager;
   friend class MDSKafka;
 
 private:
@@ -80,9 +107,9 @@ private:
 class MDSKafka {
 public:
   MDSKafka() = delete;
-  MDSKafka(const connection_t &connection);
+  MDSKafka(const MDSKafkaConnection &connection);
   static std::shared_ptr<MDSKafka> create(CephContext *_cct,
-                                          const connection_t &connection);
+                                          const MDSKafkaConnection &connection);
   uint64_t
   publish_internal(const std::shared_ptr<MDSNotificationMessage> &message);
   uint64_t poll(int read_timeout);
@@ -100,7 +127,7 @@ private:
   std::shared_mutex topic_mutex;
   std::unordered_map<std::string, std::shared_ptr<MDSKafkaTopic>> topics;
   static CephContext *cct;
-  connection_t connection;
+  MDSKafkaConnection connection;
   static void message_callback(rd_kafka_t *rk,
                                const rd_kafka_message_t *rkmessage,
                                void *opaque);
