@@ -36,7 +36,9 @@ using namespace std::literals::string_view_literals;
 #include "MDSRank.h"
 #include "Mutation.h"
 #include "MDSContext.h"
+// #include "MDSNotificationManager.h"
 
+// class MDSNotificationManager;
 class OSDMap;
 class LogEvent;
 class EMetaBlob;

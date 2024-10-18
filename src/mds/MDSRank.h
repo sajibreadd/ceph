@@ -45,6 +45,8 @@
 #include "MetricsHandler.h"
 #include "osdc/Journaler.h"
 #include "MDSMetaRequest.h"
+#include "MDSNotificationManager.h"
+
 
 // Full .h import instead of forward declaration for PerfCounter, for the
 // benefit of those including this header and using MDSRank::logger
@@ -154,6 +156,7 @@ class ScrubStack;
 class C_ExecAndReply;
 class QuiesceDbManager;
 class QuiesceAgent;
+class MDSNotificationManager;
 
 /**
  * The public part of this class's interface is what's exposed to all
@@ -395,6 +398,16 @@ class MDSRank {
     double get_inject_journal_corrupt_dentry_first() const {
       return inject_journal_corrupt_dentry_first;
     }
+#ifdef WITH_CEPHFS_NOTIFICATION
+    int add_kafka_topic(const std::string &topic_name, const std::string &broker,
+                      bool use_ssl, const std::string &user,
+                      const std::string &password,
+                      const std::optional<std::string> &ca_location,
+                      const std::optional<std::string> &mechanism);
+    int remove_kafka_topic(const std::string& topic_name);
+    int add_udp_endpoint(const std::string& name, const std::string& ip, int port);
+    int remove_udp_endpoint(const std::string& name);
+#endif
 
     // Reference to global MDS::mds_lock, so that users of MDSRank don't
     // carry around references to the outer MDS, and we can substitute
@@ -427,6 +440,7 @@ class MDSRank {
 
     SnapServer *snapserver = nullptr;
     SnapClient *snapclient = nullptr;
+    std::unique_ptr <MDSNotificationManager> notification_manager;
 
     SessionMap sessionmap;
 
@@ -650,6 +664,12 @@ class MDSRank {
     bool standby_replaying = false;  // true if current replay pass is in standby-replay mode
     uint64_t extraordinary_events_dump_interval = 0;
     double inject_journal_corrupt_dentry_first = 0.0;
+protected:
+
+#ifdef WITH_CEPHFS_NOTIFICATION
+    void send_notification_info_to_peers(const ref_t<Message>& m);
+#endif
+
 private:
     bool send_status = true;
 
@@ -661,6 +681,10 @@ private:
     inline static const std::string SCRUB_STATUS_KEY = "scrub status";
 
     bool client_eviction_dump = false;
+
+#ifdef WITH_CEPHFS_NOTIFICATION
+    bool is_notification_info(const cref_t<Message>& m);
+#endif
 
     void get_task_status(std::map<std::string, std::string> *status);
     void schedule_update_timer_task();
