@@ -3,7 +3,7 @@
 #define dout_subsys ceph_subsys_mds
 
 MDSNotificationManager::MDSNotificationManager(MDSRank *mds)
-    : cct(mds->cct), cur_notification_seq_id(0) {
+    : cct(mds->cct), mds(mds), cur_notification_seq_id(0) {
 #ifdef WITH_CEPHFS_NOTIFICATION
   uuid_d uid;
   uid.generate_random();
@@ -26,12 +26,35 @@ void MDSNotificationManager::init() {
 #endif
 }
 
+void MDSNotificationManager::dispatch(const cref_t<Message> &m) {
+#ifdef WITH_CEPHFS_NOTIFICATION
+  if (m->get_type() == MSG_MDS_NOTIFICATION_INFO_KAFKA_TOPIC) {
+    const auto &req = ref_cast<MNotificationInfoKafkaTopic>(m);
+    if (!req->is_remove) {
+      add_kafka_topic(req->topic_name, req->endpoint_name, req->broker,
+                      req->use_ssl, req->user, req->password, req->ca_location,
+                      req->mechanism, false, false);
+    } else {
+      remove_kafka_topic(req->topic_name, req->endpoint_name, false, false);
+    }
+  } else if (m->get_type() == MSG_MDS_NOTIFICATION_INFO_UDP_ENDPOINT) {
+    const auto &req = ref_cast<MNotificationInfoUDPEndpoint>(m);
+    if (!req->is_remove) {
+      add_udp_endpoint(req->name, req->ip, req->port, false, false);
+    } else {
+      remove_udp_endpoint(req->name, false, false);
+    }
+  }
+#endif
+}
+
 #ifdef WITH_CEPHFS_NOTIFICATION
 int MDSNotificationManager::add_kafka_topic(
-    const std::string &topic_name, const std::string &broker, bool use_ssl,
-    const std::string &user, const std::string &password,
-    const std::optional<std::string> &ca_location,
-    const std::optional<std::string> &mechanism, bool write_into_disk) {
+    const std::string &topic_name, const std::string &endpoint_name,
+    const std::string &broker, bool use_ssl, const std::string &user,
+    const std::string &password, const std::optional<std::string> &ca_location,
+    const std::optional<std::string> &mechanism, bool write_into_disk,
+    bool send_peers) {
   if (!kafka_manager) {
     ldout(cct, 1)
         << "Kafka topic '" << topic_name
@@ -39,15 +62,24 @@ int MDSNotificationManager::add_kafka_topic(
         << dendl;
     return -CEPHFS_EFAULT;
   }
-  return kafka_manager->add_topic(topic_name,
-                                  MDSKafkaConnection(broker, use_ssl, user,
-                                                     password, ca_location,
-                                                     mechanism),
-                                  write_into_disk);
+  int r = kafka_manager->add_topic(topic_name, endpoint_name,
+                                   MDSKafkaConnection(broker, use_ssl, user,
+                                                      password, ca_location,
+                                                      mechanism),
+                                   write_into_disk);
+  if (send_peers && r == 0) {
+    auto m = make_message<MNotificationInfoKafkaTopic>(
+        topic_name, endpoint_name, broker, use_ssl, user, password, ca_location,
+        mechanism, false);
+    mds->send_to_peers(m);
+  }
+  return r;
 }
 
 int MDSNotificationManager::remove_kafka_topic(const std::string &topic_name,
-                                               bool write_into_disk) {
+                                               const std::string &endpoint_name,
+                                               bool write_into_disk,
+                                               bool send_peers) {
   if (!kafka_manager) {
     ldout(cct, 1)
         << "Kafka topic '" << topic_name
@@ -55,12 +87,20 @@ int MDSNotificationManager::remove_kafka_topic(const std::string &topic_name,
         << dendl;
     return -CEPHFS_EFAULT;
   }
-  return kafka_manager->remove_topic(topic_name, write_into_disk);
+  int r =
+      kafka_manager->remove_topic(topic_name, endpoint_name, write_into_disk);
+  if (send_peers && r == 0) {
+    auto m = make_message<MNotificationInfoKafkaTopic>(topic_name,
+                                                       endpoint_name, true);
+    mds->send_to_peers(m);
+  }
+  return r;
 }
 
 int MDSNotificationManager::add_udp_endpoint(const std::string &name,
                                              const std::string &ip, int port,
-                                             bool write_into_disk) {
+                                             bool write_into_disk,
+                                             bool send_peers) {
   if (!udp_manager) {
     ldout(cct, 1)
         << "UDP endpoint '" << name
@@ -68,12 +108,18 @@ int MDSNotificationManager::add_udp_endpoint(const std::string &name,
         << dendl;
     return -CEPHFS_EFAULT;
   }
-  return udp_manager->add_endpoint(name, MDSUDPConnection(ip, port),
-                                   write_into_disk);
+  int r = udp_manager->add_endpoint(name, MDSUDPConnection(ip, port),
+                                    write_into_disk);
+  if (send_peers && r == 0) {
+    auto m = make_message<MNotificationInfoUDPEndpoint>(name, ip, port, false);
+    mds->send_to_peers(m);
+  }
+  return r;
 }
 
 int MDSNotificationManager::remove_udp_endpoint(const std::string &name,
-                                                bool write_into_disk) {
+                                                bool write_into_disk,
+                                                bool send_peers) {
   if (!udp_manager) {
     ldout(cct, 1)
         << "UDP endpoint '" << name
@@ -81,7 +127,12 @@ int MDSNotificationManager::remove_udp_endpoint(const std::string &name,
         << dendl;
     return -CEPHFS_EFAULT;
   }
-  return udp_manager->remove_endpoint(name, write_into_disk);
+  int r = udp_manager->remove_endpoint(name, write_into_disk);
+  if (send_peers && r == 0) {
+    auto m = make_message<MNotificationInfoUDPEndpoint>(name, true);
+    mds->send_to_peers(m);
+  }
+  return r;
 }
 
 void MDSNotificationManager::push_notification(
@@ -96,15 +147,27 @@ void MDSNotificationManager::push_notification(
 #endif
 
 void MDSNotificationManager::push_notification(int32_t whoami, CInode *in,
-                                               uint64_t notify_mask) {
+                                               uint64_t notify_mask,
+                                               bool projected) {
 #ifdef WITH_CEPHFS_NOTIFICATION
   std::string path;
-  in->make_path_string(path, true, nullptr);
+  in->make_path_string(path, projected);
   std::shared_ptr<MDSNotificationMessage> message =
       std::make_shared<MDSNotificationMessage>(
           cur_notification_seq_id.fetch_add(1));
-  message->create_message(whoami, session_id, notify_mask, path);
-  push_notification(message);
+  uint64_t filter_mask = (1 << 17) - 1;
+  if (in->is_dir()) {
+    filter_mask = cct->_conf.get_val<uint64_t>("mds_notification_dir_mask");
+    notify_mask |= CEPH_MDS_NOTIFY_ONLYDIR;
+  } else {
+    filter_mask = cct->_conf.get_val<uint64_t>("mds_notification_file_mask");
+  }
+  notify_mask &= filter_mask;
+  uint64_t check_mask = notify_mask & ((1 << 16) - 1);
+  if (check_mask) {
+    message->create_message(whoami, session_id, notify_mask, path);
+    push_notification(message);
+  }
 #endif
 }
 
@@ -119,15 +182,29 @@ void MDSNotificationManager::push_notification_link(
   std::shared_ptr<MDSNotificationMessage> message =
       std::make_shared<MDSNotificationMessage>(
           cur_notification_seq_id.fetch_add(1));
-  if (target_path == link_path) {
-    message->create_message(whoami, session_id, notify_mask_for_link,
-                            target_path);
-    push_notification(message);
-    return;
+  uint64_t filter_mask = (1 << 17) - 1;
+  if (targeti->is_dir()) {
+    filter_mask = cct->_conf.get_val<uint64_t>("mds_notification_dir_mask");
+    notify_mask_for_target |= CEPH_MDS_NOTIFY_ONLYDIR;
+    notify_mask_for_link |= CEPH_MDS_NOTIFY_ONLYDIR;
+  } else {
+    filter_mask = cct->_conf.get_val<uint64_t>("mds_notification_file_mask");
   }
-  message->create_link_message(whoami, session_id, notify_mask_for_target,
-                               notify_mask_for_link, target_path, link_path);
-  push_notification(message);
+  notify_mask_for_target &= filter_mask;
+  notify_mask_for_link &= filter_mask;
+  uint64_t check_mask =
+      (notify_mask_for_target | notify_mask_for_link) & ((1 << 16) - 1);
+  if (check_mask) {
+    if (target_path == link_path) {
+      message->create_message(whoami, session_id, notify_mask_for_link,
+                              target_path);
+      push_notification(message);
+      return;
+    }
+    message->create_link_message(whoami, session_id, notify_mask_for_target,
+                                 notify_mask_for_link, target_path, link_path);
+    push_notification(message);
+  }
 #endif
 }
 
@@ -140,12 +217,27 @@ void MDSNotificationManager::push_notification_move(int32_t whoami,
   destdn->make_path_string(dest_path, true);
   uint64_t src_mask = CEPH_MDS_NOTIFY_MOVED_FROM,
            dest_mask = CEPH_MDS_NOTIFY_MOVED_TO;
-  std::shared_ptr<MDSNotificationMessage> message =
-      std::make_shared<MDSNotificationMessage>(
-          cur_notification_seq_id.fetch_add(1));
-  message->create_move_message(whoami, session_id, src_mask, dest_mask,
-                               src_path, dest_path);
-  push_notification(message);
+  CInode *srci = srcdn->get_projected_linkage()->get_inode();
+  CInode *desti = destdn->get_projected_linkage()->get_inode();
+  uint64_t filter_mask = (1 << 17) - 1;
+  if (srci && srci->is_dir()) {
+    src_mask |= CEPH_MDS_NOTIFY_ONLYDIR;
+    dest_mask |= CEPH_MDS_NOTIFY_ONLYDIR;
+    filter_mask = cct->_conf.get_val<uint64_t>("mds_notification_dir_mask");
+  } else {
+    filter_mask = cct->_conf.get_val<uint64_t>("mds_notification_file_mask");
+  }
+  src_mask &= filter_mask;
+  dest_mask &= filter_mask;
+  uint64_t check_mask = (src_mask | dest_mask) & ((1 << 16) - 1);
+  if (check_mask) {
+    std::shared_ptr<MDSNotificationMessage> message =
+        std::make_shared<MDSNotificationMessage>(
+            cur_notification_seq_id.fetch_add(1));
+    message->create_move_message(whoami, session_id, src_mask, dest_mask,
+                                 src_path, dest_path);
+    push_notification(message);
+  }
 #endif
 }
 
@@ -158,8 +250,19 @@ void MDSNotificationManager::push_notification_snap(int32_t whoami, CInode *in,
   std::shared_ptr<MDSNotificationMessage> message =
       std::make_shared<MDSNotificationMessage>(
           cur_notification_seq_id.fetch_add(1));
-  message->create_snap_message(whoami, session_id, notify_mask, path,
-                               std::string(snapname));
-  push_notification(message);
+  uint64_t filter_mask = (1 << 17) - 1;
+  if (in->is_dir()) {
+    notify_mask |= CEPH_MDS_NOTIFY_ONLYDIR;
+    filter_mask = cct->_conf.get_val<uint64_t>("mds_notification_dir_mask");
+  } else {
+    filter_mask = cct->_conf.get_val<uint64_t>("mds_notification_file_mask");
+  }
+  notify_mask &= filter_mask;
+  uint64_t check_mask = notify_mask & ((1 << 16) - 1);
+  if (check_mask) {
+    message->create_snap_message(whoami, session_id, notify_mask, path,
+                                 std::string(snapname));
+    push_notification(message);
+  }
 #endif
 }

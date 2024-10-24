@@ -19,20 +19,6 @@ struct MDSUDPConnection {
 };
 WRITE_CLASS_ENCODER(MDSUDPConnection)
 
-class MDSUDPDriver {
-public:
-  MDSUDPDriver(MDSRank *mds, const std::string &object_name);
-  int load_data(std::map<std::string, bufferlist> &mp);
-  int add_endpoint(const std::string &name, const MDSUDPConnection &connection);
-  int remove_endpoint(const std::string &name);
-
-private:
-  MDSRank *mds;
-  std::string object_name;
-  int update_omap(const std::map<std::string, bufferlist> &mp);
-  int remove_keys(const std::set<std::string> &st);
-};
-
 class MDSUDPManager {
 public:
   MDSUDPManager(MDSRank *mds);
@@ -43,11 +29,18 @@ public:
   int remove_endpoint(const std::string &name, bool write_into_disk);
 
 private:
+  int load_data(std::map<std::string, bufferlist> &mp);
+  int add_endpoint_into_disk(const std::string &name,
+                             const MDSUDPConnection &connection);
+  int remove_endpoint_from_disk(const std::string &name);
+  int update_omap(const std::map<std::string, bufferlist> &mp);
+  int remove_keys(const std::set<std::string> &st);
   CephContext *cct;
   std::shared_mutex endpoint_mutex;
   std::unordered_map<std::string, std::shared_ptr<MDSUDPEndpoint>> endpoints;
-  std::unique_ptr<MDSUDPDriver> driver;
   static const size_t MAX_CONNECTIONS_DEFAULT = 256;
+  MDSRank *mds;
+  std::string object_name;
 };
 
 class MDSUDPEndpoint {

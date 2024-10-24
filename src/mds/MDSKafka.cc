@@ -58,14 +58,16 @@ void MDSKafkaConnection::generate_test_instances(
   o.push_back(new MDSKafkaConnection);
 }
 
-MDSKafkaDriver::MDSKafkaDriver(MDSRank *mds, const std::string &object_name)
-    : mds(mds), object_name(object_name) {}
-
-MDSKafkaManager::MDSKafkaManager(MDSRank *mds) : cct(mds->cct), paused(true) {
-  driver = std::make_unique<MDSKafkaDriver>(mds, "mds_kafka_topics");
+bool MDSKafkaConnection::is_empty() const {
+  return broker.empty() && !use_ssl && user.empty() && password.empty() &&
+         !ca_location.has_value() && !mechanism.has_value();
 }
 
-int MDSKafkaDriver::load_data(std::map<std::string, bufferlist> &mp) {
+MDSKafkaManager::MDSKafkaManager(MDSRank *mds)
+    : mds(mds), cct(mds->cct), paused(true), object_name("mds_kafka_topics"),
+      endpoints_epoch(0), prev_endpoints_epoch(0) {}
+
+int MDSKafkaManager::load_data(std::map<std::string, bufferlist> &mp) {
   int r = update_omap(std::map<std::string, bufferlist>());
   if (r < 0) {
     return r;
@@ -84,7 +86,7 @@ int MDSKafkaDriver::load_data(std::map<std::string, bufferlist> &mp) {
   return r;
 }
 
-int MDSKafkaDriver::update_omap(const std::map<std::string, bufferlist> &mp) {
+int MDSKafkaManager::update_omap(const std::map<std::string, bufferlist> &mp) {
   C_SaferCond sync_finisher;
   ObjectOperation op;
   op.omap_set(mp);
@@ -99,7 +101,7 @@ int MDSKafkaDriver::update_omap(const std::map<std::string, bufferlist> &mp) {
   return r;
 }
 
-int MDSKafkaDriver::remove_keys(const std::set<std::string> &st) {
+int MDSKafkaManager::remove_keys(const std::set<std::string> &st) {
   C_SaferCond sync_finisher;
   ObjectOperation op;
   op.omap_rm_keys(st);
@@ -114,26 +116,30 @@ int MDSKafkaDriver::remove_keys(const std::set<std::string> &st) {
   return r;
 }
 
-int MDSKafkaDriver::add_topic(const std::string &topic_name,
-                              const MDSKafkaConnection &connection) {
+int MDSKafkaManager::add_topic_into_disk(const std::string &topic_name,
+                                         const std::string &endpoint_name,
+                                         const MDSKafkaConnection &connection) {
   std::map<std::string, bufferlist> mp;
+  std::string key = topic_name + "," + endpoint_name;
   bufferlist bl;
   encode(connection, bl);
-  mp[topic_name] = std::move(bl);
+  mp[key] = std::move(bl);
   int r = update_omap(mp);
   return r;
 }
 
-int MDSKafkaDriver::remove_topic(const std::string &topic_name) {
+int MDSKafkaManager::remove_topic_from_disk(const std::string &topic_name,
+                                            const std::string &endpoint_name) {
   std::set<std::string> st;
-  st.insert(topic_name);
+  std::string key = topic_name + "," + endpoint_name;
+  st.insert(key);
   int r = remove_keys(st);
   return r;
 }
 
 int MDSKafkaManager::init() {
   std::map<std::string, bufferlist> mp;
-  int r = driver->load_data(mp);
+  int r = load_data(mp);
   if (r < 0) {
     lderr(cct) << "Error occurred while initilizing kafka topics" << dendl;
   }
@@ -142,15 +148,16 @@ int MDSKafkaManager::init() {
       MDSKafkaConnection connection;
       auto iter = val.cbegin();
       decode(connection, iter);
-      add_topic(key, connection, false);
+      size_t pos = key.find(',');
+      std::string topic_name = key.substr(0, pos);
+      std::string endpoint_name = key.substr(pos + 1);
+      add_topic(topic_name, endpoint_name, connection, false);
+      endpoints_epoch++;
     } catch (const ceph::buffer::error &e) {
-      ldout(cct, 1)
-          << "No value exist in the omap of object 'mds_kafka_topics' "
-             "for kafka topic '"
-          << key << "'" << dendl;
+      ldout(cct, 1) << "Undecodable kafka topic found:" << e.what() << dendl;
     }
   }
-  if (endpoints.empty()) {
+  if (candidate_endpoints.empty()) {
     pause();
   } else {
     activate();
@@ -158,110 +165,113 @@ int MDSKafkaManager::init() {
   return r;
 }
 
-int MDSKafkaManager::remove_topic(const std::string &topic_name, bool write_into_disk) {
+int MDSKafkaManager::remove_topic(const std::string &topic_name,
+                                  const std::string &endpoint_name,
+                                  bool write_into_disk) {
   std::unique_lock<std::shared_mutex> lock(endpoint_mutex);
   int r = 0;
-  std::shared_ptr<MDSKafka> kafka_from;
-  for (auto &[hash_key, endpoint] : endpoints) {
-    if (endpoint->has_topic(topic_name)) {
-      kafka_from = endpoint;
-      break;
-    }
-  }
-  if (kafka_from) {
-    kafka_from->remove_topic(topic_name);
-    if (kafka_from->topics.size() == 0) {
-      endpoints.erase(kafka_from->connection.hash_key);
-    }
-    if (write_into_disk) {
-      r = driver->remove_topic(topic_name);
-    }
-    if (r == 0) {
-      ldout(cct, 1) << "Kafka topic with topic name '" << topic_name
-                    << "' is removed successfully" << dendl;
-    } else {
-      lderr(cct) << "Kafka topic '" << topic_name
-                 << "' can not be removed, failed with an error:"
-                 << cpp_strerror(r) << dendl;
-      return r;
-    }
-    if (endpoints.empty()) {
-      lock.unlock();
-      pause();
-    }
-    return r;
-  }
-  ldout(cct, 1) << "No kafka topic exist with topic name '" << topic_name << "'"
-                << dendl;
-  return -CEPHFS_EINVAL;
-  ;
-}
-
-int MDSKafkaManager::add_topic(const std::string &topic_name,
-                               const MDSKafkaConnection &connection,
-                               bool write_into_disk) {
-  std::unique_lock<std::shared_mutex> lock(endpoint_mutex);
-  std::shared_ptr<MDSKafka> kafka_from, kafka_to;
-  for (auto &[hash_key, endpoint] : endpoints) {
-    if (endpoint->has_topic(topic_name)) {
-      kafka_from = endpoint;
-      break;
-    }
-  }
-  auto it = endpoints.find(connection.hash_key);
-  if (it != endpoints.end()) {
-    kafka_to = it->second;
-  }
-  if (kafka_from && kafka_from == kafka_to) {
-    ldout(cct, 1) << "Kafka topic with topic name '" << topic_name
-                  << "' is added successfully" << dendl;
-    return 0;
-  }
-  std::shared_ptr<MDSKafkaTopic> topic;
-  bool created = false;
-  int r = 0;
-  if (!kafka_to) {
-    if (endpoints.size() >= MAX_CONNECTIONS_DEFAULT) {
-      ldout(cct, 1) << "Kafka connect: max connections exceeded" << dendl;
-      r = -CEPHFS_ENOMEM;
-      goto error_occurred;
-    }
-    kafka_to = MDSKafka::create(cct, connection);
-    if (!kafka_to) {
-      r = -CEPHFS_ECANCELED;
-      goto error_occurred;
-    }
-    created = true;
-  }
-  topic = MDSKafkaTopic::create(cct, topic_name, kafka_to);
-  if (!topic) {
-    r = -CEPHFS_ECANCELED;
+  bool is_empty = false;
+  auto it = candidate_endpoints.find(endpoint_name);
+  if (it == candidate_endpoints.end()) {
+    ldout(cct, 1) << "No kafka endpoint exist having name '" << endpoint_name
+                  << "'" << dendl;
+    r = -CEPHFS_EINVAL;
     goto error_occurred;
   }
-
-  kafka_to->add_topic(topic_name, topic);
-  if (created) {
-    endpoints[connection.hash_key] = kafka_to;
+  r = it->second->remove_topic(topic_name, is_empty);
+  if (r < 0) {
+    ldout(cct, 1) << "No kafka topic exist with topic name '" << topic_name
+                  << "' with endpoint having endpoint name '" << endpoint_name
+                  << "'" << dendl;
+    goto error_occurred;
   }
-  if (kafka_from) {
-    kafka_from->remove_topic(topic_name);
-    if (kafka_from->topics.size() == 0) {
-      endpoints.erase(kafka_from->connection.hash_key);
-    }
+  if (is_empty) {
+    candidate_endpoints.erase(it);
+    endpoints_epoch++;
   }
   if (write_into_disk) {
-    r = driver->add_topic(topic_name, connection);
+    r = remove_topic_from_disk(topic_name, endpoint_name);
     if (r < 0) {
       goto error_occurred;
     }
   }
-  ldout(cct, 1) << "Kafka topic with topic name '" << topic_name
+  ldout(cct, 1) << "Kafka topic named '" << topic_name
+                << "' having endpoint name '" << endpoint_name
+                << "' is removed successfully" << dendl;
+  if (candidate_endpoints.empty()) {
+    lock.unlock();
+    pause();
+  }
+  return r;
+
+error_occurred:
+  lderr(cct) << "Kafka topic named '" << topic_name
+             << "' having endpoint name '" << endpoint_name
+             << "' can not be removed, failed with an error:" << cpp_strerror(r)
+             << dendl;
+  return r;
+}
+
+int MDSKafkaManager::add_topic(const std::string &topic_name,
+                               const std::string &endpoint_name,
+                               const MDSKafkaConnection &connection,
+                               bool write_into_disk) {
+  std::unique_lock<std::shared_mutex> lock(endpoint_mutex);
+  auto it = candidate_endpoints.find(endpoint_name);
+  std::shared_ptr<MDSKafka> kafka;
+  std::shared_ptr<MDSKafkaTopic> topic;
+  bool created = false;
+  int r = 0;
+  if (it == candidate_endpoints.end()) {
+    if (candidate_endpoints.size() >= MAX_CONNECTIONS_DEFAULT) {
+      ldout(cct, 1) << "Kafka connect: max connections exceeded" << dendl;
+      r = -CEPHFS_ENOMEM;
+      goto error_occurred;
+    }
+    kafka = MDSKafka::create(cct, connection);
+    if (!kafka) {
+      r = -CEPHFS_ECANCELED;
+      goto error_occurred;
+    }
+    created = true;
+  } else {
+    if (!connection.is_empty() &&
+        connection.hash_key != it->second->connection.hash_key) {
+      ldout(cct, 1)
+          << "Kafka endpoint name already exist with different endpoint "
+             "information"
+          << dendl;
+      r = -CEPHFS_EINVAL;
+      goto error_occurred;
+    }
+    kafka = it->second;
+  }
+  topic = MDSKafkaTopic::create(cct, topic_name, kafka);
+  if (!topic) {
+    r = -CEPHFS_ECANCELED;
+    goto error_occurred;
+  }
+  kafka->add_topic(topic_name, topic);
+  if (created) {
+    candidate_endpoints[endpoint_name] = kafka;
+    endpoints_epoch++;
+  }
+  if (write_into_disk) {
+    r = add_topic_into_disk(topic_name, endpoint_name, connection);
+    if (r < 0) {
+      goto error_occurred;
+    }
+  }
+  ldout(cct, 1) << "Kafka topic named '" << topic_name
+                << "' having endpoint name '" << endpoint_name
                 << "' is added successfully" << dendl;
   lock.unlock();
   activate();
   return r;
+
 error_occurred:
-  lderr(cct) << "Kafka topic '" << topic
+  lderr(cct) << "Kafka topic named '" << topic_name
+             << "' having endpoint name '" << endpoint_name
              << "' can not be added, failed with an error:" << cpp_strerror(r)
              << dendl;
   return r;
@@ -273,7 +283,7 @@ void MDSKafkaManager::activate() {
   }
   worker = std::thread(&MDSKafkaManager::run, this);
   paused = false;
-  ldout(cct, 1) << "worker thread of kafka manager started." << dendl;
+  ldout(cct, 1) << "KafkaManager worker thread started" << dendl;
 }
 
 void MDSKafkaManager::pause() {
@@ -284,9 +294,7 @@ void MDSKafkaManager::pause() {
   if (worker.joinable()) {
     worker.join();
   }
-  ldout(cct, 1) << "paused worker thread of kafka manager as there is no "
-                   "endpoints for sending notifications"
-                << dendl;
+  ldout(cct, 1) << "KafkaManager worker thread paused" << dendl;
 }
 
 int MDSKafkaManager::send(
@@ -304,20 +312,28 @@ int MDSKafkaManager::send(
   return 0;
 }
 
+void MDSKafkaManager::sync_endpoints() {
+  uint64_t current_epoch = endpoints_epoch.load();
+  if (prev_endpoints_epoch != current_epoch) {
+    effective_endpoints = candidate_endpoints;
+    prev_endpoints_epoch = current_epoch;
+  }
+}
+
 uint64_t MDSKafkaManager::publish(
     const std::shared_ptr<MDSNotificationMessage> &message) {
-  std::shared_lock<std::shared_mutex> lock(endpoint_mutex);
+  sync_endpoints();
   uint64_t reply_count = 0;
-  for (auto &[key, endpoint] : endpoints) {
+  for (auto &[key, endpoint] : effective_endpoints) {
     reply_count += endpoint->publish_internal(message);
   }
   return reply_count;
 }
 
 uint64_t MDSKafkaManager::polling(int read_timeout) {
-  std::shared_lock<std::shared_mutex> lock(endpoint_mutex);
+  sync_endpoints();
   uint64_t reply_count = 0;
-  for (auto &[key, endpoint] : endpoints) {
+  for (auto &[key, endpoint] : effective_endpoints) {
     reply_count += endpoint->poll(read_timeout);
   }
   return reply_count;
@@ -326,15 +342,16 @@ uint64_t MDSKafkaManager::polling(int read_timeout) {
 void MDSKafkaManager::run() {
   while (!paused) {
     int send_count = 0, reply_count = 0;
-    while (!paused) {
-      std::unique_lock<std::mutex> lock(queue_mutex);
-      if (message_queue.empty()) {
-        break;
-      }
-      std::shared_ptr<MDSNotificationMessage> message = message_queue.front();
-      message_queue.pop();
+    std::unique_lock<std::mutex> queue_lock(queue_mutex);
+    std::queue<std::shared_ptr<MDSNotificationMessage>> local_message_queue;
+    swap(local_message_queue, message_queue);
+    ceph_assert(message_queue.empty());
+    queue_lock.unlock();
+    while (!local_message_queue.empty() && !paused) {
+      std::shared_ptr<MDSNotificationMessage> message =
+          local_message_queue.front();
+      local_message_queue.pop();
       ++send_count;
-      lock.unlock();
       reply_count += publish(message);
     }
     reply_count += polling(READ_TIMEOUT_MS_DEFAULT);
@@ -437,6 +454,9 @@ MDSKafka::create(CephContext *_cct, const MDSKafkaConnection &connection) {
       MDSKafka::cct = _cct;
     }
     // validation before creating kafka interface
+    if (connection.broker.empty()) {
+      return nullptr;
+    }
     if (connection.user.empty() != connection.password.empty()) {
       return nullptr;
     }
@@ -602,23 +622,21 @@ MDSKafka::create(CephContext *_cct, const MDSKafkaConnection &connection) {
   return nullptr;
 }
 
-bool MDSKafka::has_topic(const std::string &topic_name) {
-  std::unique_lock<std::shared_mutex> lock(topic_mutex);
-  return (topics.find(topic_name) != topics.end());
-}
-
 void MDSKafka::add_topic(const std::string &topic_name,
                          const std::shared_ptr<MDSKafkaTopic> &topic) {
   std::unique_lock<std::shared_mutex> lock(topic_mutex);
   topics[topic_name] = topic;
 }
 
-void MDSKafka::remove_topic(const std::string &topic_name) {
+int MDSKafka::remove_topic(const std::string &topic_name, bool &is_empty) {
   std::unique_lock<std::shared_mutex> lock(topic_mutex);
   auto it = topics.find(topic_name);
-  if (it != topics.end()) {
-    topics.erase(it);
+  if (it == topics.end()) {
+    return -CEPHFS_EINVAL;
   }
+  topics.erase(it);
+  is_empty = topics.empty();
+  return 0;
 }
 
 void MDSKafka::log_callback(const rd_kafka_t *rk, int level, const char *fac,

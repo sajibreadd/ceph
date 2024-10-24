@@ -537,7 +537,8 @@ void MDSDaemon::set_up_admin_socket()
   r = admin_socket->register_command(
     "add_topic "
     "name=topic_name,type=CephString,req=true "
-    "name=broker,type=CephString,req=true "
+    "name=endpoint_name,type=CephString,req=true "
+    "name=broker,type=CephString,req=false "
     "name=use_ssl,type=CephBool,req=false "
     "name=username,type=CephString,req=false "
     "name=password,type=CephString,req=false "
@@ -549,7 +550,8 @@ void MDSDaemon::set_up_admin_socket()
   ceph_assert(r == 0);
   r = admin_socket->register_command(
     "remove_topic "
-    "name=topic_name,type=CephString,req=true",
+    "name=topic_name,type=CephString,req=true "
+    "name=endpoint_name,type=CephString,req=true",
     asok_hook,
     "remove kafka topic"
   );

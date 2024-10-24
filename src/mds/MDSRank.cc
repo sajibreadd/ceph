@@ -26,11 +26,6 @@
 #include "messages/MMDSTableRequest.h"
 #include "messages/MMDSMetrics.h"
 
-#ifdef WITH_CEPHFS_NOTIFICATION
-#include "messages/MNotificationInfoKafkaTopic.h"
-#include "messages/MNotificationInfoUDPEndpoint.h"
-#endif
-
 #include "mgr/MgrClient.h"
 
 #include "MDSDaemon.h"
@@ -1075,11 +1070,9 @@ bool MDSRank::_dispatch(const cref_t<Message> &m, bool new_msg)
   if (is_stale_message(m)) {
     return true;
   }
-#ifdef WITH_CEPHFS_NOTIFICATION
   if (is_notification_info(m)) {
     return true;
   }
-#endif
 
   // do not proceed if this message cannot be handled
   if (!is_valid_message(m)) {
@@ -1186,9 +1179,7 @@ bool MDSRank::_dispatch(const cref_t<Message> &m, bool new_msg)
   return true;
 }
 
-#ifdef WITH_CEPHFS_NOTIFICATION
-
-void MDSRank::send_notification_info_to_peers(const ref_t<Message> &m) {
+void MDSRank::send_to_peers(const ref_t<Message> &m) {
   set<mds_rank_t> up;
   get_mds_map()->get_up_mds_set(up);
   for (const auto &r : up) {
@@ -1200,29 +1191,13 @@ void MDSRank::send_notification_info_to_peers(const ref_t<Message> &m) {
 }
 
 bool MDSRank::is_notification_info(const cref_t<Message> &m) {
-  if (m->get_type() == MSG_MDS_NOTIFICATION_INFO_KAFKA_TOPIC) {
-    const auto &req = ref_cast<MNotificationInfoKafkaTopic>(m);
-    if (!req->is_remove) {
-      notification_manager->add_kafka_topic(
-          req->topic_name, req->broker, req->use_ssl, req->user, req->password,
-          req->ca_location, req->mechanism, false);
-    } else {
-      notification_manager->remove_kafka_topic(req->topic_name, false);
-    }
-    return true;
-  } else if (m->get_type() == MSG_MDS_NOTIFICATION_INFO_UDP_ENDPOINT) {
-    const auto &req = ref_cast<MNotificationInfoUDPEndpoint>(m);
-    if (!req->is_remove) {
-      notification_manager->add_udp_endpoint(req->name, req->ip, req->port,
-                                             false);
-    } else {
-      notification_manager->remove_udp_endpoint(req->name, false);
-    }
+  if (m->get_type() == MSG_MDS_NOTIFICATION_INFO_KAFKA_TOPIC ||
+      m->get_type() == MSG_MDS_NOTIFICATION_INFO_UDP_ENDPOINT) {
+    notification_manager->dispatch(m);
     return true;
   }
   return false;
 }
-#endif
 
 void MDSRank::update_mlogger()
 {
@@ -3148,14 +3123,14 @@ void MDSRankDispatcher::handle_asok_command(
   } else if (command == "quiesce db") {
     command_quiesce_db(cmdmap, on_finish);
     return;
-  } 
-#ifdef WITH_CEPHFS_NOTIFICATION
-  else if (command == "add_topic") {
+  } else if (command == "add_topic") {
+    std::string endpoint_name;
     std::string topic_name, broker, username;
     std::string password;
     bool use_ssl;
     std::optional<std::string> ca_location, mechanism;
     cmd_getval(cmdmap, "topic_name", topic_name);
+    cmd_getval(cmdmap, "endpoint_name", endpoint_name);
     cmd_getval(cmdmap, "broker", broker);
     if (!cmd_getval(cmdmap, "use_ssl", use_ssl)) {
       use_ssl = false;
@@ -3169,24 +3144,15 @@ void MDSRankDispatcher::handle_asok_command(
     if (cmd_getval(cmdmap, "mechanism", mch)) {
       mechanism = mch;
     }
-    auto m = make_message<MNotificationInfoKafkaTopic>(
-        topic_name, broker, use_ssl, username, password, ca_location,
-        mechanism);
-    r = notification_manager->add_kafka_topic(topic_name, broker, use_ssl,
-                                              username, password, ca_location,
-                                              mechanism, true);
-    if (r == 0) {
-      send_notification_info_to_peers(m);
-    }
-  }
-  else if (command == "remove_topic") {
-    std::string topic_name;
+    r = notification_manager->add_kafka_topic(
+        topic_name, endpoint_name, broker, use_ssl, username, password,
+        ca_location, mechanism, true, true);
+  } else if (command == "remove_topic") {
+    std::string topic_name, endpoint_name;
     cmd_getval(cmdmap, "topic_name", topic_name);
-    auto m = make_message<MNotificationInfoKafkaTopic>(topic_name, true);
-    r = notification_manager->remove_kafka_topic(topic_name, true);
-    if (r == 0) {
-      send_notification_info_to_peers(m);
-    }
+    cmd_getval(cmdmap, "endpoint_name", endpoint_name);
+    r = notification_manager->remove_kafka_topic(topic_name, endpoint_name,
+                                                 true, true);
   }
   else if (command == "add_udp_endpoint") {
     std::string ip, name;
@@ -3194,23 +3160,13 @@ void MDSRankDispatcher::handle_asok_command(
     cmd_getval(cmdmap, "entity", name);
     cmd_getval(cmdmap, "ip", ip);
     cmd_getval(cmdmap, "port", port);
-    auto m = make_message<MNotificationInfoUDPEndpoint>(name, ip, port);
-    r = notification_manager->add_udp_endpoint(name, ip, (int)port, true);
-    if (r == 0) {
-      send_notification_info_to_peers(m);
-    }
+    r = notification_manager->add_udp_endpoint(name, ip, (int)port, true, true);
   }
   else if (command == "remove_udp_endpoint") {
     std::string name;
     cmd_getval(cmdmap, "entity", name);
-    auto m = make_message<MNotificationInfoUDPEndpoint>(name, true);
-    r = notification_manager->remove_udp_endpoint(name, true);
-    if (r == 0) {
-      send_notification_info_to_peers(m);
-    }
-  }
-#endif
-  else {
+    r = notification_manager->remove_udp_endpoint(name, true, true);
+  } else {
     r = -CEPHFS_ENOSYS;
   }
 out:

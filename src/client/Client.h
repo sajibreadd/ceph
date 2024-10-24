@@ -402,15 +402,15 @@ public:
 
 #ifdef WITH_CEPHFS_NOTIFICATION
   // notifications
-  int add_kafka_topic(const char *topic_name, const char *broker,
-                            bool use_ssl, const char *user,
-                            const char *password, const char *ca_location,
-                            const char *mechanism, const UserPerm &perm);
-  int remove_kafka_topic(const char* topic_name,
-                               const UserPerm &perm);
-  int add_udp_endpoint(const char* name, const char* ip,
-                             int port, const UserPerm &perm);
-  int remove_udp_endpoint(const char* name, const UserPerm &perm);
+  int add_kafka_topic(const char *topic_name, const char *endpoint_name,
+                      const char *broker, bool use_ssl, const char *user,
+                      const char *password, const char *ca_location,
+                      const char *mechanism, const UserPerm &perm);
+  int remove_kafka_topic(const char *topic_name, const char *endpoint_name,
+                         const UserPerm &perm);
+  int add_udp_endpoint(const char *name, const char *ip, int port,
+                       const UserPerm &perm);
+  int remove_udp_endpoint(const char *name, const UserPerm &perm);
 #endif
 
   // dirs

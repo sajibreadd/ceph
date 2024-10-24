@@ -10,6 +10,8 @@
 #include "MDSKafka.h"
 #include "MDSNotificationMessage.h"
 #include "MDSUDPEndpoint.h"
+#include "messages/MNotificationInfoKafkaTopic.h"
+#include "messages/MNotificationInfoUDPEndpoint.h"
 
 class MDSKafkaManager;
 class MDSUDPManager;
@@ -20,20 +22,25 @@ public:
   MDSNotificationManager(MDSRank *mds);
   void init();
 
-#ifdef WITH_CEPHFS_NOTIFICATION
-  int add_kafka_topic(const std::string &topic_name, const std::string &broker,
-                      bool use_ssl, const std::string &user,
-                      const std::string &password,
+  // incoming notification endpoints
+  void dispatch(const cref_t<Message> &m);
+  int add_kafka_topic(const std::string &topic_name,
+                      const std::string &endpoint_name,
+                      const std::string &broker, bool use_ssl,
+                      const std::string &user, const std::string &password,
                       const std::optional<std::string> &ca_location,
                       const std::optional<std::string> &mechanism,
-                      bool write_into_disk);
-  int remove_kafka_topic(const std::string &topic_name, bool write_into_disk);
+                      bool write_into_disk, bool send_peers);
+  int remove_kafka_topic(const std::string &topic_name,
+                         const std::string &endpoint_name, bool write_into_disk,
+                         bool send_peers);
   int add_udp_endpoint(const std::string &name, const std::string &ip, int port,
-                       bool write_into_disk);
-  int remove_udp_endpoint(const std::string &name, bool write_into_disk);
-#endif
+                       bool write_into_disk, bool send_peers);
+  int remove_udp_endpoint(const std::string &name, bool write_into_disk,
+                          bool send_peers);
 
-  void push_notification(int32_t whoami, CInode *in, uint64_t notify_mask);
+  void push_notification(int32_t whoami, CInode *in, uint64_t notify_mask,
+                         bool projected = true);
   void push_notification_link(int32_t whoami, CInode *targeti, CDentry *destdn,
                               uint64_t notify_mask_for_target,
                               uint64_t notify_mask_for_link);
@@ -53,4 +60,5 @@ private:
   CephContext *cct;
   std::atomic<uint64_t> cur_notification_seq_id;
   std::string session_id;
+  MDSRank *mds;
 };
