@@ -4694,6 +4694,8 @@ void Server::handle_client_open(const MDRequestRef& mdr)
   if (cmode & CEPH_FILE_MODE_WR)
     mds->locker->check_inode_max_size(cur);
 
+  mds->notification_manager->push_notification(mds->get_nodeid(), cur,
+                                        CEPH_MDS_NOTIFY_OPEN);
   // make sure this inode gets into the journal
   if (cur->is_auth() && cur->last == CEPH_NOSNAP &&
       mdcache->open_file_table.should_log_open(cur)) {
@@ -12061,14 +12063,9 @@ void Server::handle_client_add_kafka_topic(const MDRequestRef &mdr) {
     }
   }
   int r = mds->notification_manager->add_kafka_topic(
-      payload.topic_name, payload.broker, payload.use_ssl, payload.user,
-      payload.password, payload.ca_location, payload.mechanism, true);
-  if (r == 0) {
-    auto m = make_message<MNotificationInfoKafkaTopic>(
-        payload.topic_name, payload.broker, payload.use_ssl, payload.user,
-        payload.password, payload.ca_location, payload.mechanism);
-    mds->send_notification_info_to_peers(m);
-  }
+      payload.topic_name, payload.endpoint_name, payload.broker,
+      payload.use_ssl, payload.user, payload.password, payload.ca_location,
+      payload.mechanism, true, true);
   respond_to_request(mdr, r);
 }
 
@@ -12085,13 +12082,8 @@ void Server::handle_client_remove_kafka_topic(const MDRequestRef &mdr) {
       return;
     }
   }
-  int r =
-      mds->notification_manager->remove_kafka_topic(payload.topic_name, true);
-  if (r == 0) {
-    auto m =
-        make_message<MNotificationInfoKafkaTopic>(payload.topic_name, true);
-    mds->send_notification_info_to_peers(m);
-  }
+  int r = mds->notification_manager->remove_kafka_topic(
+      payload.topic_name, payload.endpoint_name, true, true);
   respond_to_request(mdr, r);
 }
 
@@ -12109,12 +12101,7 @@ void Server::handle_client_add_udp_endpoint(const MDRequestRef &mdr) {
     }
   }
   int r = mds->notification_manager->add_udp_endpoint(payload.name, payload.ip,
-                                                      payload.port, true);
-  if (r == 0) {
-    auto m = make_message<MNotificationInfoUDPEndpoint>(
-        payload.name, payload.ip, payload.port);
-    mds->send_notification_info_to_peers(m);
-  }
+                                                      payload.port, true, true);
   respond_to_request(mdr, r);
 }
 
@@ -12131,11 +12118,8 @@ void Server::handle_client_remove_udp_endpoint(const MDRequestRef &mdr) {
       return;
     }
   }
-  int r = mds->notification_manager->remove_udp_endpoint(payload.name, true);
-  if (r == 0) {
-    auto m = make_message<MNotificationInfoUDPEndpoint>(payload.name, true);
-    mds->send_notification_info_to_peers(m);
-  }
+  int r =
+      mds->notification_manager->remove_udp_endpoint(payload.name, true, true);
   respond_to_request(mdr, r);
 }
 #endif
