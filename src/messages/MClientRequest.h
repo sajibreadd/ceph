@@ -84,23 +84,29 @@ struct NotificationEndpointPayload {
 
 struct KafkaTopicPayload final : public NotificationEndpointPayload {
   std::string topic_name;
+  std::string endpoint_name;
   std::string broker;
   bool use_ssl = false;
   std::string user, password;
   std::optional<std::string> ca_location;
   std::optional<std::string> mechanism;
   KafkaTopicPayload() {}
-  KafkaTopicPayload(const std::string &topic_name, const std::string &broker,
+  KafkaTopicPayload(const std::string &topic_name,
+                    const std::string &endpoint_name, const std::string &broker,
                     bool use_ssl, const std::string &user,
                     const std::string &password,
                     const std::optional<std::string> &ca_location,
                     const std::optional<std::string> &mechanism)
-      : topic_name(topic_name), broker(broker), use_ssl(use_ssl), user(user),
-        password(password), ca_location(ca_location), mechanism(mechanism) {}
-  KafkaTopicPayload(const std::string &topic_name) : topic_name(topic_name) {}
+      : topic_name(topic_name), endpoint_name(endpoint_name), broker(broker),
+        use_ssl(use_ssl), user(user), password(password),
+        ca_location(ca_location), mechanism(mechanism) {}
+  KafkaTopicPayload(const std::string &topic_name,
+                    const std::string &endpoint_name)
+      : topic_name(topic_name), endpoint_name(endpoint_name) {}
   void encode(ceph::buffer::list &bl) const {
     ENCODE_START(1, 1, bl);
     encode(topic_name, bl);
+    encode(endpoint_name, bl);
     encode(broker, bl);
     encode(use_ssl, bl);
     encode(user, bl);
@@ -112,6 +118,7 @@ struct KafkaTopicPayload final : public NotificationEndpointPayload {
   void decode(ceph::buffer::list::const_iterator &iter) {
     DECODE_START(1, iter);
     decode(topic_name, iter);
+    decode(endpoint_name, iter);
     decode(broker, iter);
     decode(use_ssl, iter);
     decode(user, iter);
@@ -122,6 +129,7 @@ struct KafkaTopicPayload final : public NotificationEndpointPayload {
   }
   void dump(ceph::Formatter *f) const {
     f->dump_string("topic_name", topic_name);
+    f->dump_string("endpoint_name", endpoint_name);
     f->dump_string("broker", broker);
     f->dump_bool("use_ssl", use_ssl);
     f->dump_string("user", user);

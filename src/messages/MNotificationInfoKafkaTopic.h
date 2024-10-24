@@ -7,6 +7,7 @@ class MNotificationInfoKafkaTopic : public MMDSOp {
 
 public:
   std::string topic_name;
+  std::string endpoint_name;
   std::string broker;
   bool use_ssl;
   std::string user, password;
@@ -19,22 +20,24 @@ protected:
       : MMDSOp(MSG_MDS_NOTIFICATION_INFO_KAFKA_TOPIC, HEAD_VERSION,
                COMPAT_VERSION) {}
   MNotificationInfoKafkaTopic(const std::string &topic_name,
-                              bool is_remove = true)
+                              const std::string &endpoint_name, bool is_remove)
       : MMDSOp(MSG_MDS_NOTIFICATION_INFO_KAFKA_TOPIC, HEAD_VERSION,
                COMPAT_VERSION),
-        topic_name(topic_name), is_remove(is_remove) {}
+        topic_name(topic_name), endpoint_name(endpoint_name),
+        is_remove(is_remove) {}
   MNotificationInfoKafkaTopic(const std::string &topic_name,
+                              const std::string &endpoint_name,
                               const std::string &broker, bool use_ssl,
                               const std::string &user,
                               const std::string &password,
                               const std::optional<std::string> &ca_location,
                               const std::optional<std::string> &mechanism,
-                              bool is_remove = false)
+                              bool is_remove)
       : MMDSOp(MSG_MDS_NOTIFICATION_INFO_KAFKA_TOPIC, HEAD_VERSION,
                COMPAT_VERSION),
-        topic_name(topic_name), broker(broker), use_ssl(use_ssl), user(user),
-        password(password), ca_location(ca_location), mechanism(mechanism),
-        is_remove(is_remove) {}
+        topic_name(topic_name), endpoint_name(endpoint_name), broker(broker),
+        use_ssl(use_ssl), user(user), password(password),
+        ca_location(ca_location), mechanism(mechanism), is_remove(is_remove) {}
   ~MNotificationInfoKafkaTopic() final {}
 
 public:
@@ -45,6 +48,7 @@ public:
   void encode_payload(uint64_t features) override {
     using ceph::encode;
     encode(topic_name, payload);
+    encode(endpoint_name, payload);
     encode(broker, payload);
     encode(use_ssl, payload);
     encode(user, payload);
@@ -58,6 +62,7 @@ public:
     using ceph::decode;
     auto p = payload.cbegin();
     decode(topic_name, p);
+    decode(endpoint_name, p);
     decode(broker, p);
     decode(use_ssl, p);
     decode(user, p);

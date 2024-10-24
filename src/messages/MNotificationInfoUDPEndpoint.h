@@ -15,12 +15,12 @@ protected:
   MNotificationInfoUDPEndpoint()
       : MMDSOp(MSG_MDS_NOTIFICATION_INFO_UDP_ENDPOINT, HEAD_VERSION,
                COMPAT_VERSION) {}
-  MNotificationInfoUDPEndpoint(const std::string &name, bool is_remove = true)
+  MNotificationInfoUDPEndpoint(const std::string &name, bool is_remove)
       : MMDSOp(MSG_MDS_NOTIFICATION_INFO_UDP_ENDPOINT, HEAD_VERSION,
                COMPAT_VERSION),
         name(name), is_remove(is_remove) {}
   MNotificationInfoUDPEndpoint(const std::string &name, const std::string &ip,
-                               int port, bool is_remove = false)
+                               int port, bool is_remove)
       : MMDSOp(MSG_MDS_NOTIFICATION_INFO_UDP_ENDPOINT, HEAD_VERSION,
                COMPAT_VERSION),
         name(name), ip(ip), port(port), is_remove(is_remove) {}

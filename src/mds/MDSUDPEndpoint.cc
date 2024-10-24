@@ -30,10 +30,7 @@ void MDSUDPConnection::decode(ceph::buffer::list::const_iterator &iter) {
   DECODE_FINISH(iter);
 }
 
-MDSUDPDriver::MDSUDPDriver(MDSRank *mds, const std::string &object_name)
-    : mds(mds), object_name(object_name) {}
-
-int MDSUDPDriver::load_data(std::map<std::string, bufferlist> &mp) {
+int MDSUDPManager::load_data(std::map<std::string, bufferlist> &mp) {
   int r = update_omap(std::map<std::string, bufferlist>());
   if (r < 0) {
     return r;
@@ -52,7 +49,7 @@ int MDSUDPDriver::load_data(std::map<std::string, bufferlist> &mp) {
   return r;
 }
 
-int MDSUDPDriver::update_omap(const std::map<std::string, bufferlist> &mp) {
+int MDSUDPManager::update_omap(const std::map<std::string, bufferlist> &mp) {
   C_SaferCond sync_finisher;
   ObjectOperation op;
   op.omap_set(mp);
@@ -67,7 +64,7 @@ int MDSUDPDriver::update_omap(const std::map<std::string, bufferlist> &mp) {
   return r;
 }
 
-int MDSUDPDriver::remove_keys(const std::set<std::string> &st) {
+int MDSUDPManager::remove_keys(const std::set<std::string> &st) {
   C_SaferCond sync_finisher;
   ObjectOperation op;
   op.omap_rm_keys(st);
@@ -82,8 +79,8 @@ int MDSUDPDriver::remove_keys(const std::set<std::string> &st) {
   return r;
 }
 
-int MDSUDPDriver::add_endpoint(const std::string &name,
-                               const MDSUDPConnection &connection) {
+int MDSUDPManager::add_endpoint_into_disk(const std::string &name,
+                                          const MDSUDPConnection &connection) {
   std::map<std::string, bufferlist> mp;
   bufferlist bl;
   encode(connection, bl);
@@ -92,20 +89,19 @@ int MDSUDPDriver::add_endpoint(const std::string &name,
   return r;
 }
 
-int MDSUDPDriver::remove_endpoint(const std::string &name) {
+int MDSUDPManager::remove_endpoint_from_disk(const std::string &name) {
   std::set<std::string> st;
   st.insert(name);
   int r = remove_keys(st);
   return r;
 }
 
-MDSUDPManager::MDSUDPManager(MDSRank *mds) : cct(mds->cct) {
-  driver = std::make_unique<MDSUDPDriver>(mds, "mds_udp_endpoints");
-}
+MDSUDPManager::MDSUDPManager(MDSRank *mds)
+    : mds(mds), cct(mds->cct), object_name("mds_udp_endpoints") {}
 
 int MDSUDPManager::init() {
   std::map<std::string, bufferlist> mp;
-  int r = driver->load_data(mp);
+  int r = load_data(mp);
   if (r < 0) {
     lderr(cct) << "Error occurred while initilizing UDP endpoints" << dendl;
     return r;
@@ -160,7 +156,7 @@ int MDSUDPManager::add_endpoint(const std::string &name,
   }
   endpoints[name] = new_endpoint;
   if (write_into_disk) {
-    r = driver->add_endpoint(name, connection);
+    r = add_endpoint_into_disk(name, connection);
     if (r < 0) {
       goto error_occurred;
     }
@@ -183,7 +179,7 @@ int MDSUDPManager::remove_endpoint(const std::string &name,
   if (it != endpoints.end()) {
     endpoints.erase(it);
     if (write_into_disk) {
-      r = driver->remove_endpoint(name);
+      r = remove_endpoint_from_disk(name);
     }
     if (r == 0) {
       ldout(cct, 1) << "UDP endpoint with entity name '" << name

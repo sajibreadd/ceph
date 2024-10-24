@@ -57,7 +57,7 @@ set(mds_srcs
   MDSNotificationManager.cc)
 
 if (WITH_CEPHFS_NOTIFICATION)
-  list(APPEND mds_srcs MDSKafka.cc MDSUDPEndpoint.cc MDSNotificationMessage.cc)
+  list(APPEND mds_srcs MDSKafka.cc MDSUDPEndpoint.cc MDSTCPEndpoint.cc MDSNotificationMessage.cc)
 endif()
 
 add_library(mds STATIC ${mds_srcs})

@@ -4694,6 +4694,8 @@ void Server::handle_client_open(const MDRequestRef& mdr)
   if (cmode & CEPH_FILE_MODE_WR)
     mds->locker->check_inode_max_size(cur);
 
+  mds->notification_manager->push_notification(mds->get_nodeid(), cur,
+                                        CEPH_MDS_NOTIFY_OPEN, true, cur->is_dir());
   // make sure this inode gets into the journal
   if (cur->is_auth() && cur->last == CEPH_NOSNAP &&
       mdcache->open_file_table.should_log_open(cur)) {
@@ -4911,7 +4913,7 @@ void Server::handle_client_openc(const MDRequestRef& mdr)
 
   mds->notification_manager->push_notification(mds->get_nodeid(), newi,
                                         CEPH_MDS_NOTIFY_CREATE |
-                                            CEPH_MDS_NOTIFY_OPEN);
+                                            CEPH_MDS_NOTIFY_OPEN, true, newi->is_dir());
 
   journal_and_reply(mdr, newi, dn, le, fin);
 
@@ -5592,7 +5594,7 @@ void Server::handle_client_setattr(const MDRequestRef& mdr)
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
   mds->notification_manager->push_notification(mds->get_nodeid(), cur,
-                                        CEPH_MDS_NOTIFY_ATTRIB);
+                                        CEPH_MDS_NOTIFY_ATTRIB, true, cur->is_dir());
 
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur,
 								   truncating_smaller, changed_ranges));
@@ -5661,7 +5663,7 @@ void Server::do_open_truncate(const MDRequestRef& mdr, int cmode)
   mds->notification_manager->push_notification(mds->get_nodeid(), in,
                                         CEPH_MDS_NOTIFY_MODIFY |
                                             CEPH_MDS_NOTIFY_ACCESS |
-                                            CEPH_MDS_NOTIFY_OPEN);
+                                            CEPH_MDS_NOTIFY_OPEN, true, in->is_dir());
 
   journal_and_reply(mdr, in, dn, le, new C_MDS_inode_update_finish(this, mdr, in, old_size > 0,
 								   changed_ranges));
@@ -5753,7 +5755,7 @@ void Server::handle_client_setlayout(const MDRequestRef& mdr)
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
   mds->notification_manager->push_notification(mds->get_nodeid(), cur,
-                                        CEPH_MDS_NOTIFY_ATTRIB);
+                                        CEPH_MDS_NOTIFY_ATTRIB, true, cur->is_dir());
   
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
@@ -5873,7 +5875,7 @@ void Server::handle_client_setdirlayout(const MDRequestRef& mdr)
   mdr->no_early_reply = true;
 
   mds->notification_manager->push_notification(mds->get_nodeid(), cur,
-                                        CEPH_MDS_NOTIFY_ATTRIB);
+                                        CEPH_MDS_NOTIFY_ATTRIB, true, cur->is_dir());
 
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
@@ -6579,7 +6581,7 @@ void Server::handle_client_setvxattr(const MDRequestRef& mdr, CInode *cur)
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
   mds->notification_manager->push_notification(mds->get_nodeid(), cur,
-                                        CEPH_MDS_NOTIFY_ATTRIB);
+                                        CEPH_MDS_NOTIFY_ATTRIB, true, cur->is_dir());
 
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur,
 								   false, false, adjust_realm));
@@ -6864,7 +6866,7 @@ void Server::handle_client_setxattr(const MDRequestRef& mdr)
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
   mds->notification_manager->push_notification(mds->get_nodeid(), cur,
-                                        CEPH_MDS_NOTIFY_ATTRIB);
+                                        CEPH_MDS_NOTIFY_ATTRIB, true, cur->is_dir());
 
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
@@ -6936,7 +6938,7 @@ void Server::handle_client_removexattr(const MDRequestRef& mdr)
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
   mds->notification_manager->push_notification(mds->get_nodeid(), cur,
-                                        CEPH_MDS_NOTIFY_ATTRIB);
+                                        CEPH_MDS_NOTIFY_ATTRIB, true, cur->is_dir());
 
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
@@ -7256,7 +7258,7 @@ void Server::handle_client_mknod(const MDRequestRef& mdr)
 
   mds->notification_manager->push_notification(mds->get_nodeid(), newi,
                                         CEPH_MDS_NOTIFY_CREATE |
-                                            CEPH_MDS_NOTIFY_ATTRIB);
+                                            CEPH_MDS_NOTIFY_ATTRIB, true, newi->is_dir());
 
   journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(this, mdr, dn, newi));
   mds->balancer->maybe_fragment(dn->get_dir(), false);
@@ -7349,7 +7351,7 @@ void Server::handle_client_mkdir(const MDRequestRef& mdr)
   le->metablob.add_opened_ino(newi->ino());
 
   mds->notification_manager->push_notification(mds->get_nodeid(), newi,
-                                        CEPH_MDS_NOTIFY_CREATE);
+                                        CEPH_MDS_NOTIFY_CREATE, true, newi->is_dir());
 
   journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(this, mdr, dn, newi));
 
@@ -7415,7 +7417,7 @@ void Server::handle_client_symlink(const MDRequestRef& mdr)
   le->metablob.add_primary_dentry(dn, newi, true, true);
 
   mds->notification_manager->push_notification(mds->get_nodeid(), newi,
-                                        CEPH_MDS_NOTIFY_CREATE);
+                                        CEPH_MDS_NOTIFY_CREATE, true, newi->is_dir());
 
   journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(this, mdr, dn, newi));
   mds->balancer->maybe_fragment(dir, false);
@@ -7550,7 +7552,7 @@ void Server::handle_client_link(const MDRequestRef& mdr)
 
   mds->notification_manager->push_notification_link(mds->get_nodeid(), targeti, destdn,
                                              CEPH_MDS_NOTIFY_ATTRIB,
-                                             CEPH_MDS_NOTIFY_CREATE);
+                                             CEPH_MDS_NOTIFY_CREATE, targeti->is_dir());
 
   // local or remote?
   if (targeti->is_auth()) 
@@ -8280,7 +8282,7 @@ void Server::handle_client_unlink(const MDRequestRef& mdr)
 
   mds->notification_manager->push_notification_link(mds->get_nodeid(), in, dn,
                                              CEPH_MDS_NOTIFY_ATTRIB,
-                                             CEPH_MDS_NOTIFY_DELETE);
+                                             CEPH_MDS_NOTIFY_DELETE, in->is_dir());
 
   // ok!
   if (dnl->is_remote() && !dnl->get_inode()->is_auth()) 
@@ -9313,7 +9315,7 @@ void Server::handle_client_rename(const MDRequestRef& mdr)
   C_MDS_rename_finish *fin = new C_MDS_rename_finish(this, mdr, srcdn, destdn, straydn);
 
   mds->notification_manager->push_notification_move(mds->get_nodeid(), srcdn,
-                                               destdn);
+                                               destdn, srci->is_dir());
 
   journal_and_reply(mdr, srci, destdn, le, fin);
   mds->balancer->maybe_fragment(destdn->get_dir(), false);
@@ -11287,7 +11289,7 @@ void Server::handle_client_mksnap(const MDRequestRef& mdr)
   
   mds->notification_manager->push_notification_snap(
       mds->get_nodeid(), diri, std::string(snapname),
-      CEPH_MDS_NOTIFY_CREATE | CEPH_MDS_NOTIFY_ATTRIB);
+      CEPH_MDS_NOTIFY_CREATE | CEPH_MDS_NOTIFY_ATTRIB, diri->is_dir());
 
   // journal the snaprealm changes
   submit_mdlog_entry(le, new C_MDS_mksnap_finish(this, mdr, diri, info),
@@ -11424,7 +11426,7 @@ void Server::handle_client_rmsnap(const MDRequestRef& mdr)
 
   mds->notification_manager->push_notification_snap(
       mds->get_nodeid(), diri, std::string(snapname),
-      CEPH_MDS_NOTIFY_DELETE | CEPH_MDS_NOTIFY_ATTRIB);
+      CEPH_MDS_NOTIFY_DELETE | CEPH_MDS_NOTIFY_ATTRIB, diri->is_dir());
 
   submit_mdlog_entry(le, new C_MDS_rmsnap_finish(this, mdr, diri, snapid),
                      mdr, __func__);
@@ -12061,14 +12063,9 @@ void Server::handle_client_add_kafka_topic(const MDRequestRef &mdr) {
     }
   }
   int r = mds->notification_manager->add_kafka_topic(
-      payload.topic_name, payload.broker, payload.use_ssl, payload.user,
-      payload.password, payload.ca_location, payload.mechanism, true);
-  if (r == 0) {
-    auto m = make_message<MNotificationInfoKafkaTopic>(
-        payload.topic_name, payload.broker, payload.use_ssl, payload.user,
-        payload.password, payload.ca_location, payload.mechanism);
-    mds->send_notification_info_to_peers(m);
-  }
+      payload.topic_name, payload.endpoint_name, payload.broker,
+      payload.use_ssl, payload.user, payload.password, payload.ca_location,
+      payload.mechanism, true, true);
   respond_to_request(mdr, r);
 }
 
@@ -12085,13 +12082,8 @@ void Server::handle_client_remove_kafka_topic(const MDRequestRef &mdr) {
       return;
     }
   }
-  int r =
-      mds->notification_manager->remove_kafka_topic(payload.topic_name, true);
-  if (r == 0) {
-    auto m =
-        make_message<MNotificationInfoKafkaTopic>(payload.topic_name, true);
-    mds->send_notification_info_to_peers(m);
-  }
+  int r = mds->notification_manager->remove_kafka_topic(
+      payload.topic_name, payload.endpoint_name, true, true);
   respond_to_request(mdr, r);
 }
 
@@ -12109,12 +12101,7 @@ void Server::handle_client_add_udp_endpoint(const MDRequestRef &mdr) {
     }
   }
   int r = mds->notification_manager->add_udp_endpoint(payload.name, payload.ip,
-                                                      payload.port, true);
-  if (r == 0) {
-    auto m = make_message<MNotificationInfoUDPEndpoint>(
-        payload.name, payload.ip, payload.port);
-    mds->send_notification_info_to_peers(m);
-  }
+                                                      payload.port, true, true);
   respond_to_request(mdr, r);
 }
 
@@ -12131,11 +12118,8 @@ void Server::handle_client_remove_udp_endpoint(const MDRequestRef &mdr) {
       return;
     }
   }
-  int r = mds->notification_manager->remove_udp_endpoint(payload.name, true);
-  if (r == 0) {
-    auto m = make_message<MNotificationInfoUDPEndpoint>(payload.name, true);
-    mds->send_notification_info_to_peers(m);
-  }
+  int r =
+      mds->notification_manager->remove_udp_endpoint(payload.name, true, true);
   respond_to_request(mdr, r);
 }
 #endif

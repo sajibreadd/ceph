@@ -31,3 +31,20 @@ add_executable(unittest_mds_quiesce_agent
 )
 add_ceph_unittest(unittest_mds_quiesce_agent)
 target_link_libraries(unittest_mds_quiesce_agent ceph-common global)
+
+if (WITH_CEPHFS_NOTIFICATION)
+# unittest_cephfs_notification
+  add_executable(unittest_cephfs_notification
+    TestCephFSNotification.cc
+    $<TARGET_OBJECTS:unit-main>
+  )
+  add_ceph_unittest(unittest_cephfs_notification)
+  target_link_libraries(unittest_cephfs_notification
+  ceph-common
+  global
+  cephfs
+  ${Boost_LIBRARIES})
+  target_include_directories(unittest_cephfs_notification PRIVATE
+    ${Boost_INCLUDE_DIRS}
+  )
+endif()

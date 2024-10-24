@@ -17497,16 +17497,13 @@ void StandaloneClient::shutdown()
 
 #ifdef WITH_CEPHFS_NOTIFICATION
 // notifications
-int Client::add_kafka_topic(const char *topic_name, const char *broker,
-                            bool use_ssl, const char *user,
+int Client::add_kafka_topic(const char *topic_name, const char *endpoint_name,
+                            const char *broker, bool use_ssl, const char *user,
                             const char *password, const char *ca_location,
                             const char *mechanism, const UserPerm &perm) {
-  ldout(cct, 10) << __func__ << ": "
-                 << "topic_name=" << topic_name << ", broker=" << broker
-                 << dendl;
   MetaRequest *req = new MetaRequest(CEPH_MDS_OP_ADD_KAFKA_TOPIC);
-    
-  KafkaTopicPayload payload(topic_name, broker, use_ssl,
+
+  KafkaTopicPayload payload(topic_name, endpoint_name, broker, use_ssl,
                             (user == nullptr ? "" : user),
                             (password == nullptr ? "" : password),
                             (ca_location == nullptr || strlen(ca_location) == 0)
@@ -17523,10 +17520,11 @@ int Client::add_kafka_topic(const char *topic_name, const char *broker,
   return res;
 }
 
-int Client::remove_kafka_topic(const char* topic_name,
+int Client::remove_kafka_topic(const char *topic_name,
+                               const char *endpoint_name,
                                const UserPerm &perm) {
   MetaRequest *req = new MetaRequest(CEPH_MDS_OP_REMOVE_KAFKA_TOPIC);
-  KafkaTopicPayload payload(topic_name);
+  KafkaTopicPayload payload(topic_name, endpoint_name);
   bufferlist bl;
   encode(payload, bl);
   req->set_data(bl);
