@@ -1645,6 +1645,8 @@ private:
   std::vector<MDSCapAuth> cap_auths;
 
   feature_bitset_t myfeatures;
+
+  bool client_permissions;
 };
 
 /**
