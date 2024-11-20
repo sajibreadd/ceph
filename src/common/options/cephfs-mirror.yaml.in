@@ -91,4 +91,39 @@ options:
   default: 10
   services:
   - cephfs-mirror
+<<<<<<< HEAD
   min: 0
+=======
+  min: 0
+- name: cephfs_mirror_perf_stats_prio
+  type: int
+  level: advanced
+  desc: Priority level for mirror daemon replication perf counters
+  long_desc: The daemon will send perf counter data to the manager daemon if the priority
+    is not lower than mgr_stats_threshold.
+  default: 5
+  services:
+  - cephfs-mirror
+  min: 0
+  max: 11
+- name: cephfs_mirror_max_concurrent_file_transfer
+  type: uint
+  level: advanced
+  desc: number of threads running for file transfers per peer
+  long_desc: number of threads running for file transfers per peer.
+    Each thread is responsible for transfering a single file.
+  default: 3
+  services:
+  - cephfs-mirror
+  min: 1
+- name: cephfs_mirror_max_concurrent_large_file_transfer
+  type: uint
+  level: advanced
+  desc: maximum number of large file which can be transferred concurrently.
+  long_desc: In any moment more than this number of large file 
+    transfer can not happen concurrently.
+  default: 1
+  services:
+  - cephfs-mirror
+  min: 1
+>>>>>>> ae8d8c291b2 (Making PeerReplayer multithreaded for file transfers for single directory.)
