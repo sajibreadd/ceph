@@ -142,20 +142,24 @@ private:
   Commands commands;
 };
 
-PeerReplayer::PeerReplayer(CephContext *cct, FSMirror *fs_mirror,
-                           RadosRef local_cluster, const Filesystem &filesystem,
-                           const Peer &peer, const std::set<std::string, std::less<>> &directories,
-                           MountRef mount, ServiceDaemon *service_daemon)
-  : m_cct(cct),
-    m_fs_mirror(fs_mirror),
-    m_local_cluster(local_cluster),
-    m_filesystem(filesystem),
-    m_peer(peer),
-    m_directories(directories.begin(), directories.end()),
-    m_local_mount(mount),
-    m_service_daemon(service_daemon),
-    m_asok_hook(new PeerReplayerAdminSocketHook(cct, filesystem, peer, this)),
-    m_lock(ceph::make_mutex("cephfs::mirror::PeerReplayer::" + stringify(peer.uuid))) {
+PeerReplayer::PeerReplayer(
+    CephContext *cct, FSMirror *fs_mirror, RadosRef local_cluster,
+    const Filesystem &filesystem, const Peer &peer,
+    const std::set<std::string, std::less<>> &directories, MountRef mount,
+    ServiceDaemon *service_daemon)
+    : m_cct(cct), m_fs_mirror(fs_mirror), m_local_cluster(local_cluster),
+      m_filesystem(filesystem), m_peer(peer),
+      m_directories(directories.begin(), directories.end()),
+      m_local_mount(mount), m_service_daemon(service_daemon),
+      m_asok_hook(new PeerReplayerAdminSocketHook(cct, filesystem, peer, this)),
+      m_lock(ceph::make_mutex("cephfs::mirror::PeerReplayer::" +
+                              stringify(peer.uuid))),
+      file_transfer_context(
+          (int)g_ceph_context->_conf.get_val<uint64_t>(
+              "cephfs_mirror_max_concurrent_file_transfer"),
+          (int)g_ceph_context->_conf.get_val<uint64_t>(
+              "cephfs_mirror_max_concurrent_large_file_transfer"),
+          g_ceph_context->_conf->osd_max_object_size) {
   // reset sync stats sent via service daemon
   m_service_daemon->add_or_update_peer_attribute(m_filesystem.fscid, m_peer,
                                                  SERVICE_DAEMON_FAILED_DIR_COUNT_KEY, (uint64_t)0);
@@ -227,10 +231,10 @@ int PeerReplayer::init() {
   }
 
   std::scoped_lock locker(m_lock);
+  file_transfer_context.activate();
   auto nr_replayers = g_ceph_context->_conf.get_val<uint64_t>(
     "cephfs_mirror_max_concurrent_directory_syncs");
   dout(20) << ": spawning " << nr_replayers << " snapshot replayer(s)" << dendl;
-
   while (nr_replayers-- > 0) {
     std::unique_ptr<SnapshotReplayerThread> replayer(
       new SnapshotReplayerThread(this));
@@ -247,11 +251,12 @@ void PeerReplayer::shutdown() {
 
   {
     std::scoped_lock locker(m_lock);
-    ceph_assert(!m_stopping);
-    m_stopping = true;
+    ceph_assert(!m_stopping.load());
+    m_stopping.store(true);
     m_cond.notify_all();
   }
 
+  file_transfer_context.deactivate();
   for (auto &replayer : m_replayers) {
     replayer->join();
   }
@@ -285,7 +290,7 @@ void PeerReplayer::remove_directory(string_view dir_root) {
   if (it1 == m_registered.end()) {
     m_snap_sync_stats.erase(_dir_root);
   } else {
-    it1->second.canceled = true;
+    it1->second.canceled->store(true);
   }
   m_cond.notify_all();
 }
@@ -583,15 +588,130 @@ int PeerReplayer::remote_mkdir(const std::string &epath, const struct ceph_statx
   return 0;
 }
 
+PeerReplayer::FileTransferHandlerThreadPool::FileTransferHandlerThreadPool(
+    int _num_threads, int _max_concurrent_large_file,
+    uint64_t _file_size_threshold)
+    : num_threads(_num_threads), max_concurrent_large_file(std::min(
+                                     _num_threads, _max_concurrent_large_file)),
+      file_size_threshold(_file_size_threshold), workers(_num_threads),
+      stop_flag(true) {
+  max_token_sum = file_size_threshold * num_threads * max_concurrent_large_file;
+}
+
+void PeerReplayer::FileTransferHandlerThreadPool::activate() {
+  ceph_assert(stop_flag.load());
+  stop_flag = false;
+  for (auto &worker : workers) {
+    worker = std::thread(&FileTransferHandlerThreadPool::run, this);
+  }
+}
+
+void PeerReplayer::FileTransferHandlerThreadPool::deactivate() {
+  ceph_assert(!stop_flag.load());
+  stop_flag = true;
+  pick_task.notify_all();
+  give_task.notify_all();
+  exec_task.notify_all();
+  for (auto &worker : workers) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+  drain_queue();
+}
+
+void PeerReplayer::FileTransferHandlerThreadPool::drain_queue() {
+  std::scoped_lock lock(pmtx);
+  while (!task_queue.empty()) {
+    auto& [task, token] = task_queue.front();
+    task(true);
+    current_token_sum -= token;
+    task_queue.pop();
+  }
+}
+
+// K * L + (S - L) * min(file_size, K)
+uint64_t
+PeerReplayer::FileTransferHandlerThreadPool::get_token(uint64_t file_size) {
+  return file_size_threshold * max_concurrent_large_file +
+         std::min(file_size, file_size_threshold) *
+             (num_threads - max_concurrent_large_file);
+}
+
+void PeerReplayer::FileTransferHandlerThreadPool::run() {
+  while (true) {
+    std::function<void(bool)> task;
+    int64_t token;
+    {
+      std::unique_lock<std::mutex> lock(pmtx);
+      pick_task.wait(
+          lock, [this] { return (stop_flag.load() || !task_queue.empty()); });
+      if (stop_flag.load()) {
+        return;
+      }
+      std::tie(task, token) = std::move(task_queue.front());
+      task_queue.pop();
+      give_task.notify_one();
+      exec_task.wait(lock, [&token, this] {
+        return (stop_flag.load() || current_token_sum + token <= max_token_sum);
+      });
+      if (stop_flag.load()) {
+        return;
+      }
+      current_token_sum += token;
+    }
+    task(false);
+    {
+      std::scoped_lock<std::mutex> lock(pmtx);
+      current_token_sum -= token;
+      exec_task.notify_one();
+    }
+  }
+}
+
+template <class F, class... Args>
+void PeerReplayer::FileTransferHandlerThreadPool::enqueue(
+    std::atomic<int> &counter, std::condition_variable &dir_cv,
+    uint64_t file_size, F &&f, Args &&...args) {
+  {
+    std::unique_lock<std::mutex> lock(pmtx);
+    uint64_t token = get_token(file_size);
+    give_task.wait(lock, [this] {
+      return (stop_flag.load() || task_queue.size() < task_queue_limit);
+    });
+    if (stop_flag.load()) {
+      return;
+    }
+    counter++;
+    task_queue.emplace(
+        [f = std::forward<F>(f), ... args = std::forward<Args>(args), &counter,
+         &dir_cv](bool dont_execute) mutable {
+          if (!dont_execute) {
+            f(std::move(args)...);
+          }
+          --counter;
+          if (counter.load() == 0) {
+            dir_cv.notify_one();
+          }
+        },
+        token);
+  }
+  pick_task.notify_one();
+}
+
 #define NR_IOVECS 8 // # iovecs
 #define IOVEC_SIZE (8 * 1024 * 1024) // buffer size for each iovec
-int PeerReplayer::copy_to_remote(const std::string &dir_root,  const std::string &epath,
-                                 const struct ceph_statx &stx, const FHandles &fh) {
+int PeerReplayer::copy_to_remote(const std::string &dir_root,
+                                 const std::string &epath,
+                                 const struct ceph_statx &stx,
+                                 const FHandles &fh,
+                                 std::atomic<int> &rem_file_transfer,
+                                 std::condition_variable &cv,
+                                 std::shared_ptr<std::atomic<bool>> &canceled,
+                                 std::shared_ptr<std::atomic<bool>> &failed) {
   dout(10) << ": dir_root=" << dir_root << ", epath=" << epath << dendl;
   int l_fd;
   int r_fd;
-  void *ptr;
-  struct iovec iov[NR_IOVECS];
 
   int r = ceph_openat(m_local_mount, fh.c_fd, epath.c_str(), O_RDONLY | O_NOFOLLOW, 0);
   if (r < 0) {
@@ -606,90 +726,118 @@ int PeerReplayer::copy_to_remote(const std::string &dir_root,  const std::string
   if (r < 0) {
     derr << ": failed to create remote file path=" << epath << ": "
          << cpp_strerror(r) << dendl;
-    goto close_local_fd;
+    if (ceph_close(m_local_mount, l_fd) < 0) {
+      derr << ": failed to close local fd path=" << epath << ": "
+           << cpp_strerror(r) << dendl;
+      return -EINVAL;
+    }
+    return r;
   }
 
   r_fd = r;
-  ptr = malloc(NR_IOVECS * IOVEC_SIZE);
-  if (!ptr) {
-    r = -ENOMEM;
-    derr << ": failed to allocate memory" << dendl;
-    goto close_remote_fd;
-  }
 
-  while (true) {
-    if (should_backoff(dir_root, &r)) {
+  auto transfer = [l_fd, r_fd, &canceled, &failed,
+                   this](const std::string dir_root, const std::string epath) {
+    bool marked = false;
+    int r = 0;
+    void *ptr;
+    struct iovec iov[NR_IOVECS];
+    if (should_backoff(canceled, failed, &r)) {
       dout(0) << ": backing off r=" << r << dendl;
-      break;
+      goto close_fd;
+    }
+    ptr = malloc(NR_IOVECS * IOVEC_SIZE);
+    if (!ptr) {
+      r = -ENOMEM;
+      derr << ": failed to allocate memory" << dendl;
+      goto close_fd;
     }
 
-    for (int i = 0; i < NR_IOVECS; ++i) {
-      iov[i].iov_base = (char*)ptr + IOVEC_SIZE*i;
-      iov[i].iov_len = IOVEC_SIZE;
+    while (true) {
+      if (should_backoff(canceled, failed, &r)) {
+        dout(0) << ": backing off r=" << r << dendl;
+        break;
+      }
+
+      for (int i = 0; i < NR_IOVECS; ++i) {
+        iov[i].iov_base = (char *)ptr + IOVEC_SIZE * i;
+        iov[i].iov_len = IOVEC_SIZE;
+      }
+
+      r = ceph_preadv(m_local_mount, l_fd, iov, NR_IOVECS, -1);
+      if (r < 0) {
+        derr << ": failed to read local file path=" << epath << ": "
+             << cpp_strerror(r) << dendl;
+        break;
+      }
+      if (r == 0) {
+        break;
+      }
+
+      int iovs = (int)(r / IOVEC_SIZE);
+      int t = r % IOVEC_SIZE;
+      if (t) {
+        iov[iovs].iov_len = t;
+        ++iovs;
+      }
+
+      r = ceph_pwritev(m_remote_mount, r_fd, iov, iovs, -1);
+      if (r < 0) {
+        derr << ": failed to write remote file path=" << epath << ": "
+             << cpp_strerror(r) << dendl;
+        break;
+      }
     }
 
-    r = ceph_preadv(m_local_mount, l_fd, iov, NR_IOVECS, -1);
-    if (r < 0) {
-      derr << ": failed to read local file path=" << epath << ": "
-           << cpp_strerror(r) << dendl;
-      break;
-    }
     if (r == 0) {
-      break;
+      r = ceph_fsync(m_remote_mount, r_fd, 0);
+      if (r < 0) {
+        derr << ": failed to sync data for file path=" << epath << ": "
+             << cpp_strerror(r) << dendl;
+      }
     }
 
-    int iovs = (int)(r / IOVEC_SIZE);
-    int t = r % IOVEC_SIZE;
-    if (t) {
-      iov[iovs].iov_len = t;
-      ++iovs;
+    free(ptr);
+    if (r < 0 && !failed->load()) {
+      mark_failed(dir_root, r);
     }
 
-    r = ceph_pwritev(m_remote_mount, r_fd, iov, iovs, -1);
-    if (r < 0) {
-      derr << ": failed to write remote file path=" << epath << ": "
+  close_fd:
+    if (ceph_close(m_remote_mount, r_fd) < 0) {
+      derr << ": failed to close remote fd path=" << epath << ": "
            << cpp_strerror(r) << dendl;
-      break;
+      if (!failed->load()) {
+        mark_failed(dir_root, -EINVAL);
+      }
     }
-  }
-
-  if (r == 0) {
-    r = ceph_fsync(m_remote_mount, r_fd, 0);
-    if (r < 0) {
-      derr << ": failed to sync data for file path=" << epath << ": "
+    if (ceph_close(m_local_mount, l_fd) < 0) {
+      derr << ": failed to close local fd path=" << epath << ": "
            << cpp_strerror(r) << dendl;
+      if (!failed->load()) {
+        mark_failed(dir_root, -EINVAL);
+      }
     }
-  }
+  };
 
-  free(ptr);
-
-close_remote_fd:
-  if (ceph_close(m_remote_mount, r_fd) < 0) {
-    derr << ": failed to close remote fd path=" << epath << ": " << cpp_strerror(r)
-         << dendl;
-    return -EINVAL;
-  }
-
-close_local_fd:
-  if (ceph_close(m_local_mount, l_fd) < 0) {
-    derr << ": failed to close local fd path=" << epath << ": " << cpp_strerror(r)
-         << dendl;
-    return -EINVAL;
-  }
-
-  return r == 0 ? 0 : r;
+  file_transfer_context.enqueue(rem_file_transfer, cv, stx.stx_size, transfer,
+                                dir_root, epath);
+  return 0;
 }
 
-int PeerReplayer::remote_file_op(const std::string &dir_root, const std::string &epath,
-                                 const struct ceph_statx &stx, const FHandles &fh,
-                                 bool need_data_sync, bool need_attr_sync) {
+int PeerReplayer::remote_file_op(
+    const std::string &dir_root, const std::string &epath,
+    const struct ceph_statx &stx, const FHandles &fh, bool need_data_sync,
+    bool need_attr_sync, std::atomic<int> &rem_file_transfer,
+    std::condition_variable &cv, std::shared_ptr<std::atomic<bool>> &canceled,
+    std::shared_ptr<std::atomic<bool>> &failed) {
   dout(10) << ": dir_root=" << dir_root << ", epath=" << epath << ", need_data_sync=" << need_data_sync
            << ", need_attr_sync=" << need_attr_sync << dendl;
 
   int r;
   if (need_data_sync) {
     if (S_ISREG(stx.stx_mode)) {
-      r = copy_to_remote(dir_root, epath, stx, fh);
+      r = copy_to_remote(dir_root, epath, stx, fh, rem_file_transfer, cv,
+                         canceled, failed);
       if (r < 0) {
         derr << ": failed to copy path=" << epath << ": " << cpp_strerror(r) << dendl;
         return r;
@@ -753,8 +901,10 @@ int PeerReplayer::remote_file_op(const std::string &dir_root, const std::string 
   return 0;
 }
 
-int PeerReplayer::cleanup_remote_dir(const std::string &dir_root,
-                                     const std::string &epath, const FHandles &fh) {
+int PeerReplayer::cleanup_remote_dir(
+    const std::string &dir_root, const std::string &epath, const FHandles &fh,
+    std::shared_ptr<std::atomic<bool>> &canceled,
+    std::shared_ptr<std::atomic<bool>> &failed) {
   dout(20) << ": dir_root=" << dir_root << ", epath=" << epath
            << dendl;
 
@@ -781,7 +931,7 @@ int PeerReplayer::cleanup_remote_dir(const std::string &dir_root,
   std::stack<SyncEntry> rm_stack;
   rm_stack.emplace(SyncEntry(epath, tdirp, tstx));
   while (!rm_stack.empty()) {
-    if (should_backoff(dir_root, &r)) {
+    if (should_backoff(canceled, failed, &r)) {
       dout(0) << ": backing off r=" << r << dendl;
       break;
     }
@@ -915,8 +1065,10 @@ int PeerReplayer::should_sync_entry(const std::string &epath, const struct ceph_
   return 0;
 }
 
-int PeerReplayer::propagate_deleted_entries(const std::string &dir_root,
-                                            const std::string &epath, const FHandles &fh) {
+int PeerReplayer::propagate_deleted_entries(
+    const std::string &dir_root, const std::string &epath, const FHandles &fh,
+    std::shared_ptr<std::atomic<bool>> &canceled,
+    std::shared_ptr<std::atomic<bool>> &failed) {
   dout(10) << ": dir_root=" << dir_root << ", epath=" << epath << dendl;
 
   ceph_dir_result *dirp;
@@ -941,7 +1093,7 @@ int PeerReplayer::propagate_deleted_entries(const std::string &dir_root,
 
   struct dirent *dire = (struct dirent *)alloca(512 * sizeof(struct dirent));
   while (true) {
-    if (should_backoff(dir_root, &r)) {
+    if (should_backoff(canceled, failed, &r)) {
       dout(0) << ": backing off r=" << r << dendl;
       break;
     }
@@ -963,7 +1115,7 @@ int PeerReplayer::propagate_deleted_entries(const std::string &dir_root,
     }
     int nr = len / sizeof(struct dirent);
     for (int i = 0; i < nr; ++i) {
-      if (should_backoff(dir_root, &r)) {
+      if (should_backoff(canceled, failed, &r)) {
         dout(0) << ": backing off r=" << r << dendl;
         break;
       }
@@ -1013,7 +1165,7 @@ int PeerReplayer::propagate_deleted_entries(const std::string &dir_root,
       if (purge_remote) {
         dout(5) << ": purging remote entry=" << dpath << dendl;
         if (S_ISDIR(pstx.stx_mode)) {
-          r = cleanup_remote_dir(dir_root, dpath, fh);
+          r = cleanup_remote_dir(dir_root, dpath, fh, canceled, failed);
         } else {
           r = ceph_unlinkat(m_remote_mount, fh.r_fd_dir_root, dpath.c_str(), 0);
         }
@@ -1206,10 +1358,20 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
     return r;
   }
 
+  std::atomic <int> rem_file_transfer(0);
+  std::condition_variable all_file_transfer_done;
+  std::shared_ptr <std::atomic <bool>> canceled, failed;
+  {
+    std::scoped_lock lock(m_lock);
+    auto& dr = m_registered.at(dir_root);
+    canceled = dr.canceled;
+    failed = dr.failed;
+  }
+
   std::stack<SyncEntry> sync_stack;
   sync_stack.emplace(SyncEntry(".", tdirp, tstx));
   while (!sync_stack.empty()) {
-    if (should_backoff(dir_root, &r)) {
+    if (should_backoff(canceled, failed, &r)) {
       dout(0) << ": backing off r=" << r << dendl;
       break;
     }
@@ -1222,7 +1384,8 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
       // entry is a directory -- propagate deletes for missing entries
       // (and changed inode types) to the remote filesystem.
       if (!entry.needs_remote_sync()) {
-        r = propagate_deleted_entries(dir_root, entry.epath, fh);
+        r = propagate_deleted_entries(dir_root, entry.epath, fh, canceled,
+                                      failed);
         if (r < 0 && r != -ENOENT) {
           derr << ": failed to propagate missing dirs: " << cpp_strerror(r) << dendl;
           break;
@@ -1294,7 +1457,8 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
               << ", attr_sync=" << need_attr_sync << dendl;
       if (need_data_sync || need_attr_sync) {
         r = remote_file_op(dir_root, entry.epath, entry.stx, fh, need_data_sync,
-                           need_attr_sync);
+                           need_attr_sync, rem_file_transfer,
+                           all_file_transfer_done, canceled, failed);
         if (r < 0) {
           break;
         }
@@ -1314,6 +1478,19 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
     }
 
     sync_stack.pop();
+  }
+
+safe_exit:
+  if (r < 0 && !failed->load()) {
+    mark_failed(dir_root, r);
+  }
+  std::mutex dummy_mtx;
+  std::unique_lock<std::mutex> dummy_lock(dummy_mtx);
+  all_file_transfer_done.wait(dummy_lock, [&rem_file_transfer] {
+    return (rem_file_transfer.load() == 0);
+  });
+  if (r >= 0 && failed->load()) {
+    r = get_failed_reason(dir_root);
   }
 
   return r;
