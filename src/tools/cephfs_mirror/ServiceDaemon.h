@@ -9,14 +9,18 @@
 #include "mds/FSMap.h"
 #include "Types.h"
 
+
 namespace cephfs {
 namespace mirror {
+
+struct SnapSyncStat;
 
 class ServiceDaemon {
 public:
   ServiceDaemon(CephContext *cct, RadosRef rados);
   ~ServiceDaemon();
-
+  using SnapSyncStatMap = std::map<std::string, std::shared_ptr<SnapSyncStat>>;
+  using PeerInfo = std::pair<Attributes, SnapSyncStatMap>;
   int init();
 
   void add_filesystem(fs_cluster_id_t fscid, std::string_view fs_name);
@@ -29,12 +33,14 @@ public:
                                   AttributeValue value);
   void add_or_update_peer_attribute(fs_cluster_id_t fscid, const Peer &peer,
                                     std::string_view key, AttributeValue value);
+  void update_peer_info(fs_cluster_id_t fscid, const Peer &peer,
+                          const SnapSyncStatMap &status_map);
 
 private:
   struct Filesystem {
     std::string fs_name;
     Attributes fs_attributes;
-    std::map<Peer, Attributes> peer_attributes;
+    std::map<Peer, PeerInfo> peer_info;
 
     Filesystem(std::string_view fs_name)
       : fs_name(fs_name) {
@@ -52,7 +58,7 @@ private:
   Context *m_timer_ctx = nullptr;
   std::map<fs_cluster_id_t, Filesystem> m_filesystems;
 
-  void schedule_update_status();
+  void start_update_job();
   void update_status();
 };
 
