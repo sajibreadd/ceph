@@ -10390,8 +10390,17 @@ int Client::_open(Inode *in, int flags, mode_t mode, Fh **fhp,
 
   // success?
   if (result >= 0) {
-    if (fhp)
+    if (fhp) {
       *fhp = _create_fh(in, flags, cmode, perms);
+      // ceph_flags_sys2wire/ceph_flags_to_mode() calls above transforms O_DIRECTORY flag
+      // into CEPH_FILE_MODE_PIN mode. Although this mode is used at server size
+      // we [ab]use it here to determine whether we should pin inode to prevent from
+      // undesired cache eviction.
+      if (cmode == CEPH_FILE_MODE_PIN) {
+        ldout(cct, 20) << " pinning ll_get() call for " << *in << dendl;
+        _ll_get(in);
+      }
+    }
   } else {
     in->put_open_ref(cmode);
   }
@@ -10448,6 +10457,10 @@ int Client::_close(int fd)
   Fh *fh = get_filehandle(fd);
   if (!fh)
     return -CEPHFS_EBADF;
+  if (fh->mode == CEPH_FILE_MODE_PIN) {
+    ldout(cct, 20) << " unpinning ll_put() call for " << *(fh->inode.get()) << dendl;
+    _ll_put(fh->inode.get(), 1);
+  }
   int err = _release_fh(fh);
   fd_map.erase(fd);
   put_fd(fd);
@@ -16030,13 +16043,13 @@ void Client::ms_handle_remote_reset(Connection *con)
 	ceph_assert(s != NULL);
 	switch (s->state) {
 	case MetaSession::STATE_CLOSING:
-	  ldout(cct, 1) << "reset from mds we were closing; we'll call that closed" << dendl;
+	  ldout(cct, 0) << "reset from mds we were closing; we'll call that closed" << dendl;
 	  _closed_mds_session(s.get());
 	  break;
 
 	case MetaSession::STATE_OPENING:
 	  {
-	    ldout(cct, 1) << "reset from mds we were opening; retrying" << dendl;
+	    ldout(cct, 0) << "reset from mds we were opening; retrying" << dendl;
 	    list<Context*> waiters;
 	    waiters.swap(s->waiting_for_open);
 	    _closed_mds_session(s.get());
@@ -16049,17 +16062,23 @@ void Client::ms_handle_remote_reset(Connection *con)
 	  {
 	    objecter->maybe_request_map(); /* to check if we are blocklisted */
 	    if (cct->_conf.get_val<bool>("client_reconnect_stale")) {
-	      ldout(cct, 1) << "reset from mds we were open; close mds session for reconnect" << dendl;
+	      ldout(cct, 0) << "reset from mds we were open; close mds session for reconnect" << dendl;
 	      _closed_mds_session(s.get());
 	    } else {
-	      ldout(cct, 1) << "reset from mds we were open; mark session as stale" << dendl;
+	      ldout(cct, 0) << "reset from mds we were open; mark session as stale" << dendl;
 	      s->state = MetaSession::STATE_STALE;
 	    }
 	  }
 	  break;
 
 	case MetaSession::STATE_NEW:
+    {
+      ldout(cct, 0) << "-->MetaSession::STATE_NEW" << dendl;
+    }
 	case MetaSession::STATE_CLOSED:
+    {
+      ldout(cct, 0) << "-->MetaSession::STATE_CLOSED" << dendl;
+    }
 	default:
 	  break;
 	}
