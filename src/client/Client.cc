@@ -242,6 +242,16 @@ int Client::CommandHook::call(
 
 // -------------
 
+Fh *Client::get_filehandle(int fd) {
+  auto it = fd_map.find(fd);
+  if (it == fd_map.end()) {
+    lderr(cct) << "Bad file descriptor:" << fd << dendl;
+
+    return NULL;
+  }
+  return it->second;
+}
+
 int Client::get_fd_inode(int fd, InodeRef *in) {
   int r = 0;
   if (fd == CEPHFS_AT_FDCWD) {
@@ -6101,7 +6111,7 @@ int Client::may_open(Inode *in, int flags, const UserPerm& perms)
 
   r = inode_permission(in, perms, want);
 out:
-  ldout(cct, 3) << __func__ << " " << in << " = " << r <<  dendl;
+  ldout(cct, 5) << __func__ << " " << in << " = " << r <<  dendl;
   return r;
 }
 
@@ -6114,7 +6124,7 @@ int Client::may_lookup(Inode *dir, const UserPerm& perms)
 
   r = inode_permission(dir, perms, CLIENT_MAY_EXEC);
 out:
-  ldout(cct, 3) << __func__ << " " << dir << " = " << r <<  dendl;
+  ldout(cct, 5) << __func__ << " " << dir << " = " << r <<  dendl;
   return r;
 }
 
@@ -10069,7 +10079,7 @@ int Client::openat(int dirfd, const char *relpath, int flags, const UserPerm& pe
                            object_size, data_pool, alternate_name);
 
   tout(cct) << r << std::endl;
-  ldout(cct, 3) << "openat exit(" << relpath << ")" << dendl;
+  ldout(cct, 3) << "openat exit(" << relpath << ") = " << r << dendl;
   return r;
 }
 
