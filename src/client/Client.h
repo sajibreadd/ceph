@@ -218,6 +218,7 @@ struct dir_result_t {
     ordered_count = 0;
     cache_index = 0;
     buffer.clear();
+    fd = -1;
   }
 
   InodeRef inode;
@@ -1016,12 +1017,7 @@ protected:
   /*
    * Resolve file descriptor, or return NULL.
    */
-  Fh *get_filehandle(int fd) {
-    auto it = fd_map.find(fd);
-    if (it == fd_map.end())
-      return NULL;
-    return it->second;
-  }
+  Fh *get_filehandle(int fd);
   int get_fd_inode(int fd, InodeRef *in);
   bool _ll_fh_exists(Fh *f) {
     return ll_unclosed_fh_set.count(f);
