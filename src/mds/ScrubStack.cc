@@ -514,7 +514,16 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *done)
       if (dnl->is_primary()) {
 	_enqueue(dnl->get_inode(), header, false);
       } else if (dnl->is_remote()) {
-	// TODO: check remote linkage
+        CInode* remote_inode = dnl->get_inode();
+        if (!remote_inode) {
+          if (mdcache->mds->damage_table.is_remote_damaged(
+                  dnl->get_remote_ino())) {
+            dout(4) << "scrub: remote dentry points to damaged ino " << *dn
+                    << dendl;
+            continue;      
+          }
+          mdcache->open_remote_dentry(dn, true, nullptr, false);
+        }
       }
     }
   }
