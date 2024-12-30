@@ -163,9 +163,15 @@ void LogChannel::do_log(clog_type prio, const std::string& s)
 {
   std::lock_guard l(channel_lock);
   if (CLOG_ERROR == prio) {
-    ldout(cct,-1) << "log " << prio << " : " << s << dendl;
+    ldout(cct, -1) << "log " << prio << " : " << s << dendl;
+  } else if (CLOG_WARN == prio) {
+    ldout(cct, 0) << "log " << prio << " : " << s << dendl;
+  } else if (CLOG_SEC == prio) {
+    ldout(cct, 1) << "log " << prio << " : " << s << dendl;
+  } else if (CLOG_INFO == prio) {
+    ldout(cct, 5) << "log " << prio << " : " << s << dendl;
   } else {
-    ldout(cct,0) << "log " << prio << " : " << s << dendl;
+    ldout(cct, 10) << "log " << prio << " : " << s << dendl;
   }
   LogEntry e;
   e.stamp = ceph_clock_now();
