@@ -748,6 +748,8 @@ close_local_fd:
     return -EINVAL;
   }
 
+  dout(0) << ": file transfer finished-->" << epath << dendl;
+
   return r == 0 ? 0 : r;
 }
 
@@ -1380,7 +1382,8 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
 
     sync_stack.pop();
   }
-
+  
+  dout(0) << ": done sync-->" << dir_root << ", " << current.first << dendl;
   dout(20) << " cur:" << fh.c_fd
            << " prev:" << fh.p_fd
            << " ret = " << r
