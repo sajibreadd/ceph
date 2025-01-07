@@ -3779,3 +3779,94 @@ TEST(LibCephFS, SnapdirAttrsOnSnapRename) {
   ASSERT_EQ(0, ceph_unmount(cmount));
   ceph_shutdown(cmount);
 }
+
+TEST(LibCephFS, GetDents) {
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(ceph_mount(cmount, NULL), 0);
+
+  std::string dir_root = "/root";
+  ceph_mkdir(cmount, dir_root.c_str(), 0777);
+  int root_fd = ceph_open(cmount, dir_root.c_str(), O_DIRECTORY | O_RDONLY, 0);
+
+  // create n subdirectories
+  int i, n = 1000000;
+  for (i = 1; i <= n; ++i) {
+    int r = ceph_mkdirat(cmount, root_fd, to_string(i).c_str(), 0777);
+    ASSERT_TRUE(!(r < 0 && r != -EEXIST));
+  }
+
+  ceph_dir_result* dirp;
+  int r = ceph_openat(cmount, root_fd, ".", AT_SYMLINK_NOFOLLOW, 0);
+  ASSERT_TRUE(r >= 0);
+
+  int fd = r;
+  r = ceph_fdopendir(cmount, fd, &dirp);
+  ASSERT_TRUE(r >= 0);
+
+  auto start = std::chrono::high_resolution_clock::now();
+  struct dirent *dire = (struct dirent *)alloca(512 * sizeof(struct dirent));
+  int cnt = 0;
+  while (true) {
+    int len =
+        ceph_getdents(cmount, dirp, (char *)dire, 512 * sizeof(struct dirent));
+    ASSERT_TRUE(len >= 0);
+    if (len == 0) {
+      break;
+    }
+    int nr = len / sizeof(struct dirent);
+    for (i = 0; i < nr; ++i) {
+      std::string d_name = std::string(dire[i].d_name);
+      if (d_name == "." || d_name == "..") {
+        continue;
+      }
+      std::string dpath = "./" + d_name;
+      struct ceph_statx stx;
+      r = ceph_statxat(cmount, fd, dpath.c_str(), &stx, CEPH_STATX_MODE,
+                       AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
+      cnt++;
+    }
+  }
+  ceph_close(cmount, fd);
+  auto end = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> elapsed = end - start;
+  std::cout << "Elapsed time for ceph_getdents: " << elapsed.count() << " seconds"
+            << "-->" << cnt << std::endl;
+
+  ceph_dir_result* tdirp;
+  r = ceph_openat(cmount, root_fd, ".", AT_SYMLINK_NOFOLLOW, 0);
+  ASSERT_TRUE(r >= 0);
+
+  fd = r;
+  r = ceph_fdopendir(cmount, fd, &tdirp);
+  ASSERT_TRUE(r >= 0);
+  struct dirent de;
+
+  start = std::chrono::high_resolution_clock::now();
+  cnt = 0;
+  while (true) {
+    struct ceph_statx pstx;
+    r = ceph_readdirplus_r(cmount, tdirp, &de, &pstx, CEPH_STATX_MODE,
+                           AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW, NULL);
+    if (r <= 0) {
+      break;
+    }
+    auto d_name = std::string(de.d_name);
+    if (d_name == "." || d_name == "..") {
+      continue;
+    }
+    auto dpath = "/." + d_name;
+    cnt++;
+  }
+  ceph_close(cmount, fd);
+  end = std::chrono::high_resolution_clock::now();
+  elapsed = end - start;
+  std::cout << "Elapsed time for ceph_readdirplus_r: " << elapsed.count() << " seconds"
+            << "-->" << cnt << std::endl;
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_shutdown(cmount);
+}
+
