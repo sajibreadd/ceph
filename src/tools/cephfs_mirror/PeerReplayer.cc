@@ -747,7 +747,7 @@ close_local_fd:
          << dendl;
     return -EINVAL;
   }
-
+  dout(0) << ": file transfer finished-->" << epath << dendl;
   return r == 0 ? 0 : r;
 }
 
@@ -1163,10 +1163,18 @@ int PeerReplayer::pre_sync_check_and_open_handles(
 
   MountRef mnt;
   if (prev) {
+    dout(0) << "mirroring snapshot '" << current.first
+            << "' using a local copy of snapshot '" << (*prev).first
+            << "' as a diff base, dir_root=" << dir_root.c_str()
+            << dendl;
     mnt = m_local_mount;
     auto prev_snap_path = snapshot_path(m_cct, dir_root, (*prev).first);
     fd = open_dir(mnt, prev_snap_path, (*prev).second);
   } else {
+    dout(0) << "mirroring snapshot '" << current.first
+            << "' using a remote state as a diff base, "
+            "dir_root = " << dir_root.c_str()
+            << dendl;
     mnt = m_remote_mount;
     fd = open_dir(mnt, dir_root, boost::none);
   }
@@ -1380,7 +1388,7 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
 
     sync_stack.pop();
   }
-
+  dout(0) << ": done sync-->" << dir_root << ", " << current.first << dendl;
   dout(20) << " cur:" << fh.c_fd
            << " prev:" << fh.p_fd
            << " ret = " << r
@@ -1564,7 +1572,7 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
     }
     sync_queue.pop();
   }
-
+  dout(0) << ": done sync-->" << dir_root << ", " << current.first << dendl;
   dout(20) << " current:" << fh.c_fd
            << " prev:" << fh.p_fd
            << " ret = " << r
