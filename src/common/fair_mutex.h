@@ -17,6 +17,12 @@ public:
   ~fair_mutex() = default;
   fair_mutex(const fair_mutex&) = delete;
   fair_mutex& operator=(const fair_mutex&) = delete;
+  
+#ifdef CEPH_DEBUG_MUTEX
+  std::thread::id get_locked_by() {
+    return locked_by;
+  }
+#endif
 
   void lock()
   {

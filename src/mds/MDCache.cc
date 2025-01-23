@@ -589,11 +589,10 @@ void MDCache::_create_system_file_finish(MutationRef& mut, CDentry *dn, version_
   //migrator->export_dir(dir, (int)in->ino() - MDS_INO_MDSDIR_OFFSET);
 }
 
-
-
 struct C_MDS_RetryOpenRoot : public MDSInternalContext {
   MDCache *cache;
-  explicit C_MDS_RetryOpenRoot(MDCache *c) : MDSInternalContext(c->mds), cache(c) {}
+  explicit C_MDS_RetryOpenRoot(MDCache *c)
+      : MDSInternalContext(c->mds), cache(c) {}
   void finish(int r) override {
     if (r < 0) {
       // If we can't open root, something disastrous has happened: mark
@@ -601,9 +600,21 @@ struct C_MDS_RetryOpenRoot : public MDSInternalContext {
       // it is not okay to call suicide() here because we are in
       // a Finisher callback.
       cache->mds->damaged();
-      ceph_abort();  // damaged should never return
+      dout(4) << __func__
+              << ": we got damage in while completion of C_MDS_RetryOpenRoot"
+              << dendl;
+      ceph_abort(); // damaged should never return
     } else {
+      dout(4) << __func__
+              << ": opening open root from C_MDS_RetryOpenRoot, is locked="
+              << cache->mds->mds_lock.is_locked() << ", is locked by me="
+              << ceph_mutex_is_locked(cache->mds->mds_lock) << dendl;
       cache->open_root();
+      dout(4)
+          << __func__
+          << ": we completed C_MDS_RetryOpenRoot after open root, is locked="
+          << cache->mds->mds_lock.is_locked() << ", is locked by me="
+          << ceph_mutex_is_locked_by_me(cache->mds->mds_lock) << dendl;
     }
   }
 };
@@ -645,9 +656,14 @@ void MDCache::open_mydir_frag(MDSContext *c)
 
 void MDCache::open_root()
 {
-  dout(10) << "open_root" << dendl;
+  dout(4) << "open_root"
+          << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+          << ceph_mutex_is_locked_by_me(mds->mds_lock) << ")" << dendl;
 
   if (!root) {
+    dout(4) << "open_root: root is null do C_MDS_RetryOpenRoot"
+            << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+            << ceph_mutex_is_locked_by_me(mds->mds_lock) << ")" << dendl;
     open_root_inode(new C_MDS_RetryOpenRoot(this));
     return;
   }
@@ -658,6 +674,11 @@ void MDCache::open_root()
     if (!rootdir->is_subtree_root())
       adjust_subtree_auth(rootdir, mds->get_nodeid());   
     if (!rootdir->is_complete()) {
+      dout(4) << "open_root: I am incomplete do C_MDS_RetryOpenRoot-->"
+                 ", is locked=("
+              << mds->mds_lock.is_locked() << ", "
+              << ceph_mutex_is_locked_by_me(mds->mds_lock) << ") " << *rootdir
+              << dendl;
       rootdir->fetch(new C_MDS_RetryOpenRoot(this));
       return;
     }
@@ -665,12 +686,18 @@ void MDCache::open_root()
     ceph_assert(!root->is_auth());
     CDir *rootdir = root->get_dirfrag(frag_t());
     if (!rootdir) {
+      dout(4) << "open_root: open remote dirfrag and do C_MDS_RetryOpenRoot"
+              << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+              << ceph_mutex_is_locked_by_me(mds->mds_lock) << ")" << dendl;
       open_remote_dirfrag(root, frag_t(), new C_MDS_RetryOpenRoot(this));
       return;
     }    
   }
 
   if (!myin) {
+    dout(4) << "open_root: create system inode and do C_MDS_RetryOpenRoot"
+            << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+            << ceph_mutex_is_locked_by_me(mds->mds_lock) << ")" << dendl;
     CInode *in = create_system_inode(MDS_INO_MDSDIR(mds->get_nodeid()), S_IFDIR|0755);  // initially inaccurate!
     in->fetch(new C_MDS_RetryOpenRoot(this));
     return;
@@ -679,7 +706,13 @@ void MDCache::open_root()
   ceph_assert(mydir);
   adjust_subtree_auth(mydir, mds->get_nodeid());
 
+  dout(4) << __func__ << ": populte_mydir starts"
+          << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+          << ceph_mutex_is_locked_by_me(mds->mds_lock) << ")" << dendl;
   populate_mydir();
+  dout(4) << __func__ << ": populte_mydir done"
+          << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+          << ceph_mutex_is_locked_by_me(mds->mds_lock) << ")" << dendl;
 }
 
 void MDCache::advance_stray() {
@@ -733,9 +766,11 @@ void MDCache::populate_mydir()
   CDir *mydir = myin->get_or_open_dirfrag(this, frag_t());
   ceph_assert(mydir);
 
-  dout(10) << "populate_mydir " << *mydir << dendl;
+  dout(10) << "populate_mydir: " << *mydir << dendl;
 
   if (!mydir->is_complete()) {
+    dout(4) << "populate_mydir: I am incomplete doing C_MDS_RetryOpenRoot-->"
+             << *mydir << dendl;
     mydir->fetch(new C_MDS_RetryOpenRoot(this));
     return;
   }
@@ -764,6 +799,13 @@ void MDCache::populate_mydir()
       straydn = mydir->lookup("stray");
 
     if (!straydn || !straydn->get_linkage()->get_inode()) {
+      bool straydn_null = (straydn == nullptr);
+      bool linkage_inode_null =
+          (straydn->get_linkage()->get_inode() == nullptr);
+      dout(4) << "populate_mydir: create system file and doing "
+                  "C_MDS_RetryOpenRoot-->"
+               << "is_straydn_null=" << straydn_null << ", "
+               << "is_linkage_inode_null=" << linkage_inode_null << dendl;
       _create_system_file(mydir, css->strv(), create_system_inode(MDS_INO_STRAY(mds->get_nodeid(), i), S_IFDIR),
 			  new C_MDS_RetryOpenRoot(this));
       return;
@@ -792,6 +834,9 @@ void MDCache::populate_mydir()
       ceph_assert(!dir->state_test(CDir::STATE_BADFRAG));
 
       if (dir->get_version() == 0) {
+        dout(4) << "populate_mydir: dir->get_version() == 0, that's why doing "
+                    "C_MDS_RetryOpenRoot -->"
+                 << *dir << dendl;
         dir->fetch(new C_MDS_RetryOpenRoot(this));
         return;
       }
@@ -802,7 +847,7 @@ void MDCache::populate_mydir()
   }
 
   // okay!
-  dout(10) << "populate_mydir done" << dendl;
+  dout(4) << "populate_mydir done, num_strays=" << num_strays << dendl;
   ceph_assert(!open);    
   open = true;
   mds->queue_waiters(waiting_for_open);
@@ -9924,16 +9969,27 @@ void MDCache::notify_global_snaprealm_update(int snap_op)
 
 struct C_MDC_RetryScanStray : public MDCacheContext {
   dirfrag_t next;
-  C_MDC_RetryScanStray(MDCache *c,  dirfrag_t n) : MDCacheContext(c), next(n) { }
+  MDSRank* mds;
+  C_MDC_RetryScanStray(MDCache *c,  dirfrag_t n) : MDCacheContext(c), next(n), mds(c->mds) { }
   void finish(int r) override {
+    dout(4) << __func__
+            << ": We started C_MDC_RetryScanStray context, is locked-->"
+            << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+            << ceph_mutex_is_locked_by_me(mds->mds_lock) << ")" << dendl;
     mdcache->scan_stray_dir(next);
+    dout(4) << __func__
+            << ": We completed C_MDC_RetryScanStray context, is locked-->"
+            << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+            << ceph_mutex_is_locked_by_me(mds->mds_lock) << ")" << dendl;
   }
 };
 
 void MDCache::scan_stray_dir(dirfrag_t next)
 {
   dout(10) << "scan_stray_dir " << next << dendl;
-
+  dout(4) << "scan_stray_dir etnry"
+          << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+          << ceph_mutex_is_locked_by_me(mds->mds_lock) << ")" << dendl;
   if (next.ino)
     next.frag = strays[MDS_INO_STRAY_INDEX(next.ino)]->dirfragtree[next.frag.value()];
 
@@ -9943,21 +9999,38 @@ void MDCache::scan_stray_dir(dirfrag_t next)
 
     std::vector<CDir*> ls;
     strays[i]->get_dirfrags(ls);
-
+    dout(4) << ": We want to number of Dirs in the " << i
+            << "th Stray bucket having inode=" << strays[i]->ino()
+            << ", ls.size() = " << ls.size() << ", is locked=("
+            << mds->mds_lock.is_locked() << ", "
+            << ceph_mutex_is_locked_by_me(mds->mds_lock) << ")" << dendl;
     for (const auto& dir : ls) {
       if (dir->get_frag() < next.frag)
 	continue;
 
       if (!dir->can_auth_pin()) {
-	dir->add_waiter(CDir::WAIT_UNFREEZE, new C_MDC_RetryScanStray(this, dir->dirfrag()));
+        dout(4) << ": WAIT_UNFREEZE occurred, we put C_MDC_RetryScanStray into "
+                   "the waiter-->"
+                << *dir << dendl;
+        dir->add_waiter(CDir::WAIT_UNFREEZE, new C_MDC_RetryScanStray(this, dir->dirfrag()));
 	return;
       }
 
       if (!dir->is_complete()) {
-	dir->fetch(new C_MDC_RetryScanStray(this, dir->dirfrag()));
+        dout(4) << ": dir is not complete need more scan, we put "
+                   "C_MDC_RetryScanStray into "
+                   "the waiter-->"
+                   ", is locked=("
+                << mds->mds_lock.is_locked() << ", "
+                << ceph_mutex_is_locked_by_me(mds->mds_lock) << ") " << *dir
+                << dendl;
+        dir->fetch(new C_MDC_RetryScanStray(this, dir->dirfrag()));
 	return;
       }
-
+      dout(4) << "We are logging dir->items.size()=" << dir->items.size()
+              << " for " << i << "th stray bucket-->"
+              << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+              << ceph_mutex_is_locked_by_me(mds->mds_lock) << ") " << dendl;
       for (auto &p : dir->items) {
 	CDentry *dn = p.second;
 	dn->state_set(CDentry::STATE_STRAY);
@@ -9969,9 +10042,16 @@ void MDCache::scan_stray_dir(dirfrag_t next)
 	  maybe_eval_stray(in);
 	}
       }
+      dout(4) << "We are done iterating dir->items.size()=" << dir->items.size()
+              << " for " << i << "th stray bucket-->"
+              << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+              << ceph_mutex_is_locked_by_me(mds->mds_lock) << ") " << dendl;
     }
     next.frag = frag_t();
   }
+  dout(4) << ": scan_stray_dir is done"
+          << ", is locked=(" << mds->mds_lock.is_locked() << ", "
+          << ceph_mutex_is_locked_by_me(mds->mds_lock) << ") " << dendl;
 }
 
 void MDCache::fetch_backtrace(inodeno_t ino, int64_t pool, bufferlist& bl, Context *fin)

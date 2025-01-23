@@ -391,7 +391,7 @@ bool PurgeQueue::_can_consume()
     return false;
   }
 
-  dout(20) << ops_in_flight << "/" << max_purge_ops << " ops, "
+  dout(4) << ops_in_flight << "/" << max_purge_ops << " ops, "
            << in_flight.size() << "/" << g_conf()->mds_max_purge_files
            << " files" << dendl;
 
@@ -404,13 +404,13 @@ bool PurgeQueue::_can_consume()
   }
 
   if (ops_in_flight >= max_purge_ops) {
-    dout(20) << "Throttling on op limit " << ops_in_flight << "/"
+    dout(4) << "Throttling on op limit " << ops_in_flight << "/"
              << max_purge_ops << dendl;
     return false;
   }
 
   if (in_flight.size() >= cct->_conf->mds_max_purge_files) {
-    dout(20) << "Throttling on item limit " << in_flight.size()
+    dout(4) << "Throttling on item limit " << in_flight.size()
              << "/" << cct->_conf->mds_max_purge_files << dendl;
     return false;
   } else {
@@ -520,7 +520,8 @@ void PurgeQueue::_commit_ops(int r, const std::vector<PurgeItemCommitOp>& ops_ve
   C_GatherBuilder gather(cct);
 
   for (auto &op : ops_vec) {
-    dout(10) << op.item.get_type_str() << dendl;
+    dout(4) << "Doing commit ops of type " << op.item.get_type_str() << " on "
+             << op.item.ino << dendl;
     if (op.type == PurgeItemCommitOp::PURGE_OP_RANGE) {
       uint64_t first_obj = 0, num_obj = 0;
       uint64_t num = Striper::get_num_objects(op.item.layout, op.item.size);
@@ -591,7 +592,6 @@ void PurgeQueue::_execute_item(
     uint64_t expire_to)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(lock));
-
   in_flight[expire_to] = item;
   logger->set(l_pq_executing, in_flight.size());
   files_high_water = std::max<uint64_t>(files_high_water,
@@ -602,6 +602,10 @@ void PurgeQueue::_execute_item(
   logger->set(l_pq_executing_ops, ops_in_flight);
   ops_high_water = std::max(ops_high_water, ops_in_flight);
   logger->set(l_pq_executing_ops_high_water, ops_high_water);
+  dout(4) ": Executing item--> ino=" << item.ino
+                                      << ", ops_in_flight=" << ops_in_flight
+                                      << ", file_in_flight=" << in_flight.size()
+                                      << dendl;
 
   std::vector<PurgeItemCommitOp> ops_vec;
   auto submit_ops = [&]() {

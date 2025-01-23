@@ -95,12 +95,22 @@ bool MDSIOContextBase::check_ios_in_flight(ceph::coarse_mono_time cutoff,
 void MDSIOContextBase::complete(int r) {
   MDSRank *mds = get_mds();
 
-  dout(10) << "MDSIOContextBase::complete: " << typeid(*this).name() << dendl;
+  dout(4) << "MDSIOContextBase::complete: " << typeid(*this).name() << dendl;
   ceph_assert(mds != NULL);
   // Note, MDSIOContext is passed outside the MDS and, strangely, we grab the
   // lock here when MDSContext::complete would otherwise assume the lock is
   // already acquired.
+#ifdef CEPH_DEBUG_MUTEX
+  dout(4) << "MDSIOContextBase::complete: " << typeid(*this).name() << "-->"
+          << "is it locked?=" << mds->mds_lock.is_locked()
+          << ", who locked it?= " << mds->mds_lock.get_locked_by() << dendl;
+#endif
+  dout(4) << "MDSIOContextBase::complete: " << typeid(*this).name() << "-->"
+          << "is it locked?=" << mds->mds_lock.is_locked() << dendl;
+
   std::lock_guard l(mds->mds_lock);
+  dout(4) << "MDSIOContextBase::complete: " << typeid(*this).name()
+           << " -->I passed the lock" << dendl;
 
   if (mds->is_daemon_stopping()) {
     dout(4) << "MDSIOContextBase::complete: dropping for stopping "

@@ -173,7 +173,7 @@ void StrayManager::_purge_stray_purged(
     CDentry *dn, bool only_head)
 {
   CInode *in = dn->get_projected_linkage()->get_inode();
-  dout(10) << "_purge_stray_purged " << *dn << " " << *in << dendl;
+  dout(1) << "_purge_stray_purged " << *dn << " " << *in << dendl;
 
   logger->inc(l_mdc_strays_enqueued);
   num_strays_enqueuing--;
@@ -417,6 +417,9 @@ void StrayManager::notify_stray_created()
 void StrayManager::notify_stray_removed()
 {
   num_strays--;
+  dout(1) << "StrayManager::notify_stray_removed: one stray down!!, current "
+             "num_strays="
+          << num_strays << dendl;
   logger->set(l_mdc_num_strays, num_strays);
 }
 
