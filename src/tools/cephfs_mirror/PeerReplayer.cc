@@ -616,49 +616,38 @@ int PeerReplayer::propagate_snap_renames(
 }
 
 int PeerReplayer::remote_mkdir(const std::string &epath,
-                               const struct ceph_statx &stx, bool iknow,
-                               bool need_data_sync, uint64_t change_mask,
-                               const FHandles &fh) {
+                               const struct ceph_statx &cstx, bool dont_create,
+                               uint64_t change_mask, const FHandles &fh,
+                               SnapSyncStat &dir_sync_stat) {
   dout(10) << ": remote epath=" << epath << dendl;
   int r = 0;
-
-  if (!iknow) {
-    r = ceph_mkdirat(m_remote_mount, fh.r_fd_dir_root, epath.c_str(),
-                     stx.stx_mode & ~S_IFDIR);
+  if (!dont_create) {
+    struct ceph_statx pstx;
+    r = ceph_statxat(fh.p_mnt, fh.p_fd, epath.c_str(), &pstx,
+                     CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
+                         CEPH_STATX_SIZE | CEPH_STATX_ATIME | CEPH_STATX_MTIME,
+                     AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
+    if (r < 0 && r != -ENOENT && r != -ENOTDIR) {
+      derr << ": failed to stat prev entry= " << epath << ": "
+           << cpp_strerror(r) << dendl;
+      return r;
+    }
     if (r < 0) {
-      // already synced in propagate_deleted_entries function
-      if (r == -EEXIST) {
+      r = ceph_mkdirat(m_remote_mount, fh.r_fd_dir_root, epath.c_str(),
+                       cstx.stx_mode & ~S_IFDIR);
+      if (r < 0 && r != -EEXIST) {
+        derr << ": failed to create remote directory=" << epath << ": "
+             << cpp_strerror(r) << dendl;
         return r;
       }
-      derr << ": failed to create remote directory=" << epath << ": "
-           << cpp_strerror(r) << dendl;
-      return r;
+      if (r != -EEXIST) {
+        dir_sync_stat.current_stat.inc_dir_created_count();
+      }
     }
-    change_mask =
-        (CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID | CEPH_STATX_MTIME);
+    update_change_mask(cstx, pstx, change_mask);
   }
-
-  if ((change_mask & CEPH_STATX_UID) || (change_mask & CEPH_STATX_GID)) {
-    r = ceph_chownat(m_remote_mount, fh.r_fd_dir_root, epath.c_str(),
-                     stx.stx_uid, stx.stx_gid, AT_SYMLINK_NOFOLLOW);
-    if (r < 0) {
-      derr << ": failed to chown remote directory=" << epath << ": "
-           << cpp_strerror(r) << dendl;
-      return r;
-    }
-  }
-
-  if ((change_mask & CEPH_STATX_MODE)) {
-    r = ceph_chmodat(m_remote_mount, fh.r_fd_dir_root, epath.c_str(),
-                     stx.stx_mode & ~S_IFMT, AT_SYMLINK_NOFOLLOW);
-    if (r < 0) {
-      derr << ": failed to chmod remote directory=" << epath << ": "
-           << cpp_strerror(r) << dendl;
-      return r;
-    }
-  }
-
-  return 0;
+  r = sync_attributes(epath, cstx, change_mask, true, fh);
+  return r;
 }
 
 void PeerReplayer::C_DoDirSync::finish(int r) {
@@ -666,11 +655,11 @@ void PeerReplayer::C_DoDirSync::finish(int r) {
     return;
   }
   if (r == 0) {
-    subdir_count = 0;
+    common_subdir_info_count = 0;
   }
-  replayer->do_dir_sync(dir_root, cur_path, cur_stx, root_dirp, iknow,
-                        need_data_sync, change_mask, subdir_count, fh, canceled,
-                        failed, op_counter, fin, dir_sync_stat);
+  replayer->do_dir_sync(dir_root, cur_path, cur_stx, root_dirp, entry_known,
+                        need_data_sync, change_mask, common_subdir_info_count,
+                        fh, canceled, failed, op_counter, fin, dir_sync_stat);
 }
 
 void PeerReplayer::C_TransferAndSyncFile::finish(int r) {
@@ -841,9 +830,7 @@ void PeerReplayer::OpHandlerThreadPool::handle_other_task_sync(
   task->complete(1);
 }
 
-
-int PeerReplayer::sync_attributes(const std::string &dir_root,
-                                  const std::string &epath,
+int PeerReplayer::sync_attributes(const std::string &epath,
                                   const struct ceph_statx &stx,
                                   uint64_t change_mask, bool is_dir,
                                   const FHandles &fh) {
@@ -1017,7 +1004,7 @@ void PeerReplayer::transfer_and_sync_file(
                          stx.stx_size);
   }
   if (change_mask > 0) {
-    r = sync_attributes(dir_root, epath, stx, change_mask, false, fh);
+    r = sync_attributes(epath, stx, change_mask, false, fh);
   }
   if (r < 0 && !failed) {
     mark_failed(dir_root, r);
@@ -1050,8 +1037,6 @@ int PeerReplayer::remote_file_op(
       return 0;
     } else if (S_ISLNK(stx.stx_mode)) {
       // free the remote link before relinking
-      dout(0) << ": link-->" << epath << "-->" << need_data_sync << ", "
-              << change_mask << dendl;
       r = ceph_unlinkat(m_remote_mount, fh.r_fd_dir_root, epath.c_str(), 0);
       if (r < 0 && r != -ENOENT) {
         derr << ": failed to remove remote symlink=" << epath << dendl;
@@ -1081,7 +1066,7 @@ int PeerReplayer::remote_file_op(
   }
 
   if (change_mask) {
-    r = sync_attributes(dir_root, epath, stx, change_mask, false, fh);
+    r = sync_attributes(epath, stx, change_mask, false, fh);
     if (r < 0) {
       return r;
     }
@@ -1214,6 +1199,60 @@ int PeerReplayer::cleanup_remote_dir(
   return r;
 }
 
+int PeerReplayer::should_sync_entry(const std::string &epath,
+                                    const struct ceph_statx &cstx,
+                                    const FHandles &fh, bool *need_data_sync,
+                                    uint64_t &change_mask) {
+  dout(10) << ": epath=" << epath << dendl;
+
+  *need_data_sync = false;
+  change_mask = 0;
+  struct ceph_statx pstx;
+  int r =
+      ceph_statxat(fh.p_mnt, fh.p_fd, epath.c_str(), &pstx,
+                   CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
+                       CEPH_STATX_SIZE | CEPH_STATX_CTIME | CEPH_STATX_MTIME,
+                   AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
+  if (r < 0 && r != -ENOENT && r != -ENOTDIR) {
+    derr << ": failed to stat prev entry= " << epath << ": " << cpp_strerror(r)
+         << dendl;
+    return r;
+  }
+
+  if (r < 0) {
+    // inode does not exist in prev snapshot or file type has changed
+    // (file was S_IFREG earlier, S_IFDIR now).
+    dout(5) << ": entry=" << epath << ", r=" << r << dendl;
+    *need_data_sync = true;
+    change_mask =
+        (CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID | CEPH_STATX_MTIME);
+    return 0;
+  }
+
+  dout(10) << ": local cur statx: mode=" << cstx.stx_mode
+           << ", uid=" << cstx.stx_uid << ", gid=" << cstx.stx_gid
+           << ", size=" << cstx.stx_size << ", ctime=" << cstx.stx_ctime
+           << ", mtime=" << cstx.stx_mtime << dendl;
+  dout(10) << ": local prev statx: mode=" << pstx.stx_mode
+           << ", uid=" << pstx.stx_uid << ", gid=" << pstx.stx_gid
+           << ", size=" << pstx.stx_size << ", ctime=" << pstx.stx_ctime
+           << ", mtime=" << pstx.stx_mtime << dendl;
+  if ((cstx.stx_mode & S_IFMT) != (pstx.stx_mode & S_IFMT)) {
+    dout(5) << ": entry=" << epath << " has mode mismatch" << dendl;
+    *need_data_sync = true;
+    change_mask =
+        (CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID | CEPH_STATX_MTIME);
+  } else {
+    *need_data_sync =
+        (cstx.stx_size != pstx.stx_size) || (cstx.stx_mtime != pstx.stx_mtime);
+    update_change_mask(cstx, pstx, change_mask);
+    if (*need_data_sync) {
+      change_mask = change_mask | CEPH_STATX_MTIME;
+    }
+  }
+  return 0;
+}
+
 void PeerReplayer::update_change_mask(const struct ceph_statx &cstx,
                                       const struct ceph_statx &pstx, uint64_t& change_mask) {
   if ((cstx.stx_mode & ~S_IFMT) != (pstx.stx_mode & ~S_IFMT)) {
@@ -1232,8 +1271,10 @@ void PeerReplayer::update_change_mask(const struct ceph_statx &cstx,
 
 int PeerReplayer::propagate_deleted_entries(
     const std::string &dir_root, const std::string &epath,
-    std::unordered_set<std::string> &subdirs, uint64_t &subdir_count,
-    const FHandles &fh, std::atomic<bool> &canceled, std::atomic<bool> &failed,
+    std::unordered_map<std::string, std::pair<bool, uint64_t>>
+        &common_subdir_info,
+    uint64_t &common_subdir_info_count, const FHandles &fh,
+    std::atomic<bool> &canceled, std::atomic<bool> &failed,
     std::atomic<int64_t> &op_counter, Context *fin,
     SnapSyncStat &dir_sync_stat) {
   dout(10) << ": dir_root=" << dir_root << ", epath=" << epath << dendl;
@@ -1291,12 +1332,15 @@ int PeerReplayer::propagate_deleted_entries(
         continue;
       }
 
+      unsigned int extra_flags =
+          (common_subdir_info_count < PER_THREAD_SUBDIR_THRESH)
+              ? (CEPH_STATX_UID | CEPH_STATX_GID | CEPH_STATX_SIZE |
+                 CEPH_STATX_ATIME | CEPH_STATX_MTIME)
+              : 0;
       struct ceph_statx pstx;
       auto dpath = entry_path(epath, d_name);
       r = ceph_statxat(fh.p_mnt, fh.p_fd, dpath.c_str(), &pstx,
-                       CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
-                           CEPH_STATX_SIZE | CEPH_STATX_ATIME |
-                           CEPH_STATX_MTIME,
+                       CEPH_STATX_MODE | extra_flags,
                        AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
       if (r < 0) {
         derr << ": failed to stat (prev) directory=" << dpath << ": "
@@ -1311,9 +1355,7 @@ int PeerReplayer::propagate_deleted_entries(
 
       struct ceph_statx cstx;
       r = ceph_statxat(m_local_mount, fh.c_fd, dpath.c_str(), &cstx,
-                       CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
-                           CEPH_STATX_SIZE | CEPH_STATX_ATIME |
-                           CEPH_STATX_MTIME,
+                       CEPH_STATX_MODE | extra_flags,
                        AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
       if (r < 0 && r != -ENOENT) {
         derr << ": failed to stat local (cur) directory=" << dpath << ": "
@@ -1336,9 +1378,6 @@ int PeerReplayer::propagate_deleted_entries(
       } else {
         dout(5) << ": entry=" << d_name << " missing in current snapshot" << dendl;
       }
-      dout(0) << ": propagate catching-->" << dpath << "--> " << r << ", "
-              << (pstx.stx_mode & S_IFMT) << ", " << (cstx.stx_mode & S_IFMT)
-              << dendl;
 
       if (purge_remote) {
         dout(5) << ": purging remote entry=" << dpath << dendl;
@@ -1362,32 +1401,20 @@ int PeerReplayer::propagate_deleted_entries(
                << cpp_strerror(r) << dendl;
           break;
         }
-      } else {
+      } else if (extra_flags){
         uint64_t change_mask = 0;
         update_change_mask(cstx, pstx, change_mask);
-        C_DoDirSync* task;
-        if (subdir_count < PER_THREAD_SUBDIR_THRESH) {
-          subdirs.insert(d_name), subdir_count++;
-        }
         if (S_ISDIR(cstx.stx_mode)) {
-          task = new C_DoDirSync(dir_root, dpath, cstx, nullptr, true, false,
-                                 change_mask, subdir_count, fh, canceled,
-                                 failed, op_counter, fin, this, dir_sync_stat);
-          op_handler_context.handle_other_task_force(task);
+          common_subdir_info[d_name] = {false, change_mask};
         } else {
           bool need_data_sync = (cstx.stx_size != pstx.stx_size) ||
                                 (cstx.stx_mtime != pstx.stx_mtime);
-          if (change_mask || need_data_sync) {
-            if (need_data_sync) {
-              change_mask = change_mask | CEPH_STATX_MTIME;
-            }
-            task = new C_DoDirSync(dir_root, dpath, cstx, nullptr, true,
-                                   need_data_sync, change_mask, subdir_count,
-                                   fh, canceled, failed, op_counter, fin, this,
-                                   dir_sync_stat);
-            op_handler_context.handle_other_task_force(task);
+          if (need_data_sync) {
+            change_mask = change_mask | CEPH_STATX_MTIME;
           }
+          common_subdir_info[d_name] = {need_data_sync, change_mask};
         }
+        ++common_subdir_info_count;
       }
     }
     if (i < nr) {
@@ -1649,20 +1676,23 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   return r;
 }
 
-void PeerReplayer::do_dir_sync(
-    const std::string &dir_root, const std::string &cur_path,
-    const struct ceph_statx &cstx, ceph_dir_result *dirp, bool iknow,
-    bool need_data_sync, uint64_t change_mask, uint64_t subdir_count,
-    const FHandles &fh, std::atomic<bool> &canceled, std::atomic<bool> &failed,
-    std::atomic<int64_t> &op_counter, Context *fin,
-    SnapSyncStat &dir_sync_stat) {
+void PeerReplayer::do_dir_sync(const std::string &dir_root,
+                               const std::string &cur_path,
+                               const struct ceph_statx &cstx,
+                               ceph_dir_result *dirp, bool entry_known,
+                               bool need_data_sync, uint64_t change_mask,
+                               uint64_t common_subdir_info_count,
+                               const FHandles &fh, std::atomic<bool> &canceled,
+                               std::atomic<bool> &failed,
+                               std::atomic<int64_t> &op_counter, Context *fin,
+                               SnapSyncStat &dir_sync_stat) {
   int r = 0;
   bool dont_close = (cur_path == ".");
   struct ceph_statx child_stx;
   struct dirent child_de;
   std::string child_dname, child_ename, child_path;
   C_DoDirSync *task;
-  std::unordered_set<std::string> subdirs;
+  std::unordered_map<std::string, std::pair<bool, uint64_t>> common_subdir_info;
 
   if (should_backoff(canceled, failed, &r)) {
     dout(0) << ": backing off r=" << r << dendl;
@@ -1670,24 +1700,10 @@ void PeerReplayer::do_dir_sync(
   }
   if (!dont_close) {
     if (S_ISDIR(cstx.stx_mode)) {
-      if (!iknow) {
-        r = ceph_mkdirat(m_remote_mount, fh.r_fd_dir_root, cur_path.c_str(),
-                         cstx.stx_mode & ~S_IFDIR);
-        if (r < 0) {
-          if (r == -EEXIST) {
-            return;
-          }
-          derr << ": failed to create remote directory=" << cur_path << ": "
-               << cpp_strerror(r) << dendl;
-          goto safe_exit;
-        }
-        change_mask = (CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
-                       CEPH_STATX_MTIME);
-        dir_sync_stat.current_stat.inc_dir_created_count();
-      }
-      r = sync_attributes(dir_root, cur_path, cstx, change_mask, true, fh);
+      r = remote_mkdir(cur_path, cstx, entry_known, change_mask, fh,
+                       dir_sync_stat);
       if (r < 0) {
-        goto safe_exit;
+        goto sanity_check;
       }
       r = opendirat(m_local_mount, fh.c_fd, cur_path, AT_SYMLINK_NOFOLLOW,
                     &dirp);
@@ -1698,30 +1714,12 @@ void PeerReplayer::do_dir_sync(
       }
       dir_sync_stat.current_stat.inc_dir_scanned_count();
     } else {
-      dout(0) << ": checking in sync1-->" << cur_path << "-->" << iknow << ", "
-              << need_data_sync << ", " << change_mask << dendl;
-      if (!iknow) {
-        struct ceph_statx pstx;
-        int r = ceph_statxat(fh.p_mnt, fh.p_fd, cur_path.c_str(), &pstx,
-                             CEPH_STATX_MODE,
-                             AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
-        dout(0) << ": catching-->" << cur_path << "--> " << r << ", "
-                << (pstx.stx_mode & S_IFMT) << ", " << (cstx.stx_mode & S_IFMT)
-                << ", " << cpp_strerror(r) << dendl;
-        if (r == 0 && (pstx.stx_mode & S_IFMT) == (cstx.stx_mode & S_IFMT)) {
-          return;
+      if (!entry_known) {
+        r = should_sync_entry(cur_path, cstx, fh, &need_data_sync, change_mask);
+        if (r < 0) {
+          goto sanity_check;
         }
-        if (r < 0 && r != -ENOENT && r != -ENOTDIR) {
-          derr << ": failed to stat prev entry= " << cur_path << ": "
-               << cpp_strerror(r) << dendl;
-          goto safe_exit;
-        }
-        need_data_sync = true,
-        change_mask = (CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
-                       CEPH_STATX_MTIME);
       }
-      dout(0) << ": checking in sync2-->" << cur_path << "-->" << iknow << ", "
-              << need_data_sync << ", " << change_mask << dendl;
       dout(5) << ": entry=" << cur_path << ", data_sync=" << need_data_sync
               << ", attr_change_mask=" << change_mask << dendl;
       if (need_data_sync || change_mask) {
@@ -1729,18 +1727,18 @@ void PeerReplayer::do_dir_sync(
                            need_data_sync, canceled, failed, op_counter, fin,
                            dir_sync_stat);
         if (r < 0) {
-          goto safe_exit;
+          goto sanity_check;
         }
       } else {
         dir_sync_stat.current_stat.inc_file_op_count(0, 0, cstx.stx_size);
       }
-      goto safe_exit;
+      goto sanity_check;
     }
   }
 
-  r = propagate_deleted_entries(dir_root, cur_path, subdirs, subdir_count, fh,
-                                canceled, failed, op_counter, fin,
-                                dir_sync_stat);
+  r = propagate_deleted_entries(dir_root, cur_path, common_subdir_info,
+                                common_subdir_info_count, fh, canceled, failed,
+                                op_counter, fin, dir_sync_stat);
   if (r < 0 && r != -ENOENT) {
     derr << ": failed to propagate missing dirs: " << cpp_strerror(r) << dendl;
     goto safe_exit;
@@ -1766,11 +1764,18 @@ void PeerReplayer::do_dir_sync(
       continue;
     }
     child_path = entry_path(cur_path, child_dname);
-    if (subdirs.find(child_dname) != subdirs.end()) {
-      continue;
+    bool child_need_sync_data = false;
+    uint64_t child_change_mask = 0;
+    bool child_known = false;
+    auto it = common_subdir_info.find(child_dname);
+    if (it != common_subdir_info.end()) {
+      child_known = true;
+      child_need_sync_data = it->second.first;
+      child_change_mask = it->second.second;
     }
-    task = new C_DoDirSync(dir_root, child_path, child_stx, nullptr, false,
-                           false, 0, subdir_count, fh, canceled, failed,
+    task = new C_DoDirSync(dir_root, child_path, child_stx, nullptr,
+                           child_known, child_need_sync_data, child_change_mask,
+                           common_subdir_info_count, fh, canceled, failed,
                            op_counter, fin, this, dir_sync_stat);
     op_handler_context.handle_other_task_force(task);
   }
@@ -1779,6 +1784,8 @@ safe_exit:
   if (!dont_close && dirp && ceph_closedir(m_local_mount, dirp) < 0) {
     derr << ": failed to close local directory=" << cur_path << dendl;
   }
+
+sanity_check:
   if (r < 0 && !failed) {
     mark_failed(dir_root, r);
   }

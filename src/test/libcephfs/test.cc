@@ -3798,6 +3798,8 @@ TEST(LibCephFS, GetDents) {
     ASSERT_TRUE(!(r < 0 && r != -EEXIST));
   }
 
+  std::cout << "dir creation completed" << std::endl;
+
   ceph_dir_result* dirp;
   int r = ceph_openat(cmount, root_fd, ".", AT_SYMLINK_NOFOLLOW, 0);
   ASSERT_TRUE(r >= 0);
@@ -3824,28 +3826,28 @@ TEST(LibCephFS, GetDents) {
       }
       std::string dpath = "./" + d_name;
       struct ceph_statx stx;
-      r = ceph_statxat(cmount, fd, dpath.c_str(), &stx,
-                       CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
-                           CEPH_STATX_SIZE | CEPH_STATX_ATIME |
-                           CEPH_STATX_MTIME,
-                       AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
-
-      // r = ceph_statxat(cmount, fd, dpath.c_str(), &stx, CEPH_STATX_MODE,
+      // r = ceph_statxat(cmount, fd, dpath.c_str(), &stx,
+      //                  CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
+      //                      CEPH_STATX_SIZE | CEPH_STATX_ATIME |
+      //                      CEPH_STATX_MTIME,
       //                  AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
-      r = ceph_mkdirat(cmount, fd, dpath.c_str(), stx.stx_mode & ~S_IFDIR);
-      r = ceph_chownat(cmount, fd, dpath.c_str(), stx.stx_uid, stx.stx_gid,
-                       AT_SYMLINK_NOFOLLOW);
+
+      r = ceph_statxat(cmount, fd, dpath.c_str(), &stx, CEPH_STATX_MODE,
+                       AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
+      // r = ceph_mkdirat(cmount, fd, dpath.c_str(), stx.stx_mode & ~S_IFDIR);
+      // r = ceph_chownat(cmount, fd, dpath.c_str(), stx.stx_uid, stx.stx_gid,
+      //                  AT_SYMLINK_NOFOLLOW);
       if (r < 0) {
         std::cout << "problem1" << std::endl;
       }
-      r = ceph_chmodat(cmount, fd, dpath.c_str(), stx.stx_mode & ~S_IFMT,
-                       AT_SYMLINK_NOFOLLOW);
+      // r = ceph_chmodat(cmount, fd, dpath.c_str(), stx.stx_mode & ~S_IFMT,
+      //                  AT_SYMLINK_NOFOLLOW);
       if (r < 0) {
         std::cout << "problem2" << std::endl;
       }
-      struct timespec times[] = {{stx.stx_atime.tv_sec, stx.stx_atime.tv_nsec},
-                                 {stx.stx_mtime.tv_sec, stx.stx_mtime.tv_nsec}};
-      r = ceph_utimensat(cmount, fd, dpath.c_str(), times, AT_SYMLINK_NOFOLLOW);
+      // struct timespec times[] = {{stx.stx_atime.tv_sec, stx.stx_atime.tv_nsec},
+      //                            {stx.stx_mtime.tv_sec, stx.stx_mtime.tv_nsec}};
+      // r = ceph_utimensat(cmount, fd, dpath.c_str(), times, AT_SYMLINK_NOFOLLOW);
       if (r < 0) {
         std::cout << "problem3" << std::endl;
       }

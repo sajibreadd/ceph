@@ -444,19 +444,20 @@ public:
   public:
     C_DoDirSync(const std::string &dir_root, const std::string &cur_path,
                 const struct ceph_statx &cur_stx, ceph_dir_result *root_dirp,
-                bool iknow, bool need_data_sync, uint64_t change_mask,
-                uint64_t subdir_count, const FHandles &fh,
+                bool entry_known, bool need_data_sync, uint64_t change_mask,
+                uint64_t common_subdir_info_count, const FHandles &fh,
                 std::atomic<bool> &canceled, std::atomic<bool> &failed,
                 std::atomic<int64_t> &op_counter, Context *fin,
                 PeerReplayer *replayer, SnapSyncStat &dir_sync_stat)
         : dir_root(dir_root), cur_path(cur_path), cur_stx(cur_stx),
-          root_dirp(root_dirp), iknow(iknow), need_data_sync(need_data_sync),
-          change_mask(change_mask), subdir_count(subdir_count), fh(fh),
+          root_dirp(root_dirp), entry_known(entry_known),
+          need_data_sync(need_data_sync), change_mask(change_mask),
+          common_subdir_info_count(common_subdir_info_count), fh(fh),
           canceled(canceled), failed(failed),
           C_MirrorContext(op_counter, fin, replayer, dir_sync_stat) {}
     void finish(int r) override;
-    void set_subdir_count(uint64_t _subdir_count) {
-      subdir_count = _subdir_count;
+    void set_common_subdir_info_count(uint64_t _common_subdir_info_count) {
+      common_subdir_info_count = _common_subdir_info_count;
     }
 
   private:
@@ -464,10 +465,10 @@ public:
     std::string cur_path;
     struct ceph_statx cur_stx;
     ceph_dir_result *root_dirp;
-    bool iknow;
+    bool entry_known;
     bool need_data_sync;
     uint64_t change_mask;
-    uint64_t subdir_count;
+    uint64_t common_subdir_info_count;
     const FHandles &fh;
     std::atomic<bool> &canceled;
     std::atomic<bool> &failed;
@@ -747,14 +748,14 @@ private:
   int propagate_snap_deletes(const std::string &dir_root, const std::set<std::string> &snaps);
   int propagate_snap_renames(const std::string &dir_root,
                              const std::set<std::pair<std::string,std::string>> &snaps);
-  int propagate_deleted_entries(const std::string &dir_root,
-                                const std::string &epath,
-                                std::unordered_set<std::string> &subdirs,
-                                uint64_t &subdir_count, const FHandles &fh,
-                                std::atomic<bool> &canceled,
-                                std::atomic<bool> &failed,
-                                std::atomic<int64_t> &op_counter, Context *fin,
-                                SnapSyncStat &dir_sync_stat);
+  int propagate_deleted_entries(
+      const std::string &dir_root, const std::string &epath,
+      std::unordered_map<std::string, std::pair<bool, uint64_t>>
+          &common_subdir_info,
+      uint64_t &common_subdir_info_count, const FHandles &fh,
+      std::atomic<bool> &canceled, std::atomic<bool> &failed,
+      std::atomic<int64_t> &op_counter, Context *fin,
+      SnapSyncStat &dir_sync_stat);
   int cleanup_remote_dir(const std::string &dir_root, const std::string &epath,
                          const FHandles &fh,
                          std::atomic<bool> &canceled,
@@ -767,10 +768,16 @@ private:
   int open_dir(MountRef mnt, const std::string &dir_path, boost::optional<uint64_t> snap_id);
   int pre_sync_check_and_open_handles(const std::string &dir_root, const Snapshot &current,
                                       boost::optional<Snapshot> prev, FHandles *fh);
+  int should_sync_entry(const std::string &epath, const struct ceph_statx &cstx,
+                        const FHandles &fh, bool *need_data_sync,
+                        uint64_t &change_mask);
+  int remote_mkdir(const std::string &epath, const struct ceph_statx &cstx,
+                   bool dont_create, uint64_t change_mask, const FHandles &fh,
+                   SnapSyncStat &dir_sync_stat);
   void do_dir_sync(const std::string &dir_root, const std::string &cur_path,
                    const struct ceph_statx &cur_stx, ceph_dir_result *root_dirp,
-                   bool iknow, bool need_data_sync, uint64_t change_mask,
-                   uint64_t subdir_count, const FHandles &fh,
+                   bool entry_known, bool need_data_sync, uint64_t change_mask,
+                   uint64_t common_subdir_info_count, const FHandles &fh,
                    std::atomic<bool> &canceled, std::atomic<bool> &failed,
                    std::atomic<int64_t> &op_counter, Context *fin,
                    SnapSyncStat &dir_sync_stat);
@@ -792,18 +799,14 @@ private:
                   boost::optional<Snapshot> prev);
   int do_sync_snaps(const std::string &dir_root);
 
-  int remote_mkdir(const std::string &epath, const struct ceph_statx &stx,
-                   bool iknow, bool need_data_sync, uint64_t change_mask,
-                   const FHandles &fh);
   int remote_file_op(const std::string &dir_root, const std::string &epath,
                      const struct ceph_statx &stx, uint64_t change_mask,
                      const FHandles &fh, bool need_data_sync,
                      std::atomic<bool> &canceled, std::atomic<bool> &failed,
                      std::atomic<int64_t> &op_counter, Context *fin,
                      SnapSyncStat &dir_sync_stat);
-  int sync_attributes(const std::string &dir_root, const std::string &epath,
-                      const struct ceph_statx &stx, uint64_t change_mask,
-                      bool is_dir, const FHandles &fh);
+  int sync_attributes(const std::string &epath, const struct ceph_statx &stx,
+                      uint64_t change_mask, bool is_dir, const FHandles &fh);
   int copy_to_remote(const std::string &dir_root, const std::string &epath,
                      const struct ceph_statx &stx, const FHandles &fh,
                      std::atomic<bool> &canceled,
