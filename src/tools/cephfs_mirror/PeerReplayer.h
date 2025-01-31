@@ -45,12 +45,31 @@ public:
     // open file descriptor on dir_root on remote filesystem.
     // Always use this fd with @m_remote_mount.
     int r_fd_dir_root;
-    std::string cur_snap_path;
-    std::string prev_snap_path;
   };
 
   using clock = ceph::coarse_mono_clock;
   using time = ceph::coarse_mono_time;
+
+  struct CommonEntryInfo {
+    bool is_dir = false;
+    bool purge_remote = false;
+    unsigned int change_mask = 0;
+    CommonEntryInfo() : is_dir(false), purge_remote(false), change_mask(0) {}
+    CommonEntryInfo(bool is_dir, bool purge_remote, unsigned int change_mask)
+        : is_dir(is_dir), purge_remote(purge_remote), change_mask(change_mask) {
+    }
+    CommonEntryInfo(const CommonEntryInfo &other)
+        : is_dir(other.is_dir), purge_remote(other.purge_remote),
+          change_mask(other.change_mask) {}
+    CommonEntryInfo &operator=(const CommonEntryInfo &other) {
+      if (this != &other) {
+        is_dir = other.is_dir;
+        purge_remote = other.purge_remote;
+        change_mask = other.change_mask;
+      }
+      return *this;
+    }
+  };
 
   struct SnapSyncStat {
     uint64_t nr_failures = 0;          // number of consecutive failures
@@ -71,7 +90,6 @@ public:
       std::atomic<uint64_t> files_deleted{0};
       std::atomic<uint64_t> large_files_in_flight{0};
       std::atomic<uint64_t> large_files_op[2][2] = {0};
-      std::atomic<uint64_t> large_files_deleted{0};
       std::atomic<uint64_t> file_bytes_synced{0};
       std::atomic<uint64_t> dir_created{0};
       std::atomic<uint64_t> dir_deleted{0};
@@ -82,7 +100,6 @@ public:
             files_in_flight(other.files_in_flight.load()),
             files_deleted(other.files_deleted.load()),
             large_files_in_flight(other.large_files_in_flight.load()),
-            large_files_deleted(other.large_files_deleted.load()),
             file_bytes_synced(other.file_bytes_synced.load()),
             dir_created(other.dir_created.load()),
             dir_deleted(other.dir_deleted.load()),
@@ -101,7 +118,6 @@ public:
           files_in_flight.store(other.files_in_flight.load());
           files_deleted.store(other.files_deleted.load());
           large_files_in_flight.store(other.large_files_in_flight.load());
-          large_files_deleted.store(other.large_files_deleted.load());
           file_bytes_synced.store(other.file_bytes_synced.load());
           dir_created.store(other.dir_created.load());
           dir_deleted.store(other.dir_deleted.load());
@@ -115,11 +131,8 @@ public:
         }
         return *this;
       }
-      void inc_file_del_count(uint64_t file_size) {
+      void inc_file_del_count() {
         files_deleted++;
-        if (file_size >= large_file_threshold) {
-          large_files_deleted++;
-        }
       }
       void inc_file_op_count(bool data_synced, bool attr_synced,
                              uint64_t file_size) {
@@ -157,7 +170,6 @@ public:
         f->dump_unsigned("files_attr_synced", files_op[0][1].load());
         f->dump_unsigned("files_skipped", files_op[0][0].load());
         f->dump_unsigned("large_files_in_flight", large_files_in_flight.load());
-        f->dump_unsigned("large_files_deleted", large_files_deleted.load());
         f->dump_unsigned("large_files_data_attr_synced",
                          large_files_op[1][1].load());
         f->dump_unsigned("large_files_data_synced",
@@ -165,6 +177,7 @@ public:
         f->dump_unsigned("large_files_attr_synced",
                          large_files_op[0][1].load());
         f->dump_unsigned("large_files_skipped", large_files_op[0][0].load());
+        f->dump_unsigned("dir_scanned", dir_scanned);
         f->dump_unsigned("dir_created", dir_created);
         f->dump_unsigned("dir_deleted", dir_deleted);
       }
@@ -247,6 +260,8 @@ public:
       delete this;
     }
     void inc_counter() { ++op_counter; }
+    virtual void add_into_stat() {}
+    virtual void remove_from_stat() {}
 
   protected:
     std::atomic<int64_t> &op_counter;
@@ -271,8 +286,9 @@ public:
   class C_TransferAndSyncFile : public C_MirrorContext {
   public:
     C_TransferAndSyncFile(const std::string &dir_root, const std::string &epath,
-                          const struct ceph_statx &stx, uint64_t change_mask,
-                          const FHandles &fh, std::atomic<bool> &canceled,
+                          const struct ceph_statx &stx,
+                          unsigned int change_mask, const FHandles &fh,
+                          std::atomic<bool> &canceled,
                           std::atomic<bool> &failed,
                           std::atomic<int64_t> &op_counter, Context *fin,
                           PeerReplayer *replayer, SnapSyncStat &dir_sync_stat)
@@ -281,94 +297,25 @@ public:
           C_MirrorContext(op_counter, fin, replayer, dir_sync_stat) {}
 
     void finish(int r) override;
-    void set_thread_idx(int idx) { thread_idx = idx; }
+    void add_into_stat() override;
+    void remove_from_stat() override;
     friend class OpHandlerThreadPool;
 
   private:
     const std::string &dir_root;
     std::string epath;
     struct ceph_statx stx;
-    uint64_t change_mask;
+    unsigned int change_mask;
     const FHandles &fh;
     std::atomic<bool> &canceled;
     std::atomic<bool> &failed;
-    int thread_idx = -1;
   };
 
   class OpHandlerThreadPool {
   public:
-    struct ThreadStats {
-      int id;
-      std::string current_syncing_file = "";
-      uint64_t current_file_size = 0;
-      uint64_t current_file_synced_bytes = 0;
-      double current_sync_duration = 0.0;
-      std::string last_synced_file = "";
-      uint64_t last_synced_file_size = 0;
-      ceph::coarse_mono_clock::time_point start;
-      double last_sync_duration = 0.0;
-      std::unique_ptr<std::mutex> mtx;
-      ThreadStats() {}
-      ThreadStats(int id) : id(id), mtx(std::make_unique<std::mutex>()) {}
-      ThreadStats(const ThreadStats &) = delete;
-      ThreadStats &operator=(const ThreadStats &) = delete;
-      ThreadStats &operator=(ThreadStats &&) = delete;
-      ThreadStats(ThreadStats &&thread_stats)
-          : id(thread_stats.id),
-            current_syncing_file(std::move(thread_stats.current_syncing_file)),
-            current_file_size(thread_stats.current_file_size),
-            current_file_synced_bytes(thread_stats.current_file_synced_bytes),
-            last_synced_file(std::move(thread_stats.last_synced_file)),
-            last_synced_file_size(thread_stats.last_synced_file_size),
-            start(thread_stats.start),
-            last_sync_duration(thread_stats.last_sync_duration),
-            mtx(std::move(thread_stats.mtx)) {}
-      void new_transfer(const std::string &file_path, uint64_t file_size) {
-        std::lock_guard<std::mutex> lock(*mtx);
-        start = ceph::coarse_mono_clock::now();
-        current_syncing_file = file_path;
-        current_file_size = file_size;
-        current_file_synced_bytes = 0;
-      }
-      void roll_over(int r) {
-        std::lock_guard<std::mutex> lock(*mtx);
-        if (r >= 0) {
-          last_synced_file = current_syncing_file;
-          last_synced_file_size = current_file_size;
-          last_sync_duration = current_sync_duration;
-        }
-        current_syncing_file = "";
-        current_file_size = 0;
-        current_file_synced_bytes = 0;
-      }
-      void inc_sync_bytes(uint64_t r) {
-        current_file_synced_bytes += r;
-        auto end = ceph::coarse_mono_clock::now();
-        current_sync_duration =
-            std::chrono::duration<double, std::milli>(end - start).count();
-      }
-      void dump(Formatter *f) {
-        std::lock_guard<std::mutex> lock(*mtx);
-        f->open_object_section(std::to_string(id));
-        f->dump_int("thread_no", id);
-        f->open_object_section("current_syncing_file");
-        f->dump_string("file_path", current_syncing_file);
-        f->dump_unsigned("file_size", current_file_size);
-        f->dump_unsigned("synced_bytes", current_file_synced_bytes);
-        f->dump_float("sync_duration(ms)", current_sync_duration);
-        f->close_section();
-        f->open_object_section("last_synced_file");
-        f->dump_string("file_path", last_synced_file);
-        f->dump_unsigned("file_size", last_synced_file_size);
-        f->dump_float("sync_duration(ms)", last_sync_duration);
-        f->close_section();
-        f->close_section();
-      }
-    };
     struct ThreadPoolStats {
       uint64_t total_bytes_queued = 0;
       int large_file_queued = 0;
-      std::vector<ThreadStats> thread_stats;
       static const uint64_t large_file_threshold = 4194304;
       OpHandlerThreadPool* op_handler_context;
       void add_file(uint64_t file_size) {
@@ -382,9 +329,6 @@ public:
       ThreadPoolStats() {}
       ThreadPoolStats(int num_threads, OpHandlerThreadPool *op_handler_context)
           : op_handler_context(op_handler_context) {
-        for (int i = 0; i < num_threads; ++i) {
-          thread_stats.emplace_back(std::move(ThreadStats(i)));
-        }
       }
       void dump(Formatter *f) {
         f->open_object_section("thread_pool_stats");
@@ -394,11 +338,6 @@ public:
         f->dump_unsigned("bytes_queued_for_transfer", total_bytes_queued);
         f->dump_int("queued_dir_ops_count",
                     op_handler_context->other_task_queue.size());
-        f->open_array_section("thread_stats");
-        for (auto &it : thread_stats) {
-          it.dump(f);
-        }
-        f->close_section();
         f->close_section();
       }
     };
@@ -407,14 +346,13 @@ public:
     OpHandlerThreadPool(int _num_file_threads, int _num_other_threads);
     void activate();
     void deactivate();
-    void do_file_task_async(C_TransferAndSyncFile *task);
+    void do_file_task_async(C_MirrorContext *task);
     bool do_other_task_async(C_MirrorContext *task);
     void handle_other_task_force(C_MirrorContext *task);
     bool handler_other_task_async(C_MirrorContext *task);
     void handle_other_task_sync(C_MirrorContext *task);
-    bool is_other_task_queue_full_unlocked();
     void dump_stats(Formatter* f) {
-      std::scoped_lock lock(fmtx, omtx);
+      // std::scoped_lock lock(fmtx, omtx);
       thread_pool_stats.dump(f);
     }
     std::atomic<int> fcount, ocount;
@@ -423,16 +361,17 @@ public:
     friend class PeerReplayer;
 
   private:
-    void run_file_task(int thread_idx);
+    void run_file_task();
     void run_other_task();
     void drain_queue();
-    std::queue<C_TransferAndSyncFile *> file_task_queue;
+    std::queue<C_MirrorContext *> file_task_queue;
     std::queue<C_MirrorContext *> other_task_queue;
     std::condition_variable pick_file_task;
     std::condition_variable give_file_task;
     std::condition_variable pick_other_task;
     std::mutex fmtx, omtx;
-    static const int task_queue_limit = 100000;
+    int file_task_queue_limit;
+    int other_task_queue_limit;
     std::vector<std::thread> file_workers;
     std::vector<std::thread> other_workers;
     std::atomic<bool> stop_flag;
@@ -443,31 +382,33 @@ public:
   class C_DoDirSync : public C_MirrorContext {
   public:
     C_DoDirSync(const std::string &dir_root, const std::string &cur_path,
-                const struct ceph_statx &cur_stx, ceph_dir_result *root_dirp,
-                bool iknow, bool need_data_sync, uint64_t change_mask,
-                uint64_t subdir_count, const FHandles &fh,
+                const struct ceph_statx &cstx, ceph_dir_result *dirp,
+                bool create_fresh, bool entry_info_known,
+                const CommonEntryInfo &entry_info,
+                uint64_t common_entry_info_count, const FHandles &fh,
                 std::atomic<bool> &canceled, std::atomic<bool> &failed,
                 std::atomic<int64_t> &op_counter, Context *fin,
                 PeerReplayer *replayer, SnapSyncStat &dir_sync_stat)
-        : dir_root(dir_root), cur_path(cur_path), cur_stx(cur_stx),
-          root_dirp(root_dirp), iknow(iknow), need_data_sync(need_data_sync),
-          change_mask(change_mask), subdir_count(subdir_count), fh(fh),
+        : dir_root(dir_root), cur_path(cur_path), cstx(cstx), dirp(dirp),
+          create_fresh(create_fresh), entry_info_known(entry_info_known),
+          entry_info(entry_info),
+          common_entry_info_count(common_entry_info_count), fh(fh),
           canceled(canceled), failed(failed),
           C_MirrorContext(op_counter, fin, replayer, dir_sync_stat) {}
     void finish(int r) override;
-    void set_subdir_count(uint64_t _subdir_count) {
-      subdir_count = _subdir_count;
+    void set_common_entry_info_count(uint64_t _common_entry_info_count) {
+      common_entry_info_count = _common_entry_info_count;
     }
 
   private:
     const std::string &dir_root;
     std::string cur_path;
-    struct ceph_statx cur_stx;
-    ceph_dir_result *root_dirp;
-    bool iknow;
-    bool need_data_sync;
-    uint64_t change_mask;
-    uint64_t subdir_count;
+    struct ceph_statx cstx;
+    ceph_dir_result *dirp;
+    bool create_fresh;
+    bool entry_info_known;
+    CommonEntryInfo entry_info;
+    uint64_t common_entry_info_count;
     const FHandles &fh;
     std::atomic<bool> &canceled;
     std::atomic<bool> &failed;
@@ -494,17 +435,40 @@ public:
     std::atomic<bool> &canceled;
     std::atomic<bool> &failed;
   };
+
+  class C_DeleteFile : public C_MirrorContext {
+  public:
+    C_DeleteFile(const std::string &dir_root, const std::string &epath,
+                 const FHandles &fh, std::atomic<bool> &canceled,
+                 std::atomic<bool> &failed, std::atomic<int64_t> &op_counter,
+                 Context *fin, PeerReplayer *replayer,
+                 SnapSyncStat &dir_sync_stat)
+        : dir_root(dir_root), epath(epath), fh(fh), canceled(canceled),
+          failed(failed),
+          C_MirrorContext(op_counter, fin, replayer, dir_sync_stat) {}
+
+    void finish(int r) override;
+
+  private:
+    const std::string &dir_root;
+    std::string epath;
+    const FHandles &fh;
+    std::atomic<bool> &canceled;
+    std::atomic<bool> &failed;
+  };
+
   friend class C_MirrorContext;
   friend class C_DoDirSync;
   friend class C_TransferFile;
   friend class C_CleanUpRemoteDir;
+  friend class C_DeleteFile;
 
 private:
   inline static const std::string PRIMARY_SNAP_ID_KEY = "primary_snap_id";
 
   inline static const std::string SERVICE_DAEMON_FAILED_DIR_COUNT_KEY = "failure_count";
   inline static const std::string SERVICE_DAEMON_RECOVERED_DIR_COUNT_KEY = "recovery_count";
-  static const uint64_t PER_THREAD_SUBDIR_THRESH = 0;
+  static const uint64_t PER_THREAD_SUBDIR_THRESH = 100000;
 
   bool is_stopping() {
     return m_stopping;
@@ -747,30 +711,44 @@ private:
   int propagate_snap_deletes(const std::string &dir_root, const std::set<std::string> &snaps);
   int propagate_snap_renames(const std::string &dir_root,
                              const std::set<std::pair<std::string,std::string>> &snaps);
-  int propagate_deleted_entries(const std::string &dir_root,
-                                const std::string &epath,
-                                std::unordered_set<std::string> &subdirs,
-                                uint64_t &subdir_count, const FHandles &fh,
-                                std::atomic<bool> &canceled,
-                                std::atomic<bool> &failed,
-                                std::atomic<int64_t> &op_counter, Context *fin,
-                                SnapSyncStat &dir_sync_stat);
+
+  int delete_file(const std::string &dir_root, const std::string &epath,
+                  const FHandles &fh, std::atomic<bool> &canceled,
+                  std::atomic<bool> &failed, SnapSyncStat &dir_sync_stat);
+
+  int propagate_deleted_entries(
+      const std::string &dir_root, const std::string &epath,
+      std::unordered_map<std::string, CommonEntryInfo> &common_entry_info,
+      uint64_t &common_entry_info_count, const FHandles &fh,
+      std::atomic<bool> &canceled, std::atomic<bool> &failed,
+      std::atomic<int64_t> &op_counter, Context *fin,
+      SnapSyncStat &dir_sync_stat);
   int cleanup_remote_dir(const std::string &dir_root, const std::string &epath,
                          const FHandles &fh,
                          std::atomic<bool> &canceled,
                          std::atomic<bool> &failed,
                          SnapSyncStat &dir_sync_stat);
 
-  void update_change_mask(const struct ceph_statx &cstx,
-                          const struct ceph_statx &pstx, uint64_t &change_mask);
-
   int open_dir(MountRef mnt, const std::string &dir_path, boost::optional<uint64_t> snap_id);
   int pre_sync_check_and_open_handles(const std::string &dir_root, const Snapshot &current,
                                       boost::optional<Snapshot> prev, FHandles *fh);
+
+  int _remote_mkdir(const std::string &epath, const struct ceph_statx &cstx,
+                    const FHandles &fh);
+
+  int remote_mkdir(const std::string &epath, const struct ceph_statx &cstx,
+                   bool create_fresh, unsigned int change_mask,
+                   const FHandles &fh, SnapSyncStat &dir_sync_stat);
+
+  void build_change_mask(const struct ceph_statx &pstx,
+                         const struct ceph_statx &cstx, bool create_fresh,
+                         unsigned int &change_mask);
+
   void do_dir_sync(const std::string &dir_root, const std::string &cur_path,
-                   const struct ceph_statx &cur_stx, ceph_dir_result *root_dirp,
-                   bool iknow, bool need_data_sync, uint64_t change_mask,
-                   uint64_t subdir_count, const FHandles &fh,
+                   const struct ceph_statx &cstx, ceph_dir_result *dirp,
+                   bool create_fresh, bool stat_known,
+                   CommonEntryInfo &entry_info,
+                   uint64_t common_entry_info_count, const FHandles &fh,
                    std::atomic<bool> &canceled, std::atomic<bool> &failed,
                    std::atomic<int64_t> &op_counter, Context *fin,
                    SnapSyncStat &dir_sync_stat);
@@ -792,29 +770,28 @@ private:
                   boost::optional<Snapshot> prev);
   int do_sync_snaps(const std::string &dir_root);
 
-  int remote_mkdir(const std::string &epath, const struct ceph_statx &stx,
-                   bool iknow, bool need_data_sync, uint64_t change_mask,
-                   const FHandles &fh);
   int remote_file_op(const std::string &dir_root, const std::string &epath,
-                     const struct ceph_statx &stx, uint64_t change_mask,
-                     const FHandles &fh, bool need_data_sync,
+                     const struct ceph_statx &stx, bool need_data_sync,
+                     unsigned int change_mask, const FHandles &fh,
                      std::atomic<bool> &canceled, std::atomic<bool> &failed,
                      std::atomic<int64_t> &op_counter, Context *fin,
                      SnapSyncStat &dir_sync_stat);
-  int sync_attributes(const std::string &dir_root, const std::string &epath,
-                      const struct ceph_statx &stx, uint64_t change_mask,
-                      bool is_dir, const FHandles &fh);
+
+  int sync_attributes(const std::string &epath, const struct ceph_statx &stx,
+                      unsigned int change_mask, bool is_dir,
+                      const FHandles &fh);
+
   int copy_to_remote(const std::string &dir_root, const std::string &epath,
                      const struct ceph_statx &stx, const FHandles &fh,
                      std::atomic<bool> &canceled,
-                     std::atomic<bool> &failed,
-                     int thread_idx);
+                     std::atomic<bool> &failed);
+
   void transfer_and_sync_file(const std::string &dir_root,
                               const std::string &epath,
                               const struct ceph_statx &stx,
-                              uint64_t change_mask, const FHandles &fh,
+                              unsigned int change_mask, const FHandles &fh,
                               std::atomic<bool> &canceled,
-                              std::atomic<bool> &failed, int thread_idx,
+                              std::atomic<bool> &failed,
                               SnapSyncStat &dir_sync_stat);
   int sync_perms(const std::string &path);
 };
