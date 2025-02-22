@@ -171,10 +171,8 @@ PeerReplayer::PeerReplayer(
       m_asok_hook(new PeerReplayerAdminSocketHook(cct, filesystem, peer, this)),
       m_lock(ceph::make_mutex("cephfs::mirror::PeerReplayer::" +
                               stringify(peer.uuid))),
-      op_handler_context(g_ceph_context->_conf.get_val<uint64_t>(
-                             "cephfs_mirror_max_concurrent_file_transfer"),
-                         g_ceph_context->_conf.get_val<uint64_t>(
-                             "cephfs_mirror_max_concurrent_ops")) {
+      task_sink_context(g_ceph_context->_conf.get_val<uint64_t>(
+                             "cephfs_mirror_max_concurrent_file_transfer")) {
   // reset sync stats sent via service daemon
   m_service_daemon->add_or_update_peer_attribute(
       m_filesystem.fscid, m_peer, SERVICE_DAEMON_FAILED_DIR_COUNT_KEY,
@@ -282,14 +280,14 @@ int PeerReplayer::init() {
              "cephfs_mirror_max_concurrent_file_transfer="
           << g_ceph_context->_conf.get_val<uint64_t>(
                  "cephfs_mirror_max_concurrent_file_transfer")
-          << "cephfs_mirror_max_concurrent_ops="
+          << "cephfs_mirror_threads_per_sync="
           << g_ceph_context->_conf.get_val<uint64_t>(
-                 "cephfs_mirror_max_concurrent_ops")
+                 "cephfs_mirror_threads_per_sync")
           << ", cephfs_mirror_max_concurrent_directory_syncs="
           << g_ceph_context->_conf.get_val<uint64_t>(
                  "cephfs_mirror_max_concurrent_directory_syncs")
           << dendl;
-  op_handler_context.activate();
+  task_sink_context.activate();
   auto nr_replayers = g_ceph_context->_conf.get_val<uint64_t>(
     "cephfs_mirror_max_concurrent_directory_syncs");
   dout(20) << ": spawning " << nr_replayers << " snapshot replayer(s)" << dendl;
@@ -315,7 +313,8 @@ void PeerReplayer::shutdown() {
     m_cond.notify_all();
   }
 
-  op_handler_context.deactivate();
+  dir_op_handler_context.deactivate();
+  task_sink_context.deactivate();
   dout(0) << ": Operation handler thread pool deactivated" << dendl;
   for (auto &replayer : m_replayers) {
     replayer->join();
@@ -696,15 +695,16 @@ void PeerReplayer::C_DoDirSync::finish(int r) {
   }
   replayer->do_dir_sync(dir_root, cur_path, cstx, dirp, create_fresh,
                         entry_info_known, entry_info, common_entry_info_count,
-                        fh, canceled, failed, op_counter, fin, dir_sync_stat);
+                        thread_pool, fh, canceled, failed, op_counter, fin,
+                        dir_sync_stat);
 }
 
 void PeerReplayer::C_TransferAndSyncFile::add_into_stat() {
-  replayer->op_handler_context.thread_pool_stats.add_file(stx.stx_size);
+  replayer->task_sink_context.thread_pool_stats.add_file(stx.stx_size);
 }
 
 void PeerReplayer::C_TransferAndSyncFile::remove_from_stat() {
-  replayer->op_handler_context.thread_pool_stats.remove_file(stx.stx_size);
+  replayer->task_sink_context.thread_pool_stats.remove_file(stx.stx_size);
 }
 
 void PeerReplayer::C_TransferAndSyncFile::finish(int r) {
@@ -745,40 +745,165 @@ void PeerReplayer::C_DeleteFile::finish(int r) {
   }
 }
 
-PeerReplayer::OpHandlerThreadPool::OpHandlerThreadPool(int _num_file_threads,
-                                                       int _num_other_threads)
-    : file_workers(_num_file_threads), other_workers(_num_other_threads),
-      stop_flag(true), thread_pool_stats(_num_file_threads, this) {
-  file_task_queue_limit = 10 * _num_file_threads;
-  other_task_queue_limit = 10 * _num_other_threads;
-  // file_task_queue_limit = 100000;
-  // other_task_queue_limit = 100000;
-}
-
-void PeerReplayer::OpHandlerThreadPool::activate() {
-  ceph_assert(stop_flag);
+void PeerReplayer::DirOpHandlerContext::ThreadPool::activate() {
   stop_flag = false;
-  for (int i = 0; i < file_workers.size(); ++i) {
-    file_workers[i] = std::thread(&OpHandlerThreadPool::run_file_task, this);
-  }
-  for (auto &worker : other_workers) {
-    worker = std::thread(&OpHandlerThreadPool::run_other_task, this);
+  task_queue_limit = std::max(500, 10 * num_threads);
+  for (int i = 0; i < num_threads; ++i) {
+    workers.push_back(std::thread(&ThreadPool::run_task, this));
   }
 }
 
-void PeerReplayer::OpHandlerThreadPool::deactivate() {
-  ceph_assert(!stop_flag);
-  stop_flag = true;
+std::shared_ptr<PeerReplayer::DirOpHandlerContext::ThreadPool>
+PeerReplayer::DirOpHandlerContext::sync_start(int _num_threads) {
+  std::unique_lock<std::mutex> lock(context_mutex);
+  if (!active) {
+    return nullptr;
+  }
+  int idx = 0;
+  if (!unassigned_sync_ids.empty()) {
+    idx = unassigned_sync_ids.back();
+    thread_pools[idx] = std::make_shared<ThreadPool>(_num_threads, idx);
+    unassigned_sync_ids.pop_back();
+  } else {
+    idx = sync_count++;
+    thread_pools.emplace_back(std::make_shared<ThreadPool>(_num_threads, idx));
+  }
+  thread_pools[idx]->activate();
+  return thread_pools[idx];
+}
 
-  pick_file_task.notify_all();
-  give_file_task.notify_all();
-  pick_other_task.notify_all();
-  for (auto &worker : file_workers) {
+void PeerReplayer::DirOpHandlerContext::dump_stats(Formatter *f) {
+  std::unique_lock<std::mutex> lock(context_mutex);
+  int task_count = 0;
+  for (int i = 0; i < thread_pools.size(); ++i) {
+    task_count += thread_pools[i]->queued_task;
+  }
+  f->dump_int("queued_dir_ops_count", task_count);
+}
+
+void PeerReplayer::DirOpHandlerContext::deactivate() {
+  std::unique_lock<std::mutex> lock(context_mutex);
+  active = false;
+  for (int i = 0; i < thread_pools.size(); ++i) {
+    thread_pools[i]->deactivate();
+  }
+}
+
+void PeerReplayer::DirOpHandlerContext::ThreadPool::deactivate() {
+  stop_flag = true;
+  pick_task.notify_all();
+  for (auto &worker : workers) {
     if (worker.joinable()) {
       worker.join();
     }
   }
-  for (auto &worker : other_workers) {
+  drain_queue();
+  workers.clear();
+}
+
+void PeerReplayer::DirOpHandlerContext::sync_finish(int idx) {
+  std::unique_lock<std::mutex> lock(context_mutex);
+  ceph_assert(idx < thread_pools.size());
+  thread_pools[idx]->deactivate();
+  unassigned_sync_ids.push_back(idx);
+}
+
+
+void PeerReplayer::DirOpHandlerContext::ThreadPool::drain_queue() {
+  std::scoped_lock lock(mtx);
+  while (!task_queue.empty()) {
+    auto &task = task_queue.front();
+    task->complete(-1);
+    task_queue.pop();
+  }
+}
+
+void PeerReplayer::DirOpHandlerContext::ThreadPool::run_task() {
+  while (true) {
+    C_MirrorContext *task;
+    {
+      std::unique_lock<std::mutex> lock(mtx);
+      pick_task.wait(lock,
+                     [this] { return (stop_flag || !task_queue.empty()); });
+      if (stop_flag) {
+        return;
+      }
+      task = task_queue.front();
+      task_queue.pop();
+      queued_task--;
+    }
+    task->complete(0);
+  }
+}
+
+bool PeerReplayer::DirOpHandlerContext::ThreadPool::do_task_async(
+    C_MirrorContext *task) {
+  std::unique_lock<std::mutex> lock(mtx);
+  if (task_queue.size() >= task_queue_limit) {
+    return false;
+  }
+  task->inc_counter();
+  task_queue.emplace(task);
+  queued_task++;
+  pick_task.notify_one();
+  return true;
+}
+
+bool PeerReplayer::DirOpHandlerContext::ThreadPool::handle_task_async(
+    C_MirrorContext *task) {
+  bool success = false;
+  if (task_queue.size() < task_queue_limit) {
+    success = do_task_async(task);
+  }
+  return success;
+}
+
+void PeerReplayer::DirOpHandlerContext::ThreadPool::handle_task_force(
+    C_MirrorContext *task) {
+  if (!handle_task_async(task)) {
+    handle_task_sync(task);
+  }
+}
+
+void PeerReplayer::DirOpHandlerContext::ThreadPool::handle_task_sync(
+    C_MirrorContext *task) {
+  task->inc_counter();
+  task->complete(1);
+}
+
+void PeerReplayer::TaskSinkContext::activate() {
+  ceph_assert(stop_flag);
+  stop_flag = false;
+  for (int i = 0; i < workers.size(); ++i) {
+    workers[i] = std::thread(&TaskSinkContext::run_task, this);
+  }
+}
+
+void PeerReplayer::TaskSinkContext::drain_queue() {
+  std::scoped_lock lock(mtx);
+  while (task_count > 0) {
+    task_vec[task_count - 1]->complete(-1);
+    task_vec[task_count] = nullptr;
+    --task_count;
+  }
+}
+
+PeerReplayer::TaskSinkContext::TaskSinkContext(int num_threads)
+    : workers(num_threads), stop_flag(true),
+      thread_pool_stats(num_threads, this), task_count(0) {
+  task_limit = max(10 * num_threads, 5000);
+  task_vec = std::vector <C_MirrorContext*> (task_limit);
+  // file_task_queue_limit = 100000;
+  // other_task_queue_limit = 100000;
+}
+
+void PeerReplayer::TaskSinkContext::deactivate() {
+  ceph_assert(!stop_flag);
+  stop_flag = true;
+
+  pick_task.notify_all();
+  give_task.notify_all();
+  for (auto &worker : workers) {
     if (worker.joinable()) {
       worker.join();
     }
@@ -786,111 +911,43 @@ void PeerReplayer::OpHandlerThreadPool::deactivate() {
   drain_queue();
 }
 
-void PeerReplayer::OpHandlerThreadPool::drain_queue() {
-  {
-    std::scoped_lock lock(fmtx);
-    while (!file_task_queue.empty()) {
-      auto &task = file_task_queue.front();
-      task->complete(-1);
-      file_task_queue.pop();
-    }
-  }
-  {
-    std::scoped_lock lock(omtx);
-    while (!other_task_queue.empty()) {
-      auto &task = other_task_queue.front();
-      task->complete(-1);
-      other_task_queue.pop();
-    }
-  }
-}
-
-
-void PeerReplayer::OpHandlerThreadPool::run_file_task() {
+void PeerReplayer::TaskSinkContext::run_task() {
   while (true) {
     C_MirrorContext* task;
     uint64_t file_size;
     {
-      std::unique_lock<std::mutex> lock(fmtx);
-      pick_file_task.wait(
-          lock, [this] { return (stop_flag || !file_task_queue.empty()); });
+      std::unique_lock<std::mutex> lock(mtx);
+      pick_task.wait(
+          lock, [this] { return (stop_flag || task_count > 0); });
       if (stop_flag) {
         return;
       }
-      task = file_task_queue.front();
-      file_task_queue.pop();
+      task = task_vec[task_count - 1];
+      task_vec[task_count - 1] = nullptr;
+      task_count--;
       task->remove_from_stat();
       // thread_pool_stats.remove_file(task->stx.stx_size);
-      give_file_task.notify_one();
+      give_task.notify_one();
     }
     task->complete(0);
   }
 }
 
-void PeerReplayer::OpHandlerThreadPool::run_other_task() {
-  while (true) {
-    C_MirrorContext* task;
-    {
-      std::unique_lock<std::mutex> lock(omtx);
-      pick_other_task.wait(
-          lock, [this] { return (stop_flag || !other_task_queue.empty()); });
-      if (stop_flag)
-        return;
-      task = other_task_queue.front();
-      other_task_queue.pop();
-    }
-    task->complete(0);
-  }
-}
-
-void PeerReplayer::OpHandlerThreadPool::do_file_task_async(
+void PeerReplayer::TaskSinkContext::do_task_async(
     C_MirrorContext *task) {
-  std::unique_lock<std::mutex> lock(fmtx);
-  give_file_task.wait(lock, [this] {
-    return (stop_flag || file_task_queue.size() < file_task_queue_limit);
+  std::unique_lock<std::mutex> lock(mtx);
+  give_task.wait(lock, [this] {
+    return (stop_flag || task_count < task_limit);
   });
   if (stop_flag) {
     return;
   }
-  file_task_queue.emplace(task);
+  task_vec[task_count - 1] = task;
+  task_count++;
   task->inc_counter();
   task->add_into_stat();
   // thread_pool_stats.add_file(task->stx.stx_size);
-  pick_file_task.notify_one();
-}
-
-bool PeerReplayer::OpHandlerThreadPool::do_other_task_async(
-    C_MirrorContext *task) {
-  std::unique_lock<std::mutex> lock(omtx);
-  if (other_task_queue.size() >= other_task_queue_limit) {
-    return false;
-  }
-  task->inc_counter();
-  other_task_queue.emplace(task);
-  pick_other_task.notify_one();
-  return true;
-}
-
-bool PeerReplayer::OpHandlerThreadPool::handler_other_task_async(
-    C_MirrorContext *task) {
-  bool success = false;
-  if (other_task_queue.size() < other_task_queue_limit) {
-    success = do_other_task_async(task);
-  }
-  return success;
-}
-
-void PeerReplayer::OpHandlerThreadPool::handle_other_task_force(
-    C_MirrorContext *task) {
-  if (!handler_other_task_async(task)) {
-    handle_other_task_sync(task);
-  }
-}
-
-void PeerReplayer::OpHandlerThreadPool::handle_other_task_sync(
-    C_MirrorContext *task) {
-  task->inc_counter();
-  task->complete(1);
+  pick_task.notify_one();
 }
 
 #define NR_IOVECS 8 // # iovecs
@@ -1049,7 +1106,7 @@ int PeerReplayer::remote_file_op(
       C_TransferAndSyncFile *task = new C_TransferAndSyncFile(
           dir_root, epath, stx, change_mask, fh, canceled, failed, op_counter,
           fin, this, dir_sync_stat);
-      op_handler_context.do_file_task_async(task);
+      task_sink_context.do_task_async(task);
       dir_sync_stat.current_stat.inc_file_in_flight_count(stx.stx_size);
       // task();
       return 0;
@@ -1342,12 +1399,12 @@ int PeerReplayer::propagate_deleted_entries(
         C_CleanUpRemoteDir *task =
             new C_CleanUpRemoteDir(dir_root, dpath, fh, canceled, failed,
                                    op_counter, fin, this, dir_sync_stat);
-        op_handler_context.do_file_task_async(task);
+        task_sink_context.do_task_async(task);
       } else {
         C_DeleteFile *task =
             new C_DeleteFile(dir_root, dpath, fh, canceled,
                              failed, op_counter, fin, this, dir_sync_stat);
-        op_handler_context.do_file_task_async(task);
+        task_sink_context.do_task_async(task);
       }
     } else if (extra_flags) {
       unsigned int change_mask = 0;
@@ -1514,16 +1571,16 @@ void PeerReplayer::build_change_mask(const struct ceph_statx &pstx,
   }
 }
 
-void PeerReplayer::do_dir_sync(const std::string &dir_root,
-                               const std::string &cur_path,
-                               const struct ceph_statx &cstx,
-                               ceph_dir_result *dirp, bool create_fresh,
-                               bool entry_info_known, CommonEntryInfo &entry_info,
-                               uint64_t common_entry_info_count,
-                               const FHandles &fh, std::atomic<bool> &canceled,
-                               std::atomic<bool> &failed,
-                               std::atomic<int64_t> &op_counter, Context *fin,
-                               SnapSyncStat &dir_sync_stat) {
+void PeerReplayer::do_dir_sync(
+    const std::string &dir_root, const std::string &cur_path,
+    const struct ceph_statx &cstx, ceph_dir_result *dirp, bool create_fresh,
+    bool entry_info_known, CommonEntryInfo &entry_info,
+    uint64_t common_entry_info_count,
+    std::shared_ptr<DirOpHandlerContext::ThreadPool> &thread_pool,
+    const FHandles &fh, std::atomic<bool> &canceled, std::atomic<bool> &failed,
+    std::atomic<int64_t> &op_counter, Context *fin,
+    SnapSyncStat &dir_sync_stat) {
+  // dout(0) << ": do_dir_sync1-->" << cur_path << dendl;
   int r = 0;
   bool is_root = (cur_path == ".");
   struct ceph_statx child_stx, pstx;
@@ -1632,6 +1689,10 @@ void PeerReplayer::do_dir_sync(const std::string &dir_root,
   }
 
   while (true) {
+    if (should_backoff(canceled, failed, &r)) {
+      dout(0) << ": backing off r=" << r << dendl;
+      goto safe_exit;
+    }
     r = ceph_readdirplus_r(m_local_mount, dirp, &child_de, &child_stx,
                            CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
                                CEPH_STATX_SIZE | CEPH_STATX_MTIME,
@@ -1664,9 +1725,9 @@ void PeerReplayer::do_dir_sync(const std::string &dir_root,
     task = new C_DoDirSync(dir_root, child_path, child_stx, nullptr,
                            child_info.purge_remote | create_fresh,
                            child_info_known, child_info,
-                           common_entry_info_count, fh, canceled, failed,
-                           op_counter, fin, this, dir_sync_stat);
-    op_handler_context.handle_other_task_force(task);
+                           common_entry_info_count, thread_pool, fh, canceled,
+                           failed, op_counter, fin, this, dir_sync_stat);
+    thread_pool->handle_task_force(task);
   }
 
 safe_exit:
@@ -1770,12 +1831,20 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   dir_sync_stat.current_stat.rfiles = std::stoull(rfiles);
   dir_sync_stat.current_stat.rbytes = std::stoull(rbytes);
   lock.unlock();
+  int _num_threads = g_ceph_context->_conf.get_val<uint64_t>(
+      "cephfs_mirror_threads_per_sync");
+  std::shared_ptr <DirOpHandlerContext::ThreadPool> thread_pool =
+      dir_op_handler_context.sync_start(_num_threads);
 
-  C_DoDirSync *task = new C_DoDirSync(
-      dir_root, ".", tstx, tdirp, false, false, CommonEntryInfo(), 0, fh,
-      canceled, failed, op_counter, &fin, this, dir_sync_stat);
-  op_handler_context.handle_other_task_force(task);
-  fin.wait();
+  if (thread_pool) {
+    C_DoDirSync *task =
+        new C_DoDirSync(dir_root, ".", tstx, tdirp, false, false,
+                        CommonEntryInfo(), 0, thread_pool, fh, canceled, failed,
+                        op_counter, &fin, this, dir_sync_stat);
+    thread_pool->handle_task_force(task);
+    fin.wait();
+    dir_op_handler_context.sync_finish(thread_pool->thread_idx);
+  }
 
   if (tdirp && ceph_closedir(m_local_mount, tdirp) < 0) {
     derr << ": failed to close local directory=." << dendl;
@@ -1819,7 +1888,7 @@ int PeerReplayer::synchronize(const std::string &dir_root, const Snapshot &curre
          << ": " << cpp_strerror(r) << dendl;
     return r;
   }
-  r = -1;
+  // r = -1;
   // no xattr, can't determine which snap the data belongs to!
   if (r < 0) {
     dout(5) << ": missing \"ceph.mirror.dirty_snap_id\" xattr on remote -- using"
@@ -2068,7 +2137,10 @@ void PeerReplayer::peer_status(Formatter *f) {
     f->dump_unsigned("snaps_renamed", sync_stat.renamed_snap_count);
     f->close_section(); // dir_root
   }
-  op_handler_context.dump_stats(f);
+  f->open_object_section("thread_pool_stats");
+  task_sink_context.dump_stats(f);
+  dir_op_handler_context.dump_stats(f);
+  f->close_section();
   f->close_section(); // stats
 }
 

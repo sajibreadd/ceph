@@ -241,18 +241,63 @@ public:
 
   using Snapshot = std::pair<std::string, uint64_t>;
 
+  class C_MirrorContext;
+
+  class DirOpHandlerContext {
+  public:
+    class ThreadPool {
+    public:
+      ThreadPool(int num_threads, int thread_idx)
+          : num_threads(num_threads), task_queue_limit(0), stop_flag(true),
+            queued_task(0), thread_idx(thread_idx) {}
+      void activate();
+      void deactivate();
+      bool do_task_async(C_MirrorContext *task);
+      void handle_task_force(C_MirrorContext *task);
+      bool handle_task_async(C_MirrorContext *task);
+      void handle_task_sync(C_MirrorContext *task);
+      friend class DirOpHandlerContext;
+      friend class PeerReplayer;
+
+    private:
+      void run_task();
+      void drain_queue();
+      int num_threads;
+      std::queue<C_MirrorContext *> task_queue;
+      std::vector<std::thread> workers;
+      std::condition_variable pick_task;
+      std::mutex mtx;
+      int task_queue_limit;
+      std::atomic<bool> stop_flag;
+      int queued_task = 0;
+      int thread_idx;
+    };
+    DirOpHandlerContext() : active(true), sync_count(0) {}
+
+    std::shared_ptr<ThreadPool> sync_start(int _num_threads);
+    void sync_finish(int idx);
+
+    void dump_stats(Formatter *f);
+
+    void deactivate();
+
+  private:
+    std::vector<std::shared_ptr<ThreadPool>> thread_pools;
+    std::vector<int> unassigned_sync_ids;
+    int sync_count = 0;
+    std::mutex context_mutex;
+    bool active = true;
+  };
+  DirOpHandlerContext dir_op_handler_context;
+
   class C_MirrorContext : public Context {
   public:
     C_MirrorContext(std::atomic<int64_t> &op_counter, Context *fin,
-                    PeerReplayer *replayer, SnapSyncStat &dir_sync_stat)
+                    PeerReplayer *replayer, SnapSyncStat &dir_sync_stat,
+                    int thread_idx)
         : op_counter(op_counter), fin(fin), replayer(replayer),
-          m_peer(replayer->m_peer), dir_sync_stat(dir_sync_stat) {}
-    template <typename F>
-    C_MirrorContext(std::atomic<int64_t> &op_counter, Context *fin,
-                    PeerReplayer *replayer, SnapSyncStat &dir_sync_stat, F &&f)
-        : op_counter(op_counter), fin(fin), replayer(replayer),
-          m_peer(replayer->m_peer), task(std::move(f)),
-          dir_sync_stat(dir_sync_stat) {}
+          m_peer(replayer->m_peer), dir_sync_stat(dir_sync_stat),
+          thread_idx(thread_idx) {}
     virtual void finish(int r) = 0;
     void complete(int r) override {
       finish(r);
@@ -262,14 +307,15 @@ public:
     void inc_counter() { ++op_counter; }
     virtual void add_into_stat() {}
     virtual void remove_from_stat() {}
+    friend class DirOpHandlerContext;
 
   protected:
     std::atomic<int64_t> &op_counter;
     Context *fin;
     PeerReplayer *replayer;
-    std::function<void(std::atomic<int64_t> &, Context *)> task;
     Peer &m_peer; // just for using dout
-    SnapSyncStat& dir_sync_stat;
+    SnapSyncStat &dir_sync_stat;
+    int thread_idx = 0;
 
   private:
     void dec_counter() {
@@ -281,7 +327,7 @@ public:
   };
 
   class C_DoDirSync;
-  class OpHandlerThreadPool;
+  class TaskSinkContext;
 
   class C_TransferAndSyncFile : public C_MirrorContext {
   public:
@@ -294,12 +340,12 @@ public:
                           PeerReplayer *replayer, SnapSyncStat &dir_sync_stat)
         : dir_root(dir_root), epath(epath), stx(stx), change_mask(change_mask),
           fh(fh), canceled(canceled), failed(failed),
-          C_MirrorContext(op_counter, fin, replayer, dir_sync_stat) {}
+          C_MirrorContext(op_counter, fin, replayer, dir_sync_stat, -1) {}
 
     void finish(int r) override;
     void add_into_stat() override;
     void remove_from_stat() override;
-    friend class OpHandlerThreadPool;
+    friend class TaskSinkContext;
 
   private:
     const std::string &dir_root;
@@ -311,73 +357,62 @@ public:
     std::atomic<bool> &failed;
   };
 
-  class OpHandlerThreadPool {
+  class TaskSinkContext {
   public:
     struct ThreadPoolStats {
       uint64_t total_bytes_queued = 0;
       int large_file_queued = 0;
+      int file_queued = 0;
       static const uint64_t large_file_threshold = 4194304;
-      OpHandlerThreadPool* op_handler_context;
+      TaskSinkContext* task_sink_context;
       void add_file(uint64_t file_size) {
         large_file_queued += (file_size >= large_file_threshold);
+        file_queued++;
         total_bytes_queued += file_size;
       }
       void remove_file(uint64_t file_size) {
         large_file_queued -= (file_size >= large_file_threshold);
+        file_queued--;
         total_bytes_queued -= file_size;
       }
       ThreadPoolStats() {}
-      ThreadPoolStats(int num_threads, OpHandlerThreadPool *op_handler_context)
-          : op_handler_context(op_handler_context) {
+      ThreadPoolStats(int num_threads, TaskSinkContext *task_sink_context)
+          : task_sink_context(task_sink_context) {
       }
       void dump(Formatter *f) {
-        f->open_object_section("thread_pool_stats");
-        f->dump_int("queued_file_count",
-                    op_handler_context->file_task_queue.size());
+        f->dump_int("queued_file_count", file_queued);
         f->dump_int("queued_large_file_count", large_file_queued);
         f->dump_unsigned("bytes_queued_for_transfer", total_bytes_queued);
-        f->dump_int("queued_dir_ops_count",
-                    op_handler_context->other_task_queue.size());
-        f->close_section();
       }
     };
 
-    OpHandlerThreadPool() {}
-    OpHandlerThreadPool(int _num_file_threads, int _num_other_threads);
+    TaskSinkContext() {}
+    TaskSinkContext(int num_threads);
     void activate();
     void deactivate();
-    void do_file_task_async(C_MirrorContext *task);
-    bool do_other_task_async(C_MirrorContext *task);
-    void handle_other_task_force(C_MirrorContext *task);
-    bool handler_other_task_async(C_MirrorContext *task);
-    void handle_other_task_sync(C_MirrorContext *task);
+    void do_task_async(C_MirrorContext *task);
     void dump_stats(Formatter* f) {
       // std::scoped_lock lock(fmtx, omtx);
       thread_pool_stats.dump(f);
     }
-    std::atomic<int> fcount, ocount;
     friend class ThreadPoolStats;
     friend class C_TransferAndSyncFile;
     friend class PeerReplayer;
 
   private:
-    void run_file_task();
-    void run_other_task();
+    void run_task();
     void drain_queue();
-    std::queue<C_MirrorContext *> file_task_queue;
-    std::queue<C_MirrorContext *> other_task_queue;
-    std::condition_variable pick_file_task;
-    std::condition_variable give_file_task;
-    std::condition_variable pick_other_task;
-    std::mutex fmtx, omtx;
-    int file_task_queue_limit;
-    int other_task_queue_limit;
-    std::vector<std::thread> file_workers;
-    std::vector<std::thread> other_workers;
+    std::vector <C_MirrorContext*> task_vec;
+    std::condition_variable pick_task;
+    std::condition_variable give_task;
+    std::mutex mtx;
+    int task_limit;
+    std::vector<std::thread> workers;
     std::atomic<bool> stop_flag;
     ThreadPoolStats thread_pool_stats;
+    int task_count = 0;
   };
-  OpHandlerThreadPool op_handler_context;
+  TaskSinkContext task_sink_context;
 
   class C_DoDirSync : public C_MirrorContext {
   public:
@@ -385,16 +420,19 @@ public:
                 const struct ceph_statx &cstx, ceph_dir_result *dirp,
                 bool create_fresh, bool entry_info_known,
                 const CommonEntryInfo &entry_info,
-                uint64_t common_entry_info_count, const FHandles &fh,
-                std::atomic<bool> &canceled, std::atomic<bool> &failed,
-                std::atomic<int64_t> &op_counter, Context *fin,
-                PeerReplayer *replayer, SnapSyncStat &dir_sync_stat)
+                uint64_t common_entry_info_count,
+                std::shared_ptr <DirOpHandlerContext::ThreadPool> &thread_pool,
+                const FHandles &fh, std::atomic<bool> &canceled,
+                std::atomic<bool> &failed, std::atomic<int64_t> &op_counter,
+                Context *fin, PeerReplayer *replayer,
+                SnapSyncStat &dir_sync_stat)
         : dir_root(dir_root), cur_path(cur_path), cstx(cstx), dirp(dirp),
           create_fresh(create_fresh), entry_info_known(entry_info_known),
           entry_info(entry_info),
-          common_entry_info_count(common_entry_info_count), fh(fh),
-          canceled(canceled), failed(failed),
-          C_MirrorContext(op_counter, fin, replayer, dir_sync_stat) {}
+          common_entry_info_count(common_entry_info_count),
+          thread_pool(thread_pool), fh(fh), canceled(canceled), failed(failed),
+          C_MirrorContext(op_counter, fin, replayer, dir_sync_stat,
+                          thread_idx) {}
     void finish(int r) override;
     void set_common_entry_info_count(uint64_t _common_entry_info_count) {
       common_entry_info_count = _common_entry_info_count;
@@ -409,6 +447,7 @@ public:
     bool entry_info_known;
     CommonEntryInfo entry_info;
     uint64_t common_entry_info_count;
+    std::shared_ptr<DirOpHandlerContext::ThreadPool> &thread_pool;
     const FHandles &fh;
     std::atomic<bool> &canceled;
     std::atomic<bool> &failed;
@@ -417,14 +456,13 @@ public:
   class C_CleanUpRemoteDir : public C_MirrorContext {
   public:
     C_CleanUpRemoteDir(const std::string &dir_root, const std::string &epath,
-                       const FHandles &fh,
-                       std::atomic<bool> &canceled,
+                       const FHandles &fh, std::atomic<bool> &canceled,
                        std::atomic<bool> &failed,
                        std::atomic<int64_t> &op_counter, Context *fin,
                        PeerReplayer *replayer, SnapSyncStat &dir_sync_stat)
         : dir_root(dir_root), epath(epath), fh(fh), canceled(canceled),
           failed(failed),
-          C_MirrorContext(op_counter, fin, replayer, dir_sync_stat) {}
+          C_MirrorContext(op_counter, fin, replayer, dir_sync_stat, -1) {}
 
     void finish(int r) override;
 
@@ -445,7 +483,7 @@ public:
                  SnapSyncStat &dir_sync_stat)
         : dir_root(dir_root), epath(epath), fh(fh), canceled(canceled),
           failed(failed),
-          C_MirrorContext(op_counter, fin, replayer, dir_sync_stat) {}
+          C_MirrorContext(op_counter, fin, replayer, dir_sync_stat, -1) {}
 
     void finish(int r) override;
 
@@ -744,14 +782,15 @@ private:
                          const struct ceph_statx &cstx, bool create_fresh,
                          unsigned int &change_mask);
 
-  void do_dir_sync(const std::string &dir_root, const std::string &cur_path,
-                   const struct ceph_statx &cstx, ceph_dir_result *dirp,
-                   bool create_fresh, bool stat_known,
-                   CommonEntryInfo &entry_info,
-                   uint64_t common_entry_info_count, const FHandles &fh,
-                   std::atomic<bool> &canceled, std::atomic<bool> &failed,
-                   std::atomic<int64_t> &op_counter, Context *fin,
-                   SnapSyncStat &dir_sync_stat);
+  void
+  do_dir_sync(const std::string &dir_root, const std::string &cur_path,
+              const struct ceph_statx &cstx, ceph_dir_result *dirp,
+              bool create_fresh, bool stat_known, CommonEntryInfo &entry_info,
+              uint64_t common_entry_info_count,
+              std::shared_ptr<DirOpHandlerContext::ThreadPool> &thread_pool,
+              const FHandles &fh, std::atomic<bool> &canceled,
+              std::atomic<bool> &failed, std::atomic<int64_t> &op_counter,
+              Context *fin, SnapSyncStat &dir_sync_stat);
 
   int do_synchronize(const std::string &dir_root, const Snapshot &current,
                      boost::optional<Snapshot> prev);

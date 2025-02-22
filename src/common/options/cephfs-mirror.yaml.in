@@ -113,11 +113,11 @@ options:
   services:
   - cephfs-mirror
   min: 1
-- name: cephfs_mirror_max_concurrent_ops
+- name: cephfs_mirror_threads_per_sync
   type: uint
   level: advanced
-  desc: number of threads running for concurrent operations
-  long_desc: number of threads running for operations per peer.
+  desc: number of threads running for concurrently scanning directory
+  long_desc: number of threads running associated for each sync.
     Each thread is responsible for several libcephfs operations.
   default: 3
   services:
