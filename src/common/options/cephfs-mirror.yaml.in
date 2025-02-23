@@ -123,3 +123,11 @@ options:
   services:
   - cephfs-mirror
   min: 1
+- name: cephfs_mirror_remote_diff_base_upon_start
+  type: bool
+  level: advanced
+  desc: take remote cluster as diff base for syncing upon restart
+  long_desc: take remote cluster as diff base for syncing upon restart
+  default: false
+  services:
+  - cephfs-mirror

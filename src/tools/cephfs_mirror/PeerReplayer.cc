@@ -219,7 +219,7 @@ PeerReplayer::~PeerReplayer() {
 int PeerReplayer::init() {
   dout(20) << ": initial dir list=[" << m_directories << "]" << dendl;
   for (auto &dir_root : m_directories) {
-    m_snap_sync_stats.emplace(dir_root, SnapSyncStat());
+    m_snap_sync_stats.emplace(dir_root, std::make_shared<SnapSyncStat>());
   }
 
   auto &remote_client = m_peer.remote.client_name;
@@ -299,7 +299,7 @@ int PeerReplayer::init() {
     replayer->create(name.c_str());
     m_replayers.push_back(std::move(replayer));
   }
-
+  // dout(0) << ": initiation done-->" << dendl;
   return 0;
 }
 
@@ -331,7 +331,7 @@ void PeerReplayer::add_directory(string_view dir_root) {
 
   std::scoped_lock locker(m_lock);
   m_directories.emplace_back(dir_root);
-  m_snap_sync_stats.emplace(dir_root, SnapSyncStat());
+  m_snap_sync_stats.emplace(dir_root, std::make_shared<SnapSyncStat>());
   m_cond.notify_all();
 }
 
@@ -349,7 +349,7 @@ void PeerReplayer::remove_directory(string_view dir_root) {
   if (it1 == m_registered.end()) {
     m_snap_sync_stats.erase(_dir_root);
   } else {
-    it1->second.canceled = true;
+    it1->second->canceled = true;
   }
   m_cond.notify_all();
 }
@@ -364,8 +364,8 @@ boost::optional<std::string> PeerReplayer::pick_directory() {
   boost::optional<std::string> candidate;
   for (auto &dir_root : m_directories) {
     auto &sync_stat = m_snap_sync_stats.at(dir_root);
-    if (sync_stat.failed) {
-      std::chrono::duration<double> d = now - *sync_stat.last_failed;
+    if (sync_stat->failed) {
+      std::chrono::duration<double> d = now - *sync_stat->last_failed;
       if (d.count() < retry_timo) {
         continue;
       }
@@ -385,15 +385,15 @@ int PeerReplayer::register_directory(const std::string &dir_root,
   dout(20) << ": dir_root=" << dir_root << dendl;
   ceph_assert(m_registered.find(dir_root) == m_registered.end());
 
-  DirRegistry registry;
-  int r = try_lock_directory(dir_root, replayer, &registry);
+  std::shared_ptr <DirRegistry> registry = std::make_shared <DirRegistry>();
+  int r = try_lock_directory(dir_root, replayer, registry);
   if (r < 0) {
     return r;
   }
 
   dout(5) << ": dir_root=" << dir_root << " registered with replayer="
           << replayer << dendl;
-  m_registered.emplace(dir_root, std::move(registry));
+  m_registered.emplace(dir_root, registry);
   return 0;
 }
 
@@ -403,7 +403,7 @@ void PeerReplayer::unregister_directory(const std::string &dir_root) {
   auto it = m_registered.find(dir_root);
   ceph_assert(it != m_registered.end());
 
-  unlock_directory(it->first, it->second);
+  unlock_directory(it->first, *it->second);
   m_registered.erase(it);
   if (std::find(m_directories.begin(), m_directories.end(), dir_root) == m_directories.end()) {
     m_snap_sync_stats.erase(dir_root);
@@ -411,7 +411,8 @@ void PeerReplayer::unregister_directory(const std::string &dir_root) {
 }
 
 int PeerReplayer::try_lock_directory(const std::string &dir_root,
-                                     SnapshotReplayerThread *replayer, DirRegistry *registry) {
+                                     SnapshotReplayerThread *replayer,
+                                     std::shared_ptr<DirRegistry> &registry) {
   dout(20) << ": dir_root=" << dir_root << dendl;
 
   int r = ceph_open(m_remote_mount, dir_root.c_str(), O_RDONLY | O_DIRECTORY, 0);
@@ -670,7 +671,7 @@ int PeerReplayer::_remote_mkdir(const std::string &epath,
 int PeerReplayer::remote_mkdir(const std::string &epath,
                                const struct ceph_statx &cstx, bool create_fresh,
                                unsigned int change_mask, const FHandles &fh,
-                               SnapSyncStat &dir_sync_stat) {
+                               std::shared_ptr<SnapSyncStat> &dir_sync_stat) {
   dout(10) << ": remote epath=" << epath << dendl;
   int r = 0;
 
@@ -679,7 +680,7 @@ int PeerReplayer::remote_mkdir(const std::string &epath,
     if (r < 0) {
       return r;
     }
-    dir_sync_stat.current_stat.inc_dir_created_count();
+    dir_sync_stat->current_stat.inc_dir_created_count();
   }
 
   r = sync_attributes(epath, cstx, change_mask, true, fh);
@@ -695,7 +696,7 @@ void PeerReplayer::C_DoDirSync::finish(int r) {
   }
   replayer->do_dir_sync(dir_root, cur_path, cstx, dirp, create_fresh,
                         entry_info_known, entry_info, common_entry_info_count,
-                        thread_pool, fh, canceled, failed, op_counter, fin,
+                        thread_pool, fh, dir_registry, op_counter, fin,
                         dir_sync_stat);
 }
 
@@ -712,19 +713,19 @@ void PeerReplayer::C_TransferAndSyncFile::finish(int r) {
     return;
   }
   replayer->transfer_and_sync_file(dir_root, epath, stx, change_mask, fh,
-                                   canceled, failed, dir_sync_stat);
+                                   dir_registry, dir_sync_stat);
 }
 
 void PeerReplayer::C_CleanUpRemoteDir::finish(int r) {
   if (r < 0) {
     return;
   }
-  r = replayer->cleanup_remote_dir(dir_root, epath, fh, canceled, failed,
+  r = replayer->cleanup_remote_dir(dir_root, epath, fh, dir_registry,
                                    dir_sync_stat);
   if (r < 0 && r != -ENOENT) {
     derr << ": failed to cleanup remote directory=" << epath << ": "
          << cpp_strerror(r) << dendl;
-    if (!failed) {
+    if (!dir_registry->failed) {
       replayer->mark_failed(dir_root, r);
     }
   }
@@ -734,12 +735,11 @@ void PeerReplayer::C_DeleteFile::finish(int r) {
   if (r < 0) {
     return;
   }
-  r = replayer->delete_file(dir_root, epath, fh, canceled, failed,
-                            dir_sync_stat);
+  r = replayer->delete_file(dir_root, epath, fh, dir_registry, dir_sync_stat);
   if (r < 0 && r != -ENOENT) {
     derr << ": failed to cleanup remote file=" << epath << ": "
          << cpp_strerror(r) << dendl;
-    if (!failed) {
+    if (!dir_registry->failed) {
       replayer->mark_failed(dir_root, r);
     }
   }
@@ -881,18 +881,17 @@ void PeerReplayer::TaskSinkContext::activate() {
 
 void PeerReplayer::TaskSinkContext::drain_queue() {
   std::scoped_lock lock(mtx);
-  while (task_count > 0) {
-    task_vec[task_count - 1]->complete(-1);
-    task_vec[task_count] = nullptr;
-    --task_count;
+  while (!task_queue.empty()) {
+    auto& task = task_queue.front();
+    task->complete(-1);
+    task_queue.pop();
   }
 }
 
 PeerReplayer::TaskSinkContext::TaskSinkContext(int num_threads)
     : workers(num_threads), stop_flag(true),
-      thread_pool_stats(num_threads, this), task_count(0) {
+      thread_pool_stats(num_threads, this) {
   task_limit = max(10 * num_threads, 5000);
-  task_vec = std::vector <C_MirrorContext*> (task_limit);
   // file_task_queue_limit = 100000;
   // other_task_queue_limit = 100000;
 }
@@ -918,13 +917,12 @@ void PeerReplayer::TaskSinkContext::run_task() {
     {
       std::unique_lock<std::mutex> lock(mtx);
       pick_task.wait(
-          lock, [this] { return (stop_flag || task_count > 0); });
+          lock, [this] { return (stop_flag || !task_queue.empty()); });
       if (stop_flag) {
         return;
       }
-      task = task_vec[task_count - 1];
-      task_vec[task_count - 1] = nullptr;
-      task_count--;
+      task = task_queue.front();
+      task_queue.pop();
       task->remove_from_stat();
       // thread_pool_stats.remove_file(task->stx.stx_size);
       give_task.notify_one();
@@ -937,13 +935,12 @@ void PeerReplayer::TaskSinkContext::do_task_async(
     C_MirrorContext *task) {
   std::unique_lock<std::mutex> lock(mtx);
   give_task.wait(lock, [this] {
-    return (stop_flag || task_count < task_limit);
+    return (stop_flag || task_queue.size() < task_limit);
   });
   if (stop_flag) {
     return;
   }
-  task_vec[task_count - 1] = task;
-  task_count++;
+  task_queue.emplace(task);
   task->inc_counter();
   task->add_into_stat();
   // thread_pool_stats.add_file(task->stx.stx_size);
@@ -956,8 +953,7 @@ int PeerReplayer::copy_to_remote(const std::string &dir_root,
                                  const std::string &epath,
                                  const struct ceph_statx &stx,
                                  const FHandles &fh,
-                                 std::atomic<bool> &canceled,
-                                 std::atomic<bool> &failed) {
+                                 std::shared_ptr<DirRegistry> &dir_registry) {
   dout(10) << ": dir_root=" << dir_root << ", epath=" << epath << dendl;
   uint64_t total_read = 0, total_wrote = 0;
   std::string full_path = entry_path(dir_root, epath);
@@ -991,7 +987,7 @@ int PeerReplayer::copy_to_remote(const std::string &dir_root,
   }
 
   while (true) {
-    if (should_backoff(canceled, failed, &r)) {
+    if (should_backoff(dir_registry, &r)) {
       dout(0) << ": backing off r=" << r << dendl;
       break;
     }
@@ -1062,12 +1058,11 @@ close_local_fd:
 void PeerReplayer::transfer_and_sync_file(
     const std::string &dir_root, const std::string &epath,
     const struct ceph_statx &stx, unsigned int change_mask, const FHandles &fh,
-    std::atomic<bool> &canceled, std::atomic<bool> &failed,
-    SnapSyncStat &dir_sync_stat) {
-  int r =
-      copy_to_remote(dir_root, epath, stx, fh, canceled, failed);
+    std::shared_ptr<DirRegistry> &dir_registry,
+    std::shared_ptr<SnapSyncStat> &dir_sync_stat) {
+  int r = copy_to_remote(dir_root, epath, stx, fh, dir_registry);
   if (r < 0) {
-    if (!failed) {
+    if (!dir_registry->failed) {
       mark_failed(dir_root, r);
     }
     derr << ": failed to copy path=" << epath << ": " << cpp_strerror(r)
@@ -1081,21 +1076,23 @@ void PeerReplayer::transfer_and_sync_file(
   if (change_mask > 0) {
     r = sync_attributes(epath, stx, change_mask, false, fh);
   }
-  if (r < 0 && !failed) {
+  if (r < 0 && !dir_registry->failed) {
     mark_failed(dir_root, r);
     return;
   }
-  dir_sync_stat.current_stat.inc_file_op_count(true, (change_mask > 0),
-                                               stx.stx_size);
-  dir_sync_stat.current_stat.dec_file_in_flight_count(stx.stx_size);
+  dir_sync_stat->current_stat.inc_file_op_count(true, (change_mask > 0),
+                                                stx.stx_size);
+  dir_sync_stat->current_stat.dec_file_in_flight_count(stx.stx_size);
 }
 
-int PeerReplayer::remote_file_op(
-    const std::string &dir_root, const std::string &epath,
-    const struct ceph_statx &stx, bool need_data_sync, unsigned int change_mask,
-    const FHandles &fh, std::atomic<bool> &canceled, std::atomic<bool> &failed,
-    std::atomic<int64_t> &op_counter, Context *fin,
-    SnapSyncStat &dir_sync_stat) {
+int PeerReplayer::remote_file_op(const std::string &dir_root,
+                                 const std::string &epath,
+                                 const struct ceph_statx &stx,
+                                 bool need_data_sync, unsigned int change_mask,
+                                 const FHandles &fh,
+                                 std::shared_ptr<DirRegistry> &dir_registry,
+                                 std::atomic<int64_t> &op_counter, Context *fin,
+                                 std::shared_ptr<SnapSyncStat> &dir_sync_stat) {
   dout(10) << ": dir_root=" << dir_root << ", epath=" << epath
            << ", need_data_sync=" << need_data_sync
            << ", stat_change_mask=" << change_mask << dendl;
@@ -1104,10 +1101,10 @@ int PeerReplayer::remote_file_op(
   if (need_data_sync) {
     if (S_ISREG(stx.stx_mode)) {
       C_TransferAndSyncFile *task = new C_TransferAndSyncFile(
-          dir_root, epath, stx, change_mask, fh, canceled, failed, op_counter,
-          fin, this, dir_sync_stat);
+          dir_root, epath, stx, change_mask, fh, dir_registry, op_counter, fin,
+          this, dir_sync_stat);
       task_sink_context.do_task_async(task);
-      dir_sync_stat.current_stat.inc_file_in_flight_count(stx.stx_size);
+      dir_sync_stat->current_stat.inc_file_in_flight_count(stx.stx_size);
       // task();
       return 0;
     } else if (S_ISLNK(stx.stx_mode)) {
@@ -1137,7 +1134,7 @@ int PeerReplayer::remote_file_op(
     } else {
       dout(5) << ": skipping entry=" << epath << ": unsupported mode=" << stx.stx_mode
               << dendl;
-      dir_sync_stat.current_stat.inc_file_op_count(false, false, stx.stx_size);
+      dir_sync_stat->current_stat.inc_file_op_count(false, false, stx.stx_size);
       return 0;
     }
   }
@@ -1148,16 +1145,16 @@ int PeerReplayer::remote_file_op(
       return r;
     }
   }
-  dir_sync_stat.current_stat.inc_file_op_count(need_data_sync,
-                                               (change_mask > 0), stx.stx_size);
+  dir_sync_stat->current_stat.inc_file_op_count(
+      need_data_sync, (change_mask > 0), stx.stx_size);
 
   return 0;
 }
 
 int PeerReplayer::cleanup_remote_dir(
     const std::string &dir_root, const std::string &epath, const FHandles &fh,
-    std::atomic<bool> &canceled,
-    std::atomic<bool> &failed, SnapSyncStat &dir_sync_stat) {
+    std::shared_ptr<DirRegistry> &dir_registry,
+    std::shared_ptr<SnapSyncStat> &dir_sync_stat) {
   dout(20) << ": dir_root=" << dir_root << ", epath=" << epath
            << dendl;
 
@@ -1176,7 +1173,7 @@ int PeerReplayer::cleanup_remote_dir(
                 "shutdown, removing "
                 "it as a file="
              << epath << dendl;
-    r = delete_file(dir_root, epath, fh, canceled, failed, dir_sync_stat);
+    r = delete_file(dir_root, epath, fh, dir_registry, dir_sync_stat);
   }
   if (r < 0) {
     derr << ": failed to remove remote directory=" << epath << ": "
@@ -1196,7 +1193,7 @@ int PeerReplayer::cleanup_remote_dir(
   std::stack<SyncEntry> rm_stack;
   rm_stack.emplace(SyncEntry(epath, tdirp, tstx));
   while (!rm_stack.empty()) {
-    if (should_backoff(canceled, failed, &r)) {
+    if (should_backoff(dir_registry, &r)) {
       dout(0) << ": backing off r=" << r << dendl;
       break;
     }
@@ -1234,7 +1231,7 @@ int PeerReplayer::cleanup_remote_dir(
                << cpp_strerror(r) << dendl;
           break;
         }
-        dir_sync_stat.current_stat.inc_dir_deleted_count();
+        dir_sync_stat->current_stat.inc_dir_deleted_count();
 
         dout(10) << ": done for remote directory=" << entry.epath << dendl;
         if (entry.dirp && ceph_closedir(m_remote_mount, entry.dirp) < 0) {
@@ -1269,7 +1266,7 @@ int PeerReplayer::cleanup_remote_dir(
         break;
       }
       dout(10) << ": done for remote file=" << entry.epath << dendl;
-      dir_sync_stat.current_stat.inc_file_del_count();
+      dir_sync_stat->current_stat.inc_file_del_count();
       rm_stack.pop();
     }
   }
@@ -1291,13 +1288,12 @@ int PeerReplayer::cleanup_remote_dir(
 
 int PeerReplayer::delete_file(const std::string &dir_root,
                               const std::string &epath, const FHandles &fh,
-                              std::atomic<bool> &canceled,
-                              std::atomic<bool> &failed,
-                              SnapSyncStat &dir_sync_stat) {
+                              std::shared_ptr<DirRegistry> &dir_registry,
+                              std::shared_ptr<SnapSyncStat> &dir_sync_stat) {
   dout(20) << ": dir_root=" << dir_root << ", epath=" << epath << dendl;
   int r = ceph_unlinkat(m_remote_mount, fh.r_fd_dir_root, epath.c_str(), 0);
   if (r == 0) {
-    dir_sync_stat.current_stat.inc_file_del_count();
+    dir_sync_stat->current_stat.inc_file_del_count();
   }
   return r;
 }
@@ -1306,9 +1302,9 @@ int PeerReplayer::propagate_deleted_entries(
     const std::string &dir_root, const std::string &epath,
     std::unordered_map<std::string, CommonEntryInfo> &common_entry_info,
     uint64_t &common_entry_info_count, const FHandles &fh,
-    std::atomic<bool> &canceled, std::atomic<bool> &failed,
+    std::shared_ptr<DirRegistry> &dir_registry,
     std::atomic<int64_t> &op_counter, Context *fin,
-    SnapSyncStat &dir_sync_stat) {
+    std::shared_ptr<SnapSyncStat> &dir_sync_stat) {
   dout(10) << ": dir_root=" << dir_root << ", epath=" << epath << dendl;
 
   ceph_dir_result *dirp;
@@ -1333,7 +1329,7 @@ int PeerReplayer::propagate_deleted_entries(
   struct ceph_statx pstx;
   struct dirent de;
   while (true) {
-    if (should_backoff(canceled, failed, &r)) {
+    if (should_backoff(dir_registry, &r)) {
       dout(0) << ": backing off r=" << r << dendl;
       break;
     }
@@ -1397,13 +1393,13 @@ int PeerReplayer::propagate_deleted_entries(
       dout(5) << ": purging remote entry=" << dpath << dendl;
       if (S_ISDIR(pstx.stx_mode)) {
         C_CleanUpRemoteDir *task =
-            new C_CleanUpRemoteDir(dir_root, dpath, fh, canceled, failed,
+            new C_CleanUpRemoteDir(dir_root, dpath, fh, dir_registry,
                                    op_counter, fin, this, dir_sync_stat);
         task_sink_context.do_task_async(task);
       } else {
         C_DeleteFile *task =
-            new C_DeleteFile(dir_root, dpath, fh, canceled,
-                             failed, op_counter, fin, this, dir_sync_stat);
+            new C_DeleteFile(dir_root, dpath, fh, dir_registry, op_counter, fin,
+                             this, dir_sync_stat);
         task_sink_context.do_task_async(task);
       }
     } else if (extra_flags) {
@@ -1516,7 +1512,7 @@ int PeerReplayer::pre_sync_check_and_open_handles(
     std::scoped_lock locker(m_lock);
     auto it = m_registered.find(dir_root);
     ceph_assert(it != m_registered.end());
-    fh->r_fd_dir_root = it->second.fd;
+    fh->r_fd_dir_root = it->second->fd;
   }
 
   dout(5) << ": using " << ((fh->p_mnt == m_local_mount) ? "local (previous) snapshot" : "remote dir_root")
@@ -1577,9 +1573,9 @@ void PeerReplayer::do_dir_sync(
     bool entry_info_known, CommonEntryInfo &entry_info,
     uint64_t common_entry_info_count,
     std::shared_ptr<DirOpHandlerContext::ThreadPool> &thread_pool,
-    const FHandles &fh, std::atomic<bool> &canceled, std::atomic<bool> &failed,
+    const FHandles &fh, std::shared_ptr<DirRegistry> &dir_registry,
     std::atomic<int64_t> &op_counter, Context *fin,
-    SnapSyncStat &dir_sync_stat) {
+    std::shared_ptr<SnapSyncStat> &dir_sync_stat) {
   // dout(0) << ": do_dir_sync1-->" << cur_path << dendl;
   int r = 0;
   bool is_root = (cur_path == ".");
@@ -1590,7 +1586,7 @@ void PeerReplayer::do_dir_sync(
   std::unordered_map<std::string, CommonEntryInfo> common_entry_info;
   int pstat_r = 0, rem_r = 0;
 
-  if (should_backoff(canceled, failed, &r)) {
+  if (should_backoff(dir_registry, &r)) {
     dout(0) << ": backing off r=" << r << dendl;
     goto safe_exit;
   }
@@ -1620,11 +1616,11 @@ void PeerReplayer::do_dir_sync(
     }
     if (create_fresh && entry_info.purge_remote) {
       if (entry_info.is_dir) {
-        rem_r = cleanup_remote_dir(dir_root, cur_path, fh, canceled, failed,
+        rem_r = cleanup_remote_dir(dir_root, cur_path, fh, dir_registry,
                                    dir_sync_stat);
       } else {
-        rem_r = delete_file(dir_root, cur_path, fh, canceled, failed,
-                            dir_sync_stat);
+        rem_r =
+            delete_file(dir_root, cur_path, fh, dir_registry, dir_sync_stat);
         if (rem_r == -EISDIR && S_ISDIR(cstx.stx_mode)) {
           dout(10)
               << ": although it is not a directory in previous snapshot but in "
@@ -1657,7 +1653,7 @@ void PeerReplayer::do_dir_sync(
              << cpp_strerror(r) << dendl;
         goto safe_exit;
       }
-      dir_sync_stat.current_stat.inc_dir_scanned_count();
+      dir_sync_stat->current_stat.inc_dir_scanned_count();
     } else {
       bool need_data_sync = create_fresh ||
                             ((entry_info.change_mask & CEPH_STATX_SIZE) > 0) ||
@@ -1666,20 +1662,20 @@ void PeerReplayer::do_dir_sync(
               << ", attr_change_mask=" << entry_info.change_mask << dendl;
       if (need_data_sync || entry_info.change_mask) {
         r = remote_file_op(dir_root, cur_path, cstx, need_data_sync,
-                           entry_info.change_mask, fh, canceled, failed,
-                           op_counter, fin, dir_sync_stat);
+                           entry_info.change_mask, fh, dir_registry, op_counter,
+                           fin, dir_sync_stat);
         if (r < 0) {
           goto sanity_check;
         }
       } else {
-        dir_sync_stat.current_stat.inc_file_op_count(0, 0, cstx.stx_size);
+        dir_sync_stat->current_stat.inc_file_op_count(0, 0, cstx.stx_size);
       }
       goto sanity_check;
     }
   }
   if (!create_fresh) {
     r = propagate_deleted_entries(dir_root, cur_path, common_entry_info,
-                                  common_entry_info_count, fh, canceled, failed,
+                                  common_entry_info_count, fh, dir_registry,
                                   op_counter, fin, dir_sync_stat);
     if (r < 0 && r != -ENOENT) {
       derr << ": failed to propagate missing dirs: " << cpp_strerror(r)
@@ -1689,7 +1685,7 @@ void PeerReplayer::do_dir_sync(
   }
 
   while (true) {
-    if (should_backoff(canceled, failed, &r)) {
+    if (should_backoff(dir_registry, &r)) {
       dout(0) << ": backing off r=" << r << dendl;
       goto safe_exit;
     }
@@ -1725,8 +1721,8 @@ void PeerReplayer::do_dir_sync(
     task = new C_DoDirSync(dir_root, child_path, child_stx, nullptr,
                            child_info.purge_remote | create_fresh,
                            child_info_known, child_info,
-                           common_entry_info_count, thread_pool, fh, canceled,
-                           failed, op_counter, fin, this, dir_sync_stat);
+                           common_entry_info_count, thread_pool, fh,
+                           dir_registry, op_counter, fin, this, dir_sync_stat);
     thread_pool->handle_task_force(task);
   }
 
@@ -1736,7 +1732,7 @@ safe_exit:
   }
 
 sanity_check:
-  if (r < 0 && !failed) {
+  if (r < 0 && !dir_registry->failed) {
     mark_failed(dir_root, r);
   }
 }
@@ -1822,14 +1818,15 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
 
   std::atomic<int64_t> op_counter(0);
   C_SaferCond fin;
+  // dout(0) << "I am here1" << dendl;
   std::unique_lock<ceph::mutex> lock(m_lock);
-  auto &dr = m_registered.at(dir_root);
-  dr.failed = false, dr.failed_reason = 0;
-  std::atomic<bool> &canceled = dr.canceled;
-  std::atomic<bool> &failed = dr.failed;
-  auto &dir_sync_stat = m_snap_sync_stats.at(dir_root);
-  dir_sync_stat.current_stat.rfiles = std::stoull(rfiles);
-  dir_sync_stat.current_stat.rbytes = std::stoull(rbytes);
+  auto dir_registry = m_registered.at(dir_root);
+  dir_registry->failed = false, dir_registry->failed_reason = 0;
+  auto dir_sync_stat = m_snap_sync_stats.at(dir_root);
+  dir_sync_stat->current_stat.rfiles = std::stoull(rfiles);
+  dir_sync_stat->current_stat.rbytes = std::stoull(rbytes);
+  dir_sync_stat->current_stat.start_timer();
+  // dout(0) << "I am here2" << dendl;
   lock.unlock();
   int _num_threads = g_ceph_context->_conf.get_val<uint64_t>(
       "cephfs_mirror_threads_per_sync");
@@ -1837,10 +1834,9 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
       dir_op_handler_context.sync_start(_num_threads);
 
   if (thread_pool) {
-    C_DoDirSync *task =
-        new C_DoDirSync(dir_root, ".", tstx, tdirp, false, false,
-                        CommonEntryInfo(), 0, thread_pool, fh, canceled, failed,
-                        op_counter, &fin, this, dir_sync_stat);
+    C_DoDirSync *task = new C_DoDirSync(
+        dir_root, ".", tstx, tdirp, false, false, CommonEntryInfo(), 0,
+        thread_pool, fh, dir_registry, op_counter, &fin, this, dir_sync_stat);
     thread_pool->handle_task_force(task);
     fin.wait();
     dir_op_handler_context.sync_finish(thread_pool->thread_idx);
@@ -1852,11 +1848,11 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   if (m_stopping) {
     r = -EINPROGRESS;
   }
-  if (r >= 0 && failed) {
+  if (r >= 0 && dir_registry->failed) {
     r = get_failed_reason(dir_root);
   }
   lock.lock();
-  dir_sync_stat.reset_stats();
+  dir_sync_stat->reset_stats();
   lock.unlock();
 
   dout(0) << ": done sync-->" << dir_root << ", " << current.first << dendl;
@@ -1887,6 +1883,16 @@ int PeerReplayer::synchronize(const std::string &dir_root, const Snapshot &curre
     derr << ": failed to fetch primary_snap_id length from dir_root=" << dir_root
          << ": " << cpp_strerror(r) << dendl;
     return r;
+  }
+
+  {
+    std::scoped_lock lock(m_lock);
+    auto &dir_sync_stat = m_snap_sync_stats.at(dir_root);
+    bool remote_diff_base = g_ceph_context->_conf.get_val<bool>(
+        "cephfs_mirror_remote_diff_base_upon_start");
+    if (dir_sync_stat->synced_snap_count == 0 && remote_diff_base) {
+      r = -1;
+    }
   }
   // r = -1;
   // no xattr, can't determine which snap the data belongs to!
@@ -2057,6 +2063,7 @@ void PeerReplayer::sync_snaps(const std::string &dir_root,
 
 void PeerReplayer::run(SnapshotReplayerThread *replayer) {
   dout(10) << ": snapshot replayer=" << replayer << dendl;
+  // dout(0) << ": I am here1-->" << dendl;
 
   time last_directory_scan = clock::zero();
   auto scan_interval = g_ceph_context->_conf.get_val<uint64_t>(
@@ -2084,10 +2091,14 @@ void PeerReplayer::run(SnapshotReplayerThread *replayer) {
     std::chrono::duration<double> timo = now - last_directory_scan;
     if (timo.count() >= scan_interval && m_directories.size()) {
       dout(20) << ": trying to pick from " << m_directories.size() << " directories" << dendl;
+      // dout(0) << ": pick directory1-->" << dendl;
       auto dir_root = pick_directory();
+      // dout(0) << ": pick directory2-->" << dendl;
       if (dir_root) {
         dout(5) << ": picked dir_root=" << *dir_root << dendl;
+        // dout(0) << ": pick directory3-->" << dendl;
         int r = register_directory(*dir_root, replayer);
+        // dout(0) << ": pick directory4-->" << dendl;
         if (r == 0) {
 	  r = sync_perms(*dir_root);
 	  if (r < 0) {
@@ -2109,32 +2120,32 @@ void PeerReplayer::peer_status(Formatter *f) {
   f->open_object_section("stats");
   for (auto &[dir_root, sync_stat] : m_snap_sync_stats) {
     f->open_object_section(dir_root);
-    if (sync_stat.failed) {
+    if (sync_stat->failed) {
       f->dump_string("state", "failed");
-    } else if (!sync_stat.current_syncing_snap) {
+    } else if (!sync_stat->current_syncing_snap) {
       f->dump_string("state", "idle");
     } else {
       f->dump_string("state", "syncing");
       f->open_object_section("current_sycning_snap");
-      f->dump_unsigned("id", (*sync_stat.current_syncing_snap).first);
-      f->dump_string("name", (*sync_stat.current_syncing_snap).second);
-      sync_stat.current_stat.dump(f);
+      f->dump_unsigned("id", (*sync_stat->current_syncing_snap).first);
+      f->dump_string("name", (*sync_stat->current_syncing_snap).second);
+      sync_stat->current_stat.dump(f);
       f->close_section();
     }
-    if (sync_stat.last_synced_snap) {
+    if (sync_stat->last_synced_snap) {
       f->open_object_section("last_synced_snap");
-      f->dump_unsigned("id", (*sync_stat.last_synced_snap).first);
-      f->dump_string("name", (*sync_stat.last_synced_snap).second);
-      if (sync_stat.last_sync_duration) {
-        f->dump_float("sync_duration", *sync_stat.last_sync_duration);
-        f->dump_stream("sync_time_stamp") << sync_stat.last_synced;
+      f->dump_unsigned("id", (*sync_stat->last_synced_snap).first);
+      f->dump_string("name", (*sync_stat->last_synced_snap).second);
+      if (sync_stat->last_sync_duration) {
+        f->dump_float("sync_duration", *sync_stat->last_sync_duration);
+        f->dump_stream("sync_time_stamp") << sync_stat->last_synced;
       }
-      sync_stat.last_stat.dump(f);
+      sync_stat->last_stat.dump(f);
       f->close_section();
     }
-    f->dump_unsigned("snaps_synced", sync_stat.synced_snap_count);
-    f->dump_unsigned("snaps_deleted", sync_stat.deleted_snap_count);
-    f->dump_unsigned("snaps_renamed", sync_stat.renamed_snap_count);
+    f->dump_unsigned("snaps_synced", sync_stat->synced_snap_count);
+    f->dump_unsigned("snaps_deleted", sync_stat->deleted_snap_count);
+    f->dump_unsigned("snaps_renamed", sync_stat->renamed_snap_count);
     f->close_section(); // dir_root
   }
   f->open_object_section("thread_pool_stats");

@@ -47,6 +47,7 @@ public:
     int r_fd_dir_root;
   };
 
+
   using clock = ceph::coarse_mono_clock;
   using time = ceph::coarse_mono_time;
 
@@ -94,7 +95,8 @@ public:
       std::atomic<uint64_t> dir_created{0};
       std::atomic<uint64_t> dir_deleted{0};
       std::atomic<uint64_t> dir_scanned{0};
-      SyncStat() {}
+      boost::optional<time> start_time;
+      SyncStat() : start_time(boost::none) {}
       SyncStat(const SyncStat &other)
           : rfiles(other.rfiles), rbytes(other.rbytes),
             files_in_flight(other.files_in_flight.load()),
@@ -103,7 +105,8 @@ public:
             file_bytes_synced(other.file_bytes_synced.load()),
             dir_created(other.dir_created.load()),
             dir_deleted(other.dir_deleted.load()),
-            dir_scanned(other.dir_scanned.load()) {
+            dir_scanned(other.dir_scanned.load()),
+            start_time(other.start_time) {
         for (size_t i = 0; i < 2; ++i) {
           for (size_t j = 0; j < 2; ++j) {
             files_op[i][j].store(other.files_op[i][j].load());
@@ -122,6 +125,7 @@ public:
           dir_created.store(other.dir_created.load());
           dir_deleted.store(other.dir_deleted.load());
           dir_scanned.store(other.dir_scanned.load());
+          start_time = other.start_time;
           for (size_t i = 0; i < 2; ++i) {
             for (size_t j = 0; j < 2; ++j) {
               files_op[i][j].store(other.files_op[i][j].load());
@@ -140,9 +144,7 @@ public:
         if (file_size >= large_file_threshold) {
           large_files_op[data_synced][attr_synced]++;
         }
-        if (data_synced) {
-          file_bytes_synced.fetch_add(file_size, std::memory_order_relaxed);
-        }
+        file_bytes_synced.fetch_add(file_size, std::memory_order_relaxed);
       }
       void inc_file_in_flight_count(uint64_t file_size) {
         files_in_flight++;
@@ -159,10 +161,31 @@ public:
       void inc_dir_created_count() { dir_created++; }
       void inc_dir_deleted_count() { dir_deleted++; }
       void inc_dir_scanned_count() { dir_scanned++; }
+      void start_timer() { start_time = clock::now(); }
       void dump(Formatter *f) {
         f->dump_unsigned("rfiles", rfiles);
         f->dump_unsigned("rbytes", rbytes);
         f->dump_unsigned("files_bytes_synced", file_bytes_synced.load());
+        if (start_time) {
+          std::chrono::duration<double> duration = clock::now() - *start_time;
+          double time_elapsed = duration.count();
+          f->dump_float("time_elapsed", time_elapsed);
+          double speed = 0;
+          std::string syncing_speed = "";
+          if (time_elapsed > 0) {
+            speed = (file_bytes_synced * 8.0) / time_elapsed;
+            if (speed >= (double)1e9) {
+              syncing_speed = std::to_string(speed / (double)1e9) + "Gbps";
+            } else if (speed >= (double)1e6) {
+              syncing_speed = std::to_string(speed / (double)1e6) + "Mbps";
+            } else if (speed >= (double)1e3){
+              syncing_speed = std::to_string(speed / (double)1e3) + "Kbps";
+            } else {
+              syncing_speed = std::to_string(speed) + "bps";
+            }
+            f->dump_string("syncing_speed", syncing_speed);
+          }
+        }
         f->dump_unsigned("files_in_flight", files_in_flight.load());
         f->dump_unsigned("files_deleted", files_deleted.load());
         f->dump_unsigned("files_data_attr_synced", files_op[1][1].load());
@@ -217,6 +240,7 @@ public:
     }
     void reset_stats() {
       last_stat = current_stat;
+      last_stat.start_time = boost::none;
       current_stat = SyncStat();
     }
   };
@@ -290,10 +314,12 @@ public:
   };
   DirOpHandlerContext dir_op_handler_context;
 
+  struct DirRegistry;
   class C_MirrorContext : public Context {
   public:
     C_MirrorContext(std::atomic<int64_t> &op_counter, Context *fin,
-                    PeerReplayer *replayer, SnapSyncStat &dir_sync_stat,
+                    PeerReplayer *replayer,
+                    std::shared_ptr<SnapSyncStat> &dir_sync_stat,
                     int thread_idx)
         : op_counter(op_counter), fin(fin), replayer(replayer),
           m_peer(replayer->m_peer), dir_sync_stat(dir_sync_stat),
@@ -314,7 +340,7 @@ public:
     Context *fin;
     PeerReplayer *replayer;
     Peer &m_peer; // just for using dout
-    SnapSyncStat &dir_sync_stat;
+    std::shared_ptr<SnapSyncStat> &dir_sync_stat;
     int thread_idx = 0;
 
   private:
@@ -326,6 +352,46 @@ public:
     }
   };
 
+  struct Replayer;
+  class SnapshotReplayerThread : public Thread {
+  public:
+    SnapshotReplayerThread(PeerReplayer *peer_replayer)
+      : m_peer_replayer(peer_replayer) {
+    }
+
+    void *entry() override {
+      m_peer_replayer->run(this);
+      return 0;
+    }
+
+  private:
+    PeerReplayer *m_peer_replayer;
+  };
+
+  struct DirRegistry {
+    int fd;
+    std::atomic<bool> canceled = false;
+    SnapshotReplayerThread *replayer;
+    std::atomic<bool> failed = false;
+    int failed_reason;
+    DirRegistry() {}
+    DirRegistry(const DirRegistry &other)
+        : fd(other.fd), canceled(other.canceled.load()),
+          replayer(other.replayer), failed(other.failed.load()),
+          failed_reason(other.failed_reason) {}
+
+    DirRegistry &operator=(const DirRegistry &other) {
+      if (this != &other) { // Self-assignment check
+        fd = other.fd;
+        canceled.store(other.canceled.load());
+        replayer = other.replayer;
+        failed.store(other.failed.load());
+        failed_reason = other.failed_reason;
+      }
+      return *this;
+    }
+  };
+
   class C_DoDirSync;
   class TaskSinkContext;
 
@@ -334,12 +400,12 @@ public:
     C_TransferAndSyncFile(const std::string &dir_root, const std::string &epath,
                           const struct ceph_statx &stx,
                           unsigned int change_mask, const FHandles &fh,
-                          std::atomic<bool> &canceled,
-                          std::atomic<bool> &failed,
+                          std::shared_ptr<DirRegistry> &dir_registry,
                           std::atomic<int64_t> &op_counter, Context *fin,
-                          PeerReplayer *replayer, SnapSyncStat &dir_sync_stat)
+                          PeerReplayer *replayer,
+                          std::shared_ptr<SnapSyncStat> &dir_sync_stat)
         : dir_root(dir_root), epath(epath), stx(stx), change_mask(change_mask),
-          fh(fh), canceled(canceled), failed(failed),
+          fh(fh), dir_registry(dir_registry),
           C_MirrorContext(op_counter, fin, replayer, dir_sync_stat, -1) {}
 
     void finish(int r) override;
@@ -353,8 +419,7 @@ public:
     struct ceph_statx stx;
     unsigned int change_mask;
     const FHandles &fh;
-    std::atomic<bool> &canceled;
-    std::atomic<bool> &failed;
+    std::shared_ptr<DirRegistry> &dir_registry;
   };
 
   class TaskSinkContext {
@@ -402,7 +467,7 @@ public:
   private:
     void run_task();
     void drain_queue();
-    std::vector <C_MirrorContext*> task_vec;
+    std::queue <C_MirrorContext*> task_queue;
     std::condition_variable pick_task;
     std::condition_variable give_task;
     std::mutex mtx;
@@ -410,7 +475,6 @@ public:
     std::vector<std::thread> workers;
     std::atomic<bool> stop_flag;
     ThreadPoolStats thread_pool_stats;
-    int task_count = 0;
   };
   TaskSinkContext task_sink_context;
 
@@ -421,16 +485,16 @@ public:
                 bool create_fresh, bool entry_info_known,
                 const CommonEntryInfo &entry_info,
                 uint64_t common_entry_info_count,
-                std::shared_ptr <DirOpHandlerContext::ThreadPool> &thread_pool,
-                const FHandles &fh, std::atomic<bool> &canceled,
-                std::atomic<bool> &failed, std::atomic<int64_t> &op_counter,
-                Context *fin, PeerReplayer *replayer,
-                SnapSyncStat &dir_sync_stat)
+                std::shared_ptr<DirOpHandlerContext::ThreadPool> &thread_pool,
+                const FHandles &fh, std::shared_ptr<DirRegistry> &dir_registry,
+                std::atomic<int64_t> &op_counter, Context *fin,
+                PeerReplayer *replayer,
+                std::shared_ptr<SnapSyncStat> &dir_sync_stat)
         : dir_root(dir_root), cur_path(cur_path), cstx(cstx), dirp(dirp),
           create_fresh(create_fresh), entry_info_known(entry_info_known),
           entry_info(entry_info),
           common_entry_info_count(common_entry_info_count),
-          thread_pool(thread_pool), fh(fh), canceled(canceled), failed(failed),
+          thread_pool(thread_pool), fh(fh), dir_registry(dir_registry),
           C_MirrorContext(op_counter, fin, replayer, dir_sync_stat,
                           thread_idx) {}
     void finish(int r) override;
@@ -449,19 +513,18 @@ public:
     uint64_t common_entry_info_count;
     std::shared_ptr<DirOpHandlerContext::ThreadPool> &thread_pool;
     const FHandles &fh;
-    std::atomic<bool> &canceled;
-    std::atomic<bool> &failed;
+    std::shared_ptr<DirRegistry> &dir_registry;
   };
 
   class C_CleanUpRemoteDir : public C_MirrorContext {
   public:
     C_CleanUpRemoteDir(const std::string &dir_root, const std::string &epath,
-                       const FHandles &fh, std::atomic<bool> &canceled,
-                       std::atomic<bool> &failed,
+                       const FHandles &fh,
+                       std::shared_ptr<DirRegistry> &dir_registry,
                        std::atomic<int64_t> &op_counter, Context *fin,
-                       PeerReplayer *replayer, SnapSyncStat &dir_sync_stat)
-        : dir_root(dir_root), epath(epath), fh(fh), canceled(canceled),
-          failed(failed),
+                       PeerReplayer *replayer,
+                       std::shared_ptr<SnapSyncStat> &dir_sync_stat)
+        : dir_root(dir_root), epath(epath), fh(fh), dir_registry(dir_registry),
           C_MirrorContext(op_counter, fin, replayer, dir_sync_stat, -1) {}
 
     void finish(int r) override;
@@ -470,19 +533,17 @@ public:
     const std::string &dir_root;
     std::string epath;
     const FHandles &fh;
-    std::atomic<bool> &canceled;
-    std::atomic<bool> &failed;
+    std::shared_ptr<DirRegistry> &dir_registry;
   };
 
   class C_DeleteFile : public C_MirrorContext {
   public:
     C_DeleteFile(const std::string &dir_root, const std::string &epath,
-                 const FHandles &fh, std::atomic<bool> &canceled,
-                 std::atomic<bool> &failed, std::atomic<int64_t> &op_counter,
-                 Context *fin, PeerReplayer *replayer,
-                 SnapSyncStat &dir_sync_stat)
-        : dir_root(dir_root), epath(epath), fh(fh), canceled(canceled),
-          failed(failed),
+                 const FHandles &fh, std::shared_ptr<DirRegistry> &dir_registry,
+                 std::atomic<int64_t> &op_counter, Context *fin,
+                 PeerReplayer *replayer,
+                 std::shared_ptr<SnapSyncStat> &dir_sync_stat)
+        : dir_root(dir_root), epath(epath), fh(fh), dir_registry(dir_registry),
           C_MirrorContext(op_counter, fin, replayer, dir_sync_stat, -1) {}
 
     void finish(int r) override;
@@ -491,8 +552,7 @@ public:
     const std::string &dir_root;
     std::string epath;
     const FHandles &fh;
-    std::atomic<bool> &canceled;
-    std::atomic<bool> &failed;
+    std::shared_ptr<DirRegistry> &dir_registry;
   };
 
   friend class C_MirrorContext;
@@ -511,46 +571,6 @@ private:
   bool is_stopping() {
     return m_stopping;
   }
-
-  struct Replayer;
-  class SnapshotReplayerThread : public Thread {
-  public:
-    SnapshotReplayerThread(PeerReplayer *peer_replayer)
-      : m_peer_replayer(peer_replayer) {
-    }
-
-    void *entry() override {
-      m_peer_replayer->run(this);
-      return 0;
-    }
-
-  private:
-    PeerReplayer *m_peer_replayer;
-  };
-
-  struct DirRegistry {
-    int fd;
-    std::atomic<bool> canceled = false;
-    SnapshotReplayerThread *replayer;
-    std::atomic<bool> failed = false;
-    int failed_reason;
-    DirRegistry() {}
-    DirRegistry(const DirRegistry &other)
-        : fd(other.fd), canceled(other.canceled.load()),
-          replayer(other.replayer), failed(other.failed.load()),
-          failed_reason(other.failed_reason) {}
-
-    DirRegistry &operator=(const DirRegistry &other) {
-      if (this != &other) { // Self-assignment check
-        fd = other.fd;
-        canceled.store(other.canceled.load());
-        replayer = other.replayer;
-        failed.store(other.failed.load());
-        failed_reason = other.failed_reason;
-      }
-      return *this;
-    }
-  };
 
   struct SyncEntry {
     std::string epath;
@@ -602,9 +622,9 @@ private:
     auto max_failures = g_ceph_context->_conf.get_val<uint64_t>(
     "cephfs_mirror_max_consecutive_failures_per_directory");
     auto &sync_stat = m_snap_sync_stats.at(dir_root);
-    sync_stat.last_failed = clock::now();
-    if (++sync_stat.nr_failures >= max_failures && !sync_stat.failed) {
-      sync_stat.failed = true;
+    sync_stat->last_failed = clock::now();
+    if (++sync_stat->nr_failures >= max_failures && !sync_stat->failed) {
+      sync_stat->failed = true;
       ++m_service_daemon_stats.failed_dir_count;
       m_service_daemon->add_or_update_peer_attribute(m_filesystem.fscid, m_peer,
                                                      SERVICE_DAEMON_FAILED_DIR_COUNT_KEY,
@@ -613,22 +633,22 @@ private:
   }
   void _reset_failed_count(const std::string &dir_root) {
     auto &sync_stat = m_snap_sync_stats.at(dir_root);
-    if (sync_stat.failed) {
+    if (sync_stat->failed) {
       ++m_service_daemon_stats.recovered_dir_count;
       m_service_daemon->add_or_update_peer_attribute(m_filesystem.fscid, m_peer,
                                                      SERVICE_DAEMON_RECOVERED_DIR_COUNT_KEY,
                                                      m_service_daemon_stats.recovered_dir_count);
     }
-    sync_stat.nr_failures = 0;
-    sync_stat.failed = false;
-    sync_stat.last_failed = boost::none;
+    sync_stat->nr_failures = 0;
+    sync_stat->failed = false;
+    sync_stat->last_failed = boost::none;
   }
 
   void _set_last_synced_snap(const std::string &dir_root, uint64_t snap_id,
                             const std::string &snap_name) {
     auto &sync_stat = m_snap_sync_stats.at(dir_root);
-    sync_stat.last_synced_snap = std::make_pair(snap_id, snap_name);
-    sync_stat.current_syncing_snap = boost::none;
+    sync_stat->last_synced_snap = std::make_pair(snap_id, snap_name);
+    sync_stat->current_syncing_snap = boost::none;
   }
   void set_last_synced_snap(const std::string &dir_root, uint64_t snap_id,
                             const std::string &snap_name) {
@@ -639,34 +659,33 @@ private:
                                 const std::string &snap_name) {
     std::scoped_lock locker(m_lock);
     auto &sync_stat = m_snap_sync_stats.at(dir_root);
-    sync_stat.current_syncing_snap = std::make_pair(snap_id, snap_name);
+    sync_stat->current_syncing_snap = std::make_pair(snap_id, snap_name);
   }
   void clear_current_syncing_snap(const std::string &dir_root) {
     std::scoped_lock locker(m_lock);
     auto &sync_stat = m_snap_sync_stats.at(dir_root);
-    sync_stat.current_syncing_snap = boost::none;
+    sync_stat->current_syncing_snap = boost::none;
   }
   void inc_deleted_snap(const std::string &dir_root) {
     std::scoped_lock locker(m_lock);
     auto &sync_stat = m_snap_sync_stats.at(dir_root);
-    ++sync_stat.deleted_snap_count;
+    ++sync_stat->deleted_snap_count;
   }
   void inc_renamed_snap(const std::string &dir_root) {
     std::scoped_lock locker(m_lock);
     auto &sync_stat = m_snap_sync_stats.at(dir_root);
-    ++sync_stat.renamed_snap_count;
+    ++sync_stat->renamed_snap_count;
   }
   void set_last_synced_stat(const std::string &dir_root, uint64_t snap_id,
                             const std::string &snap_name, double duration) {
     std::scoped_lock locker(m_lock);
     _set_last_synced_snap(dir_root, snap_id, snap_name);
     auto &sync_stat = m_snap_sync_stats.at(dir_root);
-    sync_stat.last_synced = clock::now();
-    sync_stat.last_sync_duration = duration;
-    ++sync_stat.synced_snap_count;
+    sync_stat->last_synced = clock::now();
+    sync_stat->last_sync_duration = duration;
+    ++sync_stat->synced_snap_count;
   }
-  bool should_backoff(std::atomic<bool> &canceled,
-                      std::atomic<bool> &failed, int *retval) {
+  bool should_backoff(std::shared_ptr<DirRegistry> &dir_registry, int *retval) {
     if (m_fs_mirror->is_blocklisted()) {
       *retval = -EBLOCKLISTED;
       return true;
@@ -678,7 +697,7 @@ private:
       *retval = -EINPROGRESS;
       return true;
     }
-    if (canceled || failed) {
+    if (dir_registry->canceled || dir_registry->failed) {
       *retval = -ECANCELED;
       return true;
     }
@@ -690,7 +709,7 @@ private:
   int get_failed_reason(const std::string &dir_root) {
     std::scoped_lock lock(m_lock);
     auto &dr = m_registered.at(dir_root);
-    return dr.failed_reason;
+    return dr->failed_reason;
   }
 
   void mark_failed(const std::string &dir_root, int reason) {
@@ -699,11 +718,11 @@ private:
     if (it == m_registered.end()) {
       return;
     }
-    if (it->second.failed) {
+    if (it->second->failed) {
       return;
     }
-    it->second.failed = true;
-    it->second.failed_reason = reason;
+    it->second->failed = true;
+    it->second->failed_reason = reason;
   }
 
   typedef std::vector<std::unique_ptr<SnapshotReplayerThread>> SnapshotReplayers;
@@ -714,9 +733,9 @@ private:
   Filesystem m_filesystem;
   Peer m_peer;
   // probably need to be encapsulated when supporting cancelations
-  std::map<std::string, DirRegistry> m_registered;
+  std::map<std::string, std::shared_ptr<DirRegistry>> m_registered;
   std::vector<std::string> m_directories;
-  std::map<std::string, SnapSyncStat> m_snap_sync_stats;
+  std::map<std::string, std::shared_ptr<SnapSyncStat>> m_snap_sync_stats;
   MountRef m_local_mount;
   ServiceDaemon *m_service_daemon;
   PeerReplayerAdminSocketHook *m_asok_hook = nullptr;
@@ -737,8 +756,9 @@ private:
   boost::optional<std::string> pick_directory();
   int register_directory(const std::string &dir_root, SnapshotReplayerThread *replayer);
   void unregister_directory(const std::string &dir_root);
-  int try_lock_directory(const std::string &dir_root, SnapshotReplayerThread *replayer,
-                         DirRegistry *registry);
+  int try_lock_directory(const std::string &dir_root,
+                         SnapshotReplayerThread *replayer,
+                         std::shared_ptr<DirRegistry> &registry);
   void unlock_directory(const std::string &dir_root, const DirRegistry &registry);
   void sync_snaps(const std::string &dir_root, std::unique_lock<ceph::mutex> &locker);
 
@@ -751,21 +771,21 @@ private:
                              const std::set<std::pair<std::string,std::string>> &snaps);
 
   int delete_file(const std::string &dir_root, const std::string &epath,
-                  const FHandles &fh, std::atomic<bool> &canceled,
-                  std::atomic<bool> &failed, SnapSyncStat &dir_sync_stat);
+                  const FHandles &fh,
+                  std::shared_ptr<DirRegistry> &dir_registry,
+                  std::shared_ptr<SnapSyncStat> &dir_sync_stat);
 
   int propagate_deleted_entries(
       const std::string &dir_root, const std::string &epath,
       std::unordered_map<std::string, CommonEntryInfo> &common_entry_info,
       uint64_t &common_entry_info_count, const FHandles &fh,
-      std::atomic<bool> &canceled, std::atomic<bool> &failed,
+      std::shared_ptr<DirRegistry> &dir_registry,
       std::atomic<int64_t> &op_counter, Context *fin,
-      SnapSyncStat &dir_sync_stat);
+      std::shared_ptr<SnapSyncStat> &dir_sync_stat);
   int cleanup_remote_dir(const std::string &dir_root, const std::string &epath,
                          const FHandles &fh,
-                         std::atomic<bool> &canceled,
-                         std::atomic<bool> &failed,
-                         SnapSyncStat &dir_sync_stat);
+                         std::shared_ptr<DirRegistry> &dir_registry,
+                         std::shared_ptr<SnapSyncStat> &dir_sync_stat);
 
   int open_dir(MountRef mnt, const std::string &dir_path, boost::optional<uint64_t> snap_id);
   int pre_sync_check_and_open_handles(const std::string &dir_root, const Snapshot &current,
@@ -776,7 +796,8 @@ private:
 
   int remote_mkdir(const std::string &epath, const struct ceph_statx &cstx,
                    bool create_fresh, unsigned int change_mask,
-                   const FHandles &fh, SnapSyncStat &dir_sync_stat);
+                   const FHandles &fh,
+                   std::shared_ptr<SnapSyncStat> &dir_sync_stat);
 
   void build_change_mask(const struct ceph_statx &pstx,
                          const struct ceph_statx &cstx, bool create_fresh,
@@ -788,20 +809,12 @@ private:
               bool create_fresh, bool stat_known, CommonEntryInfo &entry_info,
               uint64_t common_entry_info_count,
               std::shared_ptr<DirOpHandlerContext::ThreadPool> &thread_pool,
-              const FHandles &fh, std::atomic<bool> &canceled,
-              std::atomic<bool> &failed, std::atomic<int64_t> &op_counter,
-              Context *fin, SnapSyncStat &dir_sync_stat);
+              const FHandles &fh, std::shared_ptr<DirRegistry> &dir_registry,
+              std::atomic<int64_t> &op_counter, Context *fin,
+              std::shared_ptr<SnapSyncStat> &dir_sync_stat);
 
   int do_synchronize(const std::string &dir_root, const Snapshot &current,
                      boost::optional<Snapshot> prev);
-
-  void do_dir_sync_using_snapdiff(
-      const std::string &dir_root, const std::string &cur_path,
-      const struct ceph_statx &cur_stx, ceph_snapdiff_info *snapdiff_info,
-      const FHandles &fh, const Snapshot &current, const Snapshot &prev,
-      std::atomic<bool> &canceled,
-      std::atomic<bool> &failed,
-      std::atomic<int64_t> &op_counter, Context *fin);
 
   int do_synchronize(const std::string &dir_root, const Snapshot &current);
 
@@ -812,9 +825,9 @@ private:
   int remote_file_op(const std::string &dir_root, const std::string &epath,
                      const struct ceph_statx &stx, bool need_data_sync,
                      unsigned int change_mask, const FHandles &fh,
-                     std::atomic<bool> &canceled, std::atomic<bool> &failed,
+                     std::shared_ptr<DirRegistry> &dir_registry,
                      std::atomic<int64_t> &op_counter, Context *fin,
-                     SnapSyncStat &dir_sync_stat);
+                     std::shared_ptr<SnapSyncStat> &dir_sync_stat);
 
   int sync_attributes(const std::string &epath, const struct ceph_statx &stx,
                       unsigned int change_mask, bool is_dir,
@@ -822,16 +835,14 @@ private:
 
   int copy_to_remote(const std::string &dir_root, const std::string &epath,
                      const struct ceph_statx &stx, const FHandles &fh,
-                     std::atomic<bool> &canceled,
-                     std::atomic<bool> &failed);
+                     std::shared_ptr<DirRegistry> &dir_registry);
 
   void transfer_and_sync_file(const std::string &dir_root,
                               const std::string &epath,
                               const struct ceph_statx &stx,
                               unsigned int change_mask, const FHandles &fh,
-                              std::atomic<bool> &canceled,
-                              std::atomic<bool> &failed,
-                              SnapSyncStat &dir_sync_stat);
+                              std::shared_ptr<DirRegistry> &dir_registry,
+                              std::shared_ptr<SnapSyncStat> &dir_sync_stat);
   int sync_perms(const std::string &path);
 };
 
