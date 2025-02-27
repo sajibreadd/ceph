@@ -34,6 +34,7 @@ public:
 
   void add_peer(const Peer &peer);
   void remove_peer(const Peer &peer);
+  friend class PeerReplayer;
 
   bool is_stopping() {
     std::scoped_lock locker(m_lock);
