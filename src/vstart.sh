@@ -986,19 +986,17 @@ EOF
 	    MGR_PORT=$(($MGR_PORT + 1000))
 	    ceph_adm config set mgr mgr/prometheus/$name/server_port $PROMETHEUS_PORT --force
 	    PROMETHEUS_PORT=$(($PROMETHEUS_PORT + 1000))
-
-	    ceph_adm config set mgr mgr/restful/$name/server_port $MGR_PORT --force
-            if [ $mgr -eq 1 ]; then
-                RESTFUL_URLS="https://$IP:$MGR_PORT"
-            else
-                RESTFUL_URLS+=", https://$IP:$MGR_PORT"
-            fi
-	    MGR_PORT=$(($MGR_PORT + 1000))
         fi
 
         debug echo "Starting mgr.${name}"
         run 'mgr' $name $CEPH_BIN/ceph-mgr -i $name $ARGS
     done
+
+    while ! ceph_adm mgr stat | jq -e '.available'; do
+        debug echo 'waiting for mgr to become available'
+        sleep 1
+    done
+
 
     if [ "$new" -eq 1 ]; then
         # setting login credentials for dashboard
@@ -1016,19 +1014,6 @@ EOF
                     debug echo dashboard module not working correctly!
                 fi
             fi
-        fi
-
-        while ! ceph_adm -h | grep -c -q ^restful ; do
-            debug echo 'waiting for mgr restful module to start'
-            sleep 1
-        done
-        if ceph_adm restful create-self-signed-cert; then
-            SF=`mktemp`
-            ceph_adm restful create-key admin -o $SF
-            RESTFUL_SECRET=`cat $SF`
-            rm $SF
-        else
-            debug echo MGR Restful is not working, perhaps the package is not installed?
         fi
     fi
 
