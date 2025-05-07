@@ -113,13 +113,52 @@ options:
   services:
   - cephfs-mirror
   min: 1
-- name: cephfs_mirror_max_number_of_threads
+- name: cephfs_mirror_threads_per_sync
   type: uint
   level: advanced
-  desc: number of threads running for concurrent operations
-  long_desc: number of threads running for operations per peer.
+  desc: number of threads running for concurrently scanning directory
+  long_desc: number of threads running associated for each sync.
     Each thread is responsible for several libcephfs operations.
   default: 3
   services:
   - cephfs-mirror
   min: 1
+- name: cephfs_mirror_remote_diff_base_upon_start
+  type: bool
+  level: advanced
+  desc: take remote cluster as diff base for syncing upon restart
+  long_desc: take remote cluster as diff base for syncing upon restart
+  default: true
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_sync_latest_snapshot
+  type: bool
+  level: advanced
+  desc: take lates snapshot for syncing
+  long_desc: take lates snapshot for syncing
+  default: true
+  services:
+  - cephfs-mirror
+  with_legacy: true
+- name: cephfs_mirror_thread_pool_queue_size
+  type: uint
+  level: advanced
+  desc: number of threads running for concurrently scanning directory
+  long_desc: number of threads running associated for each sync.
+    Each thread is responsible for several libcephfs operations.
+  default: 5000
+  services:
+  - cephfs-mirror
+  min: 3
+  with_legacy: true
+- name: cephfs_mirror_max_element_in_cache_per_thread
+  type: uint
+  level: advanced
+  desc: number of threads running for concurrently scanning directory
+  long_desc: number of threads running associated for each sync.
+    Each thread is responsible for several libcephfs operations.
+  default: 1000000
+  services:
+  - cephfs-mirror
+  min: 0
+  with_legacy: true
