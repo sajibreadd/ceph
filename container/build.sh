@@ -49,7 +49,7 @@ CEPH_GIT_REPO=/ceph
 # BRANCH will be, say, origin/main.  remove <remote>/
 BRANCH=${BRANCH##*/}
 
-podman build --pull=newer --squash -f $CFILE -t build.sh.output \
+podman build --pull --squash -f $CFILE -t build.sh.output \
     --build-arg FROM_IMAGE=${FROM_IMAGE:-quay.io/centos/centos:stream9} \
     --build-arg CEPH_SHA1=${CEPH_SHA1} \
     --build-arg CEPH_GIT_REPO=${CEPH_GIT_REPO} \
