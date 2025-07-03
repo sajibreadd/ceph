@@ -63,6 +63,7 @@ public:
     std::scoped_lock locker(m_lock);
     return m_failed_ts;
   }
+  friend class PeerReplayer;
 
 private:
   librados::IoCtx &m_ioctx;
