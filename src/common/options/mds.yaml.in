@@ -1616,3 +1616,11 @@ options:
   default: 1048575
   services:
   - mds
+- name: mds_hide_batch_head_ceph_assert
+  type: bool
+  level: advanced
+  desc: This is just a hack to hide this assert
+  long_desc: This is just a hack to hide this assert
+  default: false
+  services:
+  - mds
