@@ -3947,6 +3947,7 @@ const char** MDSRankDispatcher::get_tracked_conf_keys() const
     "mds_inject_rename_corrupt_dentry_first",
     "mds_inject_journal_corrupt_dentry_first",
     "mds_session_metadata_threshold",
+    "mds_hide_batch_head_ceph_assert",
     NULL
   };
   return KEYS;
