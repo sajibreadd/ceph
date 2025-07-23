@@ -275,6 +275,7 @@ Server::Server(MDSRank *m, MetricsHandler *metrics_handler) :
   bal_fragment_size_max = g_conf().get_val<int64_t>("mds_bal_fragment_size_max");
   supported_features = feature_bitset_t(CEPHFS_FEATURES_MDS_SUPPORTED);
   supported_metric_spec = feature_bitset_t(CEPHFS_METRIC_FEATURES_ALL);
+  hide_batch_head_ceph_assert = g_conf().get_val<bool>("mds_hide_batch_head_ceph_assert");
   // connection_t conn("localhost:9093", true, "admin", "admin-secret",
   //                std::nullopt, std::nullopt);
   // MDSAsyncNotificationManager::create(mds->cct);
@@ -1381,6 +1382,11 @@ void Server::handle_conf_change(const std::set<std::string>& changed) {
   }
   if (changed.count("mds_inject_rename_corrupt_dentry_first")) {
     inject_rename_corrupt_dentry_first = g_conf().get_val<double>("mds_inject_rename_corrupt_dentry_first");
+  }
+  if (changed.count("mds_hide_batch_head_ceph_assert")) {
+    hide_batch_head_ceph_assert = g_conf().get_val<bool>("mds_hide_batch_head_ceph_assert");
+    dout(0) << ": mds_hide_batch_head_ceph_assert changed to-->"
+            << hide_batch_head_ceph_assert << dendl;
   }
 }
 
@@ -2669,6 +2675,9 @@ void Server::dispatch_client_request(MDRequestRef& mdr)
 
   if (mdr->killed) {
     // Should already be reset in request_cleanup().
+    if (hide_batch_head_ceph_assert) {
+      return;
+    }
     ceph_assert(!mdr->is_batch_head());
     return;
   } else if (mdr->aborted) {
