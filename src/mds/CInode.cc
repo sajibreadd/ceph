@@ -1208,6 +1208,16 @@ void CInode::_stored(int r, version_t v, Context *fin)
     dout(1) << "store error " << r << " v " << v << " on " << *this << dendl;
     mdcache->mds->clog->error() << "failed to store inode " << ino()
                                 << " object: " << cpp_strerror(r);
+    dout(1) << "CInode::_stored"
+            << ": found message too long on oid = "
+            << CInode::get_object_name(ino(), frag_t(), ".inode") << ": "
+            << cpp_strerror(r) << dendl;
+    if (r == -EMSGSIZE || r == EMSGSIZE) {
+      derr << "CInode::_stored"
+           << ": found message too long on oid = "
+           << CInode::get_object_name(ino(), frag_t(), ".inode") << ": "
+           << cpp_strerror(r) << dendl;
+    }
     mdcache->mds->handle_write_error(r);
     fin->complete(r);
     return;
@@ -1360,6 +1370,16 @@ void CInode::_commit_ops(int r, C_GatherBuilder &gather_bld,
   dout(10) << __func__ << dendl;
 
   if (r < 0) {
+    dout(1) << "CInode::_commit_ops"
+            << ": found message too long on oid = "
+            << get_object_name(ino(), frag_t(), "") << ": " << cpp_strerror(r)
+            << dendl;
+    if (r == -EMSGSIZE || r == EMSGSIZE) {
+      derr << "CInode::_commit_ops"
+           << ": found message too long on oid = "
+           << get_object_name(ino(), frag_t(), "") << ": " << cpp_strerror(r)
+           << dendl;
+    }
     mdcache->mds->handle_write_error_with_lock(r);
     return;
   }
@@ -1469,6 +1489,16 @@ void CInode::_stored_backtrace(int r, version_t v, Context *fin)
 				<< ino() << " object"
                                 << ", pool " << get_backtrace_pool()
                                 << ", errno " << r;
+    dout(1) << "CInode::_stored_backtrace"
+            << ": found message too long on oid = "
+            << get_object_name(ino(), frag_t(), "") << ": " << cpp_strerror(r)
+            << dendl;
+    if (r == -EMSGSIZE || r == EMSGSIZE) {
+      derr << "CInode::_stored_backtrace"
+           << ": found message too long on oid = "
+           << get_object_name(ino(), frag_t(), "") << ": " << cpp_strerror(r)
+           << dendl;
+    }
     mdcache->mds->handle_write_error(r);
     if (fin)
       fin->complete(r);

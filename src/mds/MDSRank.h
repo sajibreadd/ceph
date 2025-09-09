@@ -228,6 +228,8 @@ class MDSRank {
       return is_standby_replay() || is_clientreplay() || is_active() || is_stopping();
     }
 
+    std::string get_stack_trace();
+
     void handle_write_error(int err);
     void handle_write_error_with_lock(int err);
 

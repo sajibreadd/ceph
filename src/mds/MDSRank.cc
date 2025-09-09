@@ -23,6 +23,7 @@
 #include "messages/MMDSLoadTargets.h"
 #include "messages/MMDSTableRequest.h"
 #include "messages/MMDSMetrics.h"
+#include <boost/stacktrace.hpp>
 
 #include "mgr/MgrClient.h"
 
@@ -506,6 +507,12 @@ MDSRank::MDSRank(
       mdsmap_->get_metadata_pool(), objecter,
       new LambdaContext([this](int r) {
 	  std::lock_guard l(mds_lock);
+    if (r == -EMSGSIZE || r == EMSGSIZE) {
+      derr << "purge_queue::journler::handle_write_error"
+           << ": found message too long on oid = "
+           << "strays"
+           << ": " << cpp_strerror(r) << dendl;
+    }
 	  handle_write_error(r);
 	}
       )
@@ -964,6 +971,12 @@ void MDSRank::damaged_unlocked()
   damaged();
 }
 
+std::string MDSRank::get_stack_trace() {
+  std::ostringstream oss;
+  oss << boost::stacktrace::stacktrace();
+  return oss.str();
+}
+
 void MDSRank::handle_write_error(int err)
 {
   if (err == -CEPHFS_EBLOCKLISTED) {
@@ -977,6 +990,7 @@ void MDSRank::handle_write_error(int err)
     respawn();
   } else if (g_conf()->mds_action_on_write_error == 1) {
     derr << "unhandled write error " << cpp_strerror(err) << ", force readonly..." << dendl;
+    derr << get_stack_trace() << dendl;
     mdcache->force_readonly();
   } else {
     // ignore;

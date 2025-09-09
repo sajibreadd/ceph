@@ -367,10 +367,22 @@ void SessionMap::_load_legacy_finish(int r, bufferlist &bl)
 namespace {
 class C_IO_SM_Save : public SessionMapIOContext {
   version_t version;
+  mds_rank_t rank;
 public:
-  C_IO_SM_Save(SessionMap *cm, version_t v) : SessionMapIOContext(cm), version(v) {}
+  C_IO_SM_Save(SessionMap *cm, version_t v, mds_rank_t rank)
+      : SessionMapIOContext(cm), version(v), rank(rank) {}
   void finish(int r) override {
     if (r != 0) {
+      dout(1) << "C_IO_SM_Save::finish"
+              << ": found message too long on oid = "
+              << "sessionmap"
+              << ": " << cpp_strerror(r) << dendl;
+      if (r == -EMSGSIZE || r == EMSGSIZE) {
+        derr << "C_IO_SM_Save::finish"
+             << ": found message too long on oid = "
+             << "sessionmap"
+             << ": " << cpp_strerror(r) << dendl;
+      }
       get_mds()->handle_write_error(r);
     } else {
       sessionmap->_save_finish(version);
@@ -478,7 +490,7 @@ void SessionMap::save(MDSContext *onsave, version_t needv)
   mds->objecter->mutate(oid, oloc, op, snapc,
 			ceph::real_clock::now(),
 			0,
-			new C_OnFinisher(new C_IO_SM_Save(this, version),
+			new C_OnFinisher(new C_IO_SM_Save(this, version, rank),
 					 mds->finisher));
   apply_blocklist(to_blocklist);
   logger->inc(l_mdssm_metadata_threshold_sessions_evicted, to_blocklist.size());
@@ -826,11 +838,22 @@ version_t SessionMap::mark_projected(Session *s)
 namespace {
 class C_IO_SM_Save_One : public SessionMapIOContext {
   MDSContext *on_safe;
+  mds_rank_t rank;
 public:
-  C_IO_SM_Save_One(SessionMap *cm, MDSContext *on_safe_)
-    : SessionMapIOContext(cm), on_safe(on_safe_) {}
+  C_IO_SM_Save_One(SessionMap *cm, MDSContext *on_safe_, mds_rank_t rank)
+      : SessionMapIOContext(cm), on_safe(on_safe_), rank(rank) {}
   void finish(int r) override {
     if (r != 0) {
+      dout(1) << "C_IO_SM_Save_One::finish"
+              << ": found message too long on oid = "
+              << "sessionmap"
+              << ": " << cpp_strerror(r) << dendl;
+      if (r == -EMSGSIZE || r == EMSGSIZE) {
+        derr << "C_IO_SM_Save_One::finish"
+             << ": found message too long on oid = "
+             << "sessionmap"
+             << ": " << cpp_strerror(r) << dendl;
+      }
       get_mds()->handle_write_error(r);
     } else {
       on_safe->complete(r);
@@ -923,7 +946,7 @@ void SessionMap::save_if_dirty(const std::set<entity_name_t> &tgt_sessions,
       mds->objecter->mutate(oid, oloc, op, snapc,
 			    ceph::real_clock::now(), 0,
 			    new C_OnFinisher(
-			      new C_IO_SM_Save_One(this, on_safe),
+			      new C_IO_SM_Save_One(this, on_safe, rank),
 			      mds->finisher));
     }
     ++i;

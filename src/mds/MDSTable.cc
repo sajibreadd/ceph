@@ -98,6 +98,11 @@ void MDSTable::save_2(int r, version_t v)
     dout(1) << "save error " << r << " v " << v << dendl;
     mds->clog->error() << "failed to store table " << table_name << " object,"
 		       << " errno " << r;
+    if (r == -EMSGSIZE || r == EMSGSIZE) {
+      derr << "MDSTable::save_2"
+           << ": found message too long on oid = " << table_name << ": "
+           << cpp_strerror(r) << dendl;
+    }
     mds->handle_write_error(r);
     return;
   }

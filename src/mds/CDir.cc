@@ -2398,6 +2398,14 @@ void CDir::_omap_commit_ops(int r, int op_prio, int64_t metapool, version_t vers
   dout(10) << __func__ << dendl;
 
   if (r < 0) {
+    dout(1) << "CDir::_omap_commit_ops"
+            << ": found message too long on oid = " << get_ondisk_object()
+            << ": " << cpp_strerror(r) << dendl;
+    if (r == -EMSGSIZE || r == EMSGSIZE) {
+      derr << "CDir::_omap_commit_ops"
+           << ": found message too long on oid = " << get_ondisk_object()
+           << ": " << cpp_strerror(r) << dendl;
+    }
     mdcache->mds->handle_write_error_with_lock(r);
     return;
   }
@@ -2737,6 +2745,14 @@ void CDir::_committed(int r, version_t v)
       dout(1) << "commit error " << r << " v " << v << dendl;
       mdcache->mds->clog->error() << "failed to commit dir " << dirfrag() << " object,"
 				<< " errno " << r;
+      dout(1) << "CDir::_committed"
+              << ": found message too long on oid = " << dirfrag() << ": "
+              << cpp_strerror(r) << dendl;
+      if (r == -EMSGSIZE || r == EMSGSIZE) {
+        derr << "CDir::_committed"
+             << ": found message too long on oid = " << dirfrag() << ": "
+             << cpp_strerror(r) << dendl;
+      }
       mdcache->mds->handle_write_error(r);
       return;
     }

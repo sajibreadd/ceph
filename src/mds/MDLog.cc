@@ -719,8 +719,17 @@ class C_MaybeExpiredSegment : public MDSInternalContext {
     MDSInternalContext(mdl->mds), mdlog(mdl), ls(s), op_prio(p) {}
   void finish(int res) override {
     dout(10) << __func__ << ": ls=" << *ls << ", r=" << res << dendl;
-    if (res < 0)
+    if (res < 0) {
+      dout(1) << "C_MaybeExpiredSegment::finish"
+              << ": found message too long on oid = journal"
+              << ": " << cpp_strerror(res) << dendl;
+      if (res == -EMSGSIZE || res == EMSGSIZE) {
+        derr << "C_MaybeExpiredSegment::finish"
+             << ": found message too long on oid = journal"
+             << ": " << cpp_strerror(res) << dendl;
+      }
       mdlog->mds->handle_write_error(res);
+    }
     mdlog->_maybe_expired(ls, op_prio);
   }
 };

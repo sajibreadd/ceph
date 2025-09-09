@@ -274,6 +274,16 @@ void OpenFileTable::_commit_finish(int r, uint64_t log_seq, MDSContext *fin)
   dout(10) << __func__ << " log_seq " << log_seq << " committed_log_seq " << committed_log_seq
            << " committing_log_seq " << committing_log_seq << dendl;
   if (r < 0) {
+    dout(1) << "OpenFileTable::_commit_finish"
+            << ": found message too long on oid = "
+            << "openfiletable"
+            << ": " << cpp_strerror(r) << dendl;
+    if (r == -EMSGSIZE || r == EMSGSIZE) {
+      derr << "OpenFileTable::_commit_finish"
+           << ": found message too long on oid = "
+           << "openfiletable"
+           << ": " << cpp_strerror(r) << dendl;
+    }
     mds->handle_write_error(r);
     return;
   }
@@ -313,6 +323,16 @@ void OpenFileTable::_journal_finish(int r, uint64_t log_seq, MDSContext *c,
 {
   dout(10) << __func__ << " log_seq " << log_seq << dendl;
   if (r < 0) {
+    dout(1) << "OpenFileTable::_journal_finish"
+            << ": found message too long on oid = "
+            << "openfiletable"
+            << ": " << cpp_strerror(r) << dendl;
+    if (r == -EMSGSIZE || r == EMSGSIZE) {
+      derr << "OpenFileTable::_journal_finish"
+           << ": found message too long on oid = "
+           << "openfiletable"
+           << ": " << cpp_strerror(r) << dendl;
+    }
     mds->handle_write_error(r);
     return;
   }
