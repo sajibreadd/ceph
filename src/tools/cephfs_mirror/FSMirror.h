@@ -10,6 +10,7 @@
 #include "Types.h"
 #include "InstanceWatcher.h"
 #include "MirrorWatcher.h"
+#include "FileMirrorPool.h"
 
 class ContextWQ;
 
@@ -26,7 +27,7 @@ class FSMirror {
 public:
   FSMirror(CephContext *cct, const Filesystem &filesystem, uint64_t pool_id,
            ServiceDaemon *service_daemon, std::vector<const char*> args,
-           ContextWQ *work_queue);
+           ContextWQ *work_queue, FileMirrorPool &file_mirror_pool);
   ~FSMirror();
 
   void init(Context *on_finish);
@@ -137,6 +138,7 @@ private:
   std::set<std::string, std::less<>> m_directories;
   Peers m_all_peers;
   std::map<Peer, std::unique_ptr<PeerReplayer>> m_peer_replayers;
+  FileMirrorPool& file_mirror_pool;
 
   RadosRef m_cluster;
   std::string m_addrs;
