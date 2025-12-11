@@ -1585,8 +1585,8 @@ void CDir::fetch(std::string_view dname, snapid_t last,
   mdcache->mds->balancer->hit_dir(this, META_POP_FETCH);
 }
 
-void CDir::fetch_keys(const std::vector<dentry_key_t>& keys, MDSContext *c)
-{
+void CDir::fetch_keys(const std::vector<dentry_key_t> &keys, MDSContext *c,
+                      bool from_scrub) {
   dout(10) << __func__ << " " << keys.size() << " keys on " << *this << dendl;
   ceph_assert(is_auth());
   ceph_assert(!is_complete());
@@ -1643,7 +1643,7 @@ void CDir::fetch_keys(const std::vector<dentry_key_t>& keys, MDSContext *c)
   }
 
   auth_pin(this);
-  _omap_fetch(&str_keys, c);
+  _omap_fetch(from_scrub ? nullptr : &str_keys, c);
 
   if (mdcache->mds->logger)
     mdcache->mds->logger->inc(l_mds_dir_fetch_keys);

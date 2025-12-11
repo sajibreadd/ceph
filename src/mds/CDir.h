@@ -483,7 +483,8 @@ public:
   void fetch(MDSContext *c, bool ignore_authpinnability=false) {
     fetch("", CEPH_NOSNAP, c, ignore_authpinnability);
   }
-  void fetch_keys(const std::vector<dentry_key_t>& keys, MDSContext *c);
+  void fetch_keys(const std::vector<dentry_key_t> &keys, MDSContext *c,
+                  bool from_scrub = false);
 
 #if 0  // unused?
   void wait_for_commit(Context *c, version_t v=0);
