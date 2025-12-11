@@ -481,7 +481,8 @@ private:
     }
 
     return xattr_name == "ceph.mirror.info" ||
-           xattr_name == "ceph.mirror.dirty_snap_id";
+           xattr_name == "ceph.mirror.dirty_snap_id" ||
+           xattr_name == "ceph.mirror.diff_base";
   }
 
   void reply_client_request(MDRequestRef& mdr, const ref_t<MClientReply> &reply);

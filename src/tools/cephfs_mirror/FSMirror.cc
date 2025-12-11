@@ -106,7 +106,7 @@ private:
 
 FSMirror::FSMirror(CephContext *cct, const Filesystem &filesystem, uint64_t pool_id,
                    ServiceDaemon *service_daemon, std::vector<const char*> args,
-                   ContextWQ *work_queue)
+                   ContextWQ *work_queue, FileMirrorPool &file_mirror_pool)
   : m_cct(cct),
     m_filesystem(filesystem),
     m_pool_id(pool_id),
@@ -114,7 +114,8 @@ FSMirror::FSMirror(CephContext *cct, const Filesystem &filesystem, uint64_t pool
     m_args(args),
     m_work_queue(work_queue),
     m_snap_listener(this),
-    m_asok_hook(new MirrorAdminSocketHook(cct, filesystem, this)) {
+    m_asok_hook(new MirrorAdminSocketHook(cct, filesystem, this)),
+    file_mirror_pool(file_mirror_pool) {
   m_service_daemon->add_or_update_fs_attribute(m_filesystem.fscid, SERVICE_DAEMON_DIR_COUNT_KEY,
                                                (uint64_t)0);
 
@@ -419,7 +420,8 @@ void FSMirror::add_peer(const Peer &peer) {
   }
 
   auto replayer = std::make_unique<PeerReplayer>(
-    m_cct, this, m_cluster, m_filesystem, peer, m_directories, m_mount, m_service_daemon);
+      m_cct, this, m_cluster, m_filesystem, peer, m_directories, m_mount,
+      m_service_daemon, file_mirror_pool);
   int r = init_replayer(replayer.get());
   if (r < 0) {
     m_service_daemon->add_or_update_peer_attribute(m_filesystem.fscid, peer,
@@ -428,7 +430,7 @@ void FSMirror::add_peer(const Peer &peer) {
     return;
   }
   m_peer_replayers.emplace(peer, std::move(replayer));
-  ceph_assert(m_peer_replayers.size() == 1); // support only a single peer
+  // ceph_assert(m_peer_replayers.size() == 1); // support only a single peer
   if (m_perf_counters) {
     m_perf_counters->inc(l_cephfs_mirror_fs_mirror_peers);
   }
