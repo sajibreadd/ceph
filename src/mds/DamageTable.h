@@ -16,8 +16,12 @@
 #ifndef DAMAGE_TABLE_H_
 #define DAMAGE_TABLE_H_
 
+#include <filesystem>
+#include <fstream>
+#include <ostream>
 #include <string_view>
 
+#include "common/Formatter.h"
 #include "mdstypes.h"
 #include "include/random.h"
 
@@ -47,6 +51,11 @@ class DamageEntry
 
     virtual damage_entry_type_t get_type() const = 0;
     virtual void dump(Formatter *f) const = 0;
+    void print(std::ostream &os) const {
+      JSONFormatter jf;
+      dump(&jf);
+      jf.flush(os);
+    }
 
     damage_entry_id_t id;
     utime_t reported_at;
@@ -121,10 +130,13 @@ class DentryIdent
 class DamageTable
 {
   public:
-    explicit DamageTable(const mds_rank_t rank_)
-      : rank(rank_)
-    {
+    explicit DamageTable(const mds_rank_t rank_, bool log_to_file_,
+                         const std::string &log_file_)
+        : rank(rank_), log_to_file(log_to_file_), log_file(log_file_) {
       ceph_assert(rank_ != MDS_RANK_NONE);
+      if (log_to_file) {
+        log_file_opened = open_damage_log_file(fout, log_file);
+      }
     }
 
     /**
@@ -175,6 +187,25 @@ class DamageTable
 
     void erase(damage_entry_id_t damage_id);
 
+    void set_log_to_file(bool _log_to_file) {
+      log_to_file = _log_to_file;
+      if (log_to_file) {
+        log_file_opened = open_damage_log_file(fout, log_file);
+      }
+    }
+
+    void set_log_file(const std::string &_log_file) {
+      log_file = _log_file;
+      if (log_to_file) {
+        log_file_opened = open_damage_log_file(fout, log_file);
+      }
+    }
+
+  private:
+    bool open_damage_log_file(std::ofstream &fout,
+                              const std::filesystem::path &file_path);
+    std::ofstream fout;
+
   protected:
     // I need to know my MDS rank so that I can check if
     // metadata items are part of my mydir.
@@ -199,5 +230,8 @@ class DamageTable
     // to enable external tools to unambiguously operate
     // on particular entries.
     std::map<damage_entry_id_t, DamageEntryRef> by_id;
+    bool log_to_file = false;
+    std::string log_file = "";
+    bool log_file_opened = false;
 };
 #endif // DAMAGE_TABLE_H_

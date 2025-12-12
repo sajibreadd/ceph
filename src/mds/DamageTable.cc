@@ -29,6 +29,12 @@ namespace {
  * Record damage to a particular dirfrag, implicitly affecting
  * any dentries within it.
  */
+inline std::ostream& operator<<(std::ostream& os, const DamageEntry& entry)
+{
+  entry.print(os);
+  return os;
+}
+
 class DirFragDamage : public DamageEntry
 {
   public:
@@ -132,28 +138,34 @@ bool DamageTable::notify_dentry(
     inodeno_t ino, frag_t frag,
     snapid_t snap_id, std::string_view dname, std::string_view path)
 {
-  if (oversized()) {
+  bool over_sized = oversized();
+  if (!log_to_file && over_sized) {
     return true;
   }
 
   // Special cases: damage to these dirfrags is considered fatal to
   // the MDS rank that owns them.
-  if (
-      (MDS_INO_IS_MDSDIR(ino) && MDS_INO_MDSDIR_OWNER(ino) == rank)
-      ||
-      (MDS_INO_IS_STRAY(ino) && MDS_INO_STRAY_OWNER(ino) == rank)
-     ) {
+  if ((MDS_INO_IS_MDSDIR(ino) && MDS_INO_MDSDIR_OWNER(ino) == rank) ||
+      (MDS_INO_IS_STRAY(ino) && MDS_INO_STRAY_OWNER(ino) == rank)) {
     derr << "Damage to dentries in fragment " << frag << " of ino " << ino
          << "is fatal because it is a system directory for this rank" << dendl;
     return true;
   }
 
-  auto& df_dentries = dentries[DirFragIdent(ino, frag)];
-  if (auto [it, inserted] = df_dentries.try_emplace(DentryIdent(dname, snap_id)); inserted) {
-    auto entry = std::make_shared<DentryDamage>(ino, frag, dname, snap_id);
-    entry->path = path;
-    it->second = entry;
-    by_id[entry->id] = std::move(entry);
+  auto entry = std::make_shared<DentryDamage>(ino, frag, dname, snap_id);
+  if (log_to_file) {
+    fout << *entry << std::endl;
+  }
+
+  if (!over_sized) {
+    auto &df_dentries = dentries[DirFragIdent(ino, frag)];
+    if (auto [it, inserted] =
+            df_dentries.try_emplace(DentryIdent(dname, snap_id));
+        inserted) {
+      entry->path = path;
+      it->second = entry;
+      by_id[entry->id] = std::move(entry);
+    }
   }
 
   return false;
@@ -171,15 +183,24 @@ bool DamageTable::notify_dirfrag(inodeno_t ino, frag_t frag,
     return true;
   }
 
-  if (oversized()) {
+  bool over_sized = oversized();
+
+  if (!log_to_file && over_sized) {
     return true;
   }
 
-  if (auto [it, inserted] = dirfrags.try_emplace(DirFragIdent(ino, frag)); inserted) {
-    DamageEntryRef entry = std::make_shared<DirFragDamage>(ino, frag);
-    entry->path = path;
-    it->second = entry;
-    by_id[entry->id] = std::move(entry);
+  DamageEntryRef entry = std::make_shared<DirFragDamage>(ino, frag);
+  if (log_to_file) {
+    fout << *entry << std::endl;
+  }
+
+  if (!over_sized) {
+    if (auto [it, inserted] = dirfrags.try_emplace(DirFragIdent(ino, frag));
+        inserted) {
+      entry->path = path;
+      it->second = entry;
+      by_id[entry->id] = std::move(entry);
+    }
   }
 
   return false;
@@ -187,15 +208,22 @@ bool DamageTable::notify_dirfrag(inodeno_t ino, frag_t frag,
 
 bool DamageTable::notify_remote_damaged(inodeno_t ino, std::string_view path)
 {
-  if (oversized()) {
+  bool over_sized = oversized();
+  if (!log_to_file && over_sized) {
     return true;
   }
 
-  if (auto [it, inserted] = remotes.try_emplace(ino); inserted) {
-    auto entry = std::make_shared<BacktraceDamage>(ino);
-    entry->path = path;
-    it->second = entry;
-    by_id[entry->id] = std::move(entry);
+  auto entry = std::make_shared<BacktraceDamage>(ino);
+  if (log_to_file) {
+    fout << *entry << std::endl;
+  }
+
+  if (!over_sized) {
+    if (auto [it, inserted] = remotes.try_emplace(ino); inserted) {
+      entry->path = path;
+      it->second = entry;
+      by_id[entry->id] = std::move(entry);
+    }
   }
 
   return false;
@@ -301,3 +329,44 @@ void DamageTable::erase(damage_entry_id_t damage_id)
   by_id.erase(by_id_entry);
 }
 
+bool DamageTable::open_damage_log_file(std::ofstream &fout,
+                                       const std::filesystem::path &file_path) {
+  namespace fs = std::filesystem;
+
+  // Reset the stream in case it was previously used
+  if (fout.is_open()) {
+    fout.close();
+  }
+  fout.clear(); // clear any error flags
+
+  const fs::path dir = file_path.parent_path();
+
+  // Create parent directories if needed
+  if (!dir.empty()) {
+    std::error_code ec;
+
+    if (!fs::exists(dir, ec)) {
+      if (ec) {
+        dout(0) << "error checking existence of damage dir: " << dir << " ("
+                << ec.message() << ")" << dendl;
+        return false;
+      }
+
+      if (!fs::create_directories(dir, ec)) {
+        dout(0) << "failed to create directories for damage file: " << dir
+                << " (" << ec.message() << ")" << dendl;
+        return false;
+      }
+    }
+  }
+
+  // Open in append mode so we keep previous log contents
+  fout.open(file_path, std::ios::out | std::ios::app);
+
+  if (!fout.is_open()) {
+    dout(0) << "failed to open damage file: " << file_path << dendl;
+    return false;
+  }
+
+  return true;
+}
