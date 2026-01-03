@@ -249,13 +249,23 @@ bool MDCache::shutdown()
 
 void MDCache::add_inode(CInode *in)
 {
+  std::string path;
+  in->make_path_string(path);
   // add to inode map
   if (in->last == CEPH_NOSNAP) {
     auto &p = inode_map[in->ino()];
+    if (p) {
+      dout(0) << __func__ << ": found duplicate normal inode: ino=" << in->ino()
+              << ", path=" << path << ", inode=" << *in << dendl;
+    }
     ceph_assert(!p); // should be no dup inos!
     p = in;
   } else {
     auto &p = snap_inode_map[in->vino()];
+    if (p) {
+      dout(0) << __func__ << ": found duplicate snap inode: ino=" << in->ino()
+              << ", path=" << path << ", inode=" << *in << dendl;
+    }
     ceph_assert(!p); // should be no dup inos!
     p = in;
   }
