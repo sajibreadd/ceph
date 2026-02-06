@@ -259,7 +259,7 @@ private:
     // open file descriptor on the snap directory for snapshot
     // currently being synchronized. Always use this fd with
     // @m_local_mount.
-    int c_fd = -1;
+    InodeSharedPtr c_inode_current = nullptr, c_inode_parent = nullptr;
 
     // open file descriptor on the "previous" snapshot or on
     // dir_root on remote filesystem (based on if the snapshot
@@ -267,22 +267,25 @@ private:
     // fd with p_mnt which either points to @m_local_mount (
     // for local incremental comparison) or @m_remote_mount (
     // for remote incremental comparison).
-    int p_fd = -1;
+    InodeSharedPtr p_inode_current = nullptr, p_inode_parent = nullptr;
     MountRef p_mnt;
+    UserPermRef p_perms;
 
     // open file descriptor on dir_root on remote filesystem.
     // Always use this fd with @m_remote_mount.
-    int r_fd_dir_root = -1;
+    InodeSharedPtr r_inode_current = nullptr, r_inode_parent = nullptr;
     Snapshot m_current;
     boost::optional<Snapshot> m_prev;
+
+    void reset_p_inode() { p_inode_current = p_inode_parent = nullptr; }
   };
 
   struct DirRegistry {
-    int fd;
+    InodeSharedPtr local_root_inode = nullptr, remote_root_inode = nullptr,
+                   local_snap_inode = nullptr;
     std::atomic<bool> canceled = false;
     std::atomic<bool> failed = false;
     std::string dir_root;
-    FHandles snapdiff_fh, remotediff_fh;
     std::atomic<int> failed_reason = 0;
     int file_sync_queue_idx = -2;
     std::unique_ptr<C_SaferCond> sync_finish_cond;
@@ -318,6 +321,10 @@ private:
     static const unsigned int WASNT_DIR_IN_PREV_SNAPSHOT = (1 << 22);
     static const unsigned int CHANGE_MASK_POPULATED = (1 << 23);
     std::string epath;
+    std::string ppath;
+    std::string dir_name;
+
+    FHandles fh;
     ceph_dir_result *dirp = nullptr; // valid for directories
     ceph_snapdiff_info info;
     struct ceph_statx stx;
@@ -327,41 +334,27 @@ private:
     bool remote_synced = false;
 
     unsigned int change_mask = 0;
-    bool is_snapdiff = false;
     ceph_snapdiff_entry_t deleted_sibling;
     bool deleted_sibling_exist = false;
-    bool stat_known = false;
 
     SyncEntry() {}
 
-    SyncEntry(std::string_view path) : epath(path) {}
+    SyncEntry(const std::string &ppath, std::string &&epath,
+              const std::string &dir_name, FHandles &&fh,
+              unsigned int change_mask, bool is_snapdiff)
+        : ppath(ppath), epath(std::move(epath)), dir_name(dir_name),
+          fh(std::move(fh)), change_mask(change_mask) {}
 
-    SyncEntry(std::string_view path, const struct ceph_statx &stx)
-        : epath(path), stx(stx) {}
-    SyncEntry(std::string_view path, ceph_dir_result *dirp,
+    SyncEntry(const std::string &epath, const std::string &dir_name,
+              FHandles &&fh, ceph_dir_result *dirp,
               const struct ceph_statx &stx)
-        : epath(path), dirp(dirp), stx(stx) {}
-    SyncEntry(std::string_view path, ceph_dir_result *dirp,
-              const struct ceph_statx &stx, unsigned int change_mask,
-              bool is_snapdiff)
-        : epath(path), dirp(dirp), stx(stx), change_mask(change_mask),
-          is_snapdiff(is_snapdiff) {}
-    SyncEntry(std::string_view path, const ceph_snapdiff_info &info,
-              const struct ceph_statx &stx, unsigned int change_mask)
-        : epath(path), info(info), stx(stx), change_mask(change_mask) {
-      is_snapdiff = true;
-    }
+        : epath(epath), dir_name(dir_name), fh(std::move(fh)), dirp(dirp),
+          stx(stx) {}
 
     bool is_directory() const { return S_ISDIR(stx.stx_mode); }
 
     bool needs_remote_sync() const { return !remote_synced; }
     void set_remote_synced() { remote_synced = true; }
-
-    void set_is_snapdiff(bool f) { is_snapdiff = f; }
-
-    bool sync_is_snapdiff() const { return is_snapdiff; }
-
-    void set_stat_known() { stat_known = true; }
 
     void reset_change_mask() { change_mask = 0; }
 
@@ -371,6 +364,11 @@ private:
 
     bool purge_remote() { return (change_mask & PURGE_REMOTE); }
     bool create_fresh() { return (change_mask & CREATE_FRESH); }
+    bool stats_changed() {
+      return (change_mask &
+              (CEPH_STATX_MODE | CEPH_STATX_SIZE | CEPH_STATX_UID |
+               CEPH_STATX_GID | CEPH_STATX_MTIME)) > 0;
+    }
     bool wasnt_dir_in_prev_snapshot() {
       return (change_mask & WASNT_DIR_IN_PREV_SNAPSHOT);
     }
@@ -516,11 +514,25 @@ private:
   RadosRef m_remote_cluster;
   MountRef m_remote_mount;
   bool m_stopping = false;
+  UserPermRef local_perms, remote_perms;
 
   ServiceDaemonStats m_service_daemon_stats;
 
   PerfCounters *m_perf_counters;
 
+  inline InodeSharedPtr create_inode_shared_ptr(MountRef cmount, InodeRawPtr inode) {
+    if (!inode) {
+      return InodeSharedPtr();
+    }
+    return InodeSharedPtr(inode, InodeDeleter{cmount});
+  }
+
+  inline InodeUniquePtr create_inode_unique_ptr(MountRef cmount, InodeRawPtr inode) {
+    if (!inode) {
+      return InodeUniquePtr();
+    }
+    return InodeUniquePtr(inode, InodeDeleter{cmount});
+  }
 
   int register_directory(const std::string &dir_root);
   void unregister_directory(const std::string &dir_root);
@@ -537,25 +549,28 @@ private:
   int propagate_snap_renames(
       const std::string &dir_root,
       const std::map<uint64_t, std::pair<std::string, std::string>> &snaps);
-  int propagate_deleted_entries(
-      const std::string &epath, DirRegistry *registry,
-      std::shared_ptr<SnapSyncStat> &sync_stat, const FHandles &fh,
-      std::unordered_map<std::string, unsigned int> &change_mask_map,
-      int &change_mask_map_size);
-  int cleanup_remote_entry(const std::string &epath, DirRegistry *registry,
-                           const FHandles &fh,
+
+  int do_remote_walk(const std::string &epath, InodeSharedPtr &inode_shared,
+                     DirRegistry *registry, bool force = true);
+
+  int cleanup_remote_entry(InodeSharedPtr &r_inode_parent,
+                           const std::string &dir_name,
+                           const std::string &epath, DirRegistry *registry,
                            std::shared_ptr<SnapSyncStat> &sync_stat,
                            int not_dir = -1);
 
   int should_sync_entry(const std::string &epath, const struct ceph_statx &cstx,
                         const FHandles &fh, bool *need_data_sync, bool *need_attr_sync);
 
-  int open_dir(MountRef mnt, const std::string &dir_path, boost::optional<uint64_t> snap_id);
-  int pre_sync_check_and_open_handles(const std::string &dir_root,
+  int open_inode(MountRef mnt, InodeSharedPtr &parent_inode,
+                 const std::string &dir_path, InodeSharedPtr &inode_shared,
+                 struct ceph_statx &stx, unsigned int want, UserPermRef perms,
+                 boost::optional<uint64_t> snap_id = boost::none);
+
+  int pre_sync_check_and_open_handles(DirRegistry *registry,
                                       const Snapshot &current,
                                       boost::optional<Snapshot> prev,
-                                      FHandles *snapdiff_fh,
-                                      FHandles *remotediff_fh);
+                                      FHandles *fh);
 
   int do_synchronize(const std::string &dir_root, const Snapshot &current,
                      boost::optional<Snapshot> prev);
@@ -569,13 +584,18 @@ private:
                      Snapshot last_snap);
   int do_sync_snaps(const std::string &dir_root, bool *nothing_to_sync);
 
-  int sync_attributes(std::shared_ptr<SyncEntry> &cur_entry,
-                      const FHandles &fh);
+  int sync_attributes(InodeSharedPtr &r_inode_parent,
+                      const std::string &dir_name,
+                      InodeSharedPtr &r_inode_current,
+                      const struct ceph_statx &cstx, unsigned int change_mask);
 
-  int remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry, const FHandles &fh,
+  int remote_mkdir(InodeSharedPtr &parent_inode, const std::string &dir_name,
+                   InodeSharedPtr &inode_shared, struct ceph_statx &cstx,
                    std::shared_ptr<SnapSyncStat> &sync_stat);
-  int _remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry, const FHandles &fh,
-                    std::shared_ptr<SnapSyncStat> &sync_stat);
+
+  int remote_mkdirs(const std::string &epath, DirRegistry *registry,
+                    InodeSharedPtr &parent_inode);
+
   int remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
                      DirRegistry *registry,
                      std::shared_ptr<SnapSyncStat> &sync_stat,
@@ -605,14 +625,12 @@ private:
 
 class SyncMechanism : public Context {
 public:
-  SyncMechanism(MountRef m_local,
-                std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
+  SyncMechanism(std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
                 PeerReplayer::DirRegistry *registry,
                 std::shared_ptr<SnapSyncStat> &sync_stat,
-                const PeerReplayer::FHandles &fh, PeerReplayer *replayer)
-      : m_local(m_local), m_peer(replayer->m_peer),
-        cur_entry(std::move(cur_entry)), registry(registry),
-        sync_stat(sync_stat), fh(fh), replayer(replayer) {}
+                PeerReplayer *replayer)
+      : m_peer(replayer->m_peer), cur_entry(std::move(cur_entry)),
+        registry(registry), sync_stat(sync_stat), replayer(replayer) {}
 
   void sync_in_flight() { registry->inc_sync_indicator(); }
   bool sync_failed_or_canceled() {
@@ -623,27 +641,23 @@ public:
   }
 
 protected:
-  MountRef m_local;
   Peer &m_peer;
   std::shared_ptr<PeerReplayer::SyncEntry> cur_entry;
   PeerReplayer::DirRegistry *registry;
   std::shared_ptr<SnapSyncStat> &sync_stat;
-  const PeerReplayer::FHandles &fh;
   PeerReplayer *replayer;
-  int populate_change_mask(const PeerReplayer::FHandles &fh);
-  int populate_current_stat(const PeerReplayer::FHandles &fh);
+  int populate_previous();
+  int populate_current(unsigned int want = 0);
+  int populate_remote();
 };
 
 class DeleteMechanism : public SyncMechanism {
 public:
-  DeleteMechanism(MountRef m_local,
-                  std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
+  DeleteMechanism(std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
                   PeerReplayer::DirRegistry *registry,
                   std::shared_ptr<SnapSyncStat> &sync_stat,
-                  const PeerReplayer::FHandles &fh, PeerReplayer *replayer,
-                  int not_dir = -1)
-      : SyncMechanism(m_local, std::move(cur_entry), registry, sync_stat, fh,
-                      replayer),
+                  PeerReplayer *replayer, int not_dir = -1)
+      : SyncMechanism(std::move(cur_entry), registry, sync_stat, replayer),
         not_dir(not_dir) {}
 
 private:
@@ -653,13 +667,11 @@ private:
 
 class FileSyncMechanism : public SyncMechanism {
 public:
-  FileSyncMechanism(MountRef m_local,
-                    std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
+  FileSyncMechanism(std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
                     PeerReplayer::DirRegistry *registry,
                     std::shared_ptr<SnapSyncStat> &sync_stat,
-                    const PeerReplayer::FHandles &fh, PeerReplayer *replayer)
-      : SyncMechanism(m_local, std::move(cur_entry), registry, sync_stat, fh,
-                      replayer) {}
+                    PeerReplayer *replayer)
+      : SyncMechanism(std::move(cur_entry), registry, sync_stat, replayer) {}
 
   uint64_t get_file_size() { return cur_entry->stx.stx_size; }
   std::string get_file_name() {
@@ -667,30 +679,31 @@ public:
   }
   std::string get_peer_uid() { return m_peer.uuid; }
   int get_file_sync_queue_idx() { return registry->get_file_sync_queue_idx(); }
-  inline void set_worker_ref(FileMirrorPool::FileWorker* _file_worker) {
+  inline void set_worker_ref(FileMirrorPool::FileWorker *_file_worker) {
     file_worker = _file_worker;
   }
 
 private:
   void finish(int r) override;
   int sync_file();
-  FileMirrorPool::FileWorker* file_worker;
+  FileMirrorPool::FileWorker *file_worker;
 };
 
 class DirSyncMechanism : public SyncMechanism {
 public:
-  DirSyncMechanism(MountRef m_local,
-                   std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
+  DirSyncMechanism(std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
                    PeerReplayer::DirRegistry *registry,
                    std::shared_ptr<SnapSyncStat> &sync_stat,
-                   const PeerReplayer::FHandles &fh, PeerReplayer *replayer)
-      : SyncMechanism(m_local, std::move(cur_entry), registry, sync_stat, fh,
-                      replayer) {}
+                   PeerReplayer *replayer)
+      : SyncMechanism(std::move(cur_entry), registry, sync_stat, replayer) {}
 
 protected:
   void finish(int r) override;
   int sync_tree();
   bool try_spawning(SyncMechanism *syncm);
+  int remote_dir_op();
+  int remote_file_op();
+  int propagate_deleted_entries();
   std::stack<std::shared_ptr<PeerReplayer::SyncEntry>> m_sync_stack;
 
 private:
@@ -701,13 +714,11 @@ private:
 
 class DirBruteDiffSync : public DirSyncMechanism {
 public:
-  DirBruteDiffSync(MountRef m_local,
-                   std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
+  DirBruteDiffSync(std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
                    PeerReplayer::DirRegistry *registry,
                    std::shared_ptr<SnapSyncStat> &sync_stat,
-                   const PeerReplayer::FHandles &fh, PeerReplayer *replayer)
-      : DirSyncMechanism(m_local, std::move(cur_entry), registry, sync_stat, fh,
-                         replayer) {}
+                   PeerReplayer *replayer)
+      : DirSyncMechanism(std::move(cur_entry), registry, sync_stat, replayer) {}
 
 private:
   std::stack<std::unordered_map<std::string, unsigned int>>
@@ -720,13 +731,11 @@ private:
 
 class DirSnapDiffSync : public DirSyncMechanism {
 public:
-  DirSnapDiffSync(MountRef m_local,
-                  std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
+  DirSnapDiffSync(std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
                   PeerReplayer::DirRegistry *registry,
                   std::shared_ptr<SnapSyncStat> &sync_stat,
-                  const PeerReplayer::FHandles &fh, PeerReplayer *replayer)
-      : DirSyncMechanism(m_local, std::move(cur_entry), registry, sync_stat, fh,
-                         replayer) {}
+                  PeerReplayer *replayer)
+      : DirSyncMechanism(std::move(cur_entry), registry, sync_stat, replayer) {}
 
 private:
   void finish_sync() override;

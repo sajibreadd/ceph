@@ -80,6 +80,18 @@ typedef std::shared_ptr<librados::IoCtx> IoCtxRef;
 
 // not a shared_ptr since the type is incomplete
 typedef ceph_mount_info *MountRef;
+typedef UserPerm *UserPermRef;
+typedef std::shared_ptr<Inode> InodeSharedPtr;
+struct InodeDeleter {
+  MountRef cmount = nullptr;
+  void operator()(Inode *inode) const {
+    if (cmount && inode) {
+      ceph_ll_forget(cmount, inode, 1);
+    }
+  }
+};
+typedef std::unique_ptr<Inode, InodeDeleter> InodeUniquePtr;
+typedef Inode *InodeRawPtr;
 
 using clock = ceph::coarse_mono_clock;
 using monotime = ceph::coarse_mono_time;

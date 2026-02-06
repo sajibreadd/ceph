@@ -67,6 +67,10 @@ std::string snapshot_path(CephContext *cct, const std::string &path, const std::
   return path + "/" + cct->_conf->client_snapdir + "/" + snap_name;
 }
 
+std::string snapshot_path(CephContext *cct, const std::string &snap_name) {
+  return cct->_conf->client_snapdir + "/" + snap_name;
+}
+
 std::string entry_path(const std::string &dir, const std::string &name) {
   return dir + "/" + name;
 }
@@ -475,6 +479,8 @@ int PeerReplayer::init() {
     derr << ": error mounting remote filesystem=" << remote_filesystem << dendl;
     return r;
   }
+  local_perms = ceph_mount_perms(m_local_mount);
+  remote_perms = ceph_mount_perms(m_remote_mount);
 
   std::scoped_lock locker(m_lock);
   nr_replayers = max_concurrent_directory_syncs =
@@ -808,82 +814,65 @@ int PeerReplayer::propagate_snap_renames(
   return 0;
 }
 
-int PeerReplayer::sync_attributes(std::shared_ptr<SyncEntry> &cur_entry,
-                                  const FHandles &fh) {
+int PeerReplayer::sync_attributes(InodeSharedPtr &r_inode_parent,
+                                  const std::string &dir_name,
+                                  InodeSharedPtr &r_inode_current,
+                                  const struct ceph_statx &cstx,
+                                  unsigned int change_mask) {
+
+  unsigned int attr_mask = 0;
+  if (change_mask & CEPH_STATX_MODE) {
+    attr_mask |= CEPH_SETATTR_MODE;
+  }
+  if (change_mask & CEPH_STATX_SIZE) {
+    attr_mask |= CEPH_SETATTR_SIZE;
+  }
+  if (change_mask & CEPH_STATX_MTIME) {
+    attr_mask |= CEPH_SETATTR_MTIME;
+  }
+  if (change_mask & CEPH_STATX_UID) {
+    attr_mask |= CEPH_SETATTR_UID;
+  }
+  if (change_mask & CEPH_STATX_GID) {
+    attr_mask |= CEPH_SETATTR_GID;
+  }
+  if (attr_mask == 0) {
+    return 0;
+  }
   int r = 0;
-  if ((cur_entry->change_mask & CEPH_STATX_UID) ||
-      (cur_entry->change_mask & CEPH_STATX_GID)) {
-    r = ceph_chownat(m_remote_mount, fh.r_fd_dir_root, cur_entry->epath.c_str(),
-                     cur_entry->stx.stx_uid, cur_entry->stx.stx_gid,
-                     AT_SYMLINK_NOFOLLOW);
+  struct ceph_statx rstx;
+  if (!r_inode_current) {
+    r = open_inode(m_remote_mount, r_inode_parent, dir_name, r_inode_current,
+                   rstx, 0, remote_perms);
     if (r < 0) {
-      derr << ": failed to chown remote directory=" << cur_entry->epath << ": "
-           << cpp_strerror(r) << dendl;
       return r;
     }
   }
-
-  if ((cur_entry->change_mask & CEPH_STATX_MODE)) {
-    r = ceph_chmodat(m_remote_mount, fh.r_fd_dir_root, cur_entry->epath.c_str(),
-                     cur_entry->stx.stx_mode & ~S_IFMT, AT_SYMLINK_NOFOLLOW);
-    if (r < 0) {
-      derr << ": failed to chmod remote directory=" << cur_entry->epath << ": "
-           << cpp_strerror(r) << dendl;
-      return r;
-    }
-  }
-
-  if (!cur_entry->is_directory() &&
-      (cur_entry->change_mask & CEPH_STATX_MTIME)) {
-    struct timespec times[] = {
-        {cur_entry->stx.stx_atime.tv_sec, cur_entry->stx.stx_atime.tv_nsec},
-        {cur_entry->stx.stx_mtime.tv_sec, cur_entry->stx.stx_mtime.tv_nsec}};
-    r = ceph_utimensat(m_remote_mount, fh.r_fd_dir_root,
-                       cur_entry->epath.c_str(), times, AT_SYMLINK_NOFOLLOW);
-    if (r < 0) {
-      derr << ": failed to change [am]time on remote directory="
-           << cur_entry->epath << ": " << cpp_strerror(r) << dendl;
-      return r;
-    }
-  }
-  return 0;
-}
-
-int PeerReplayer::_remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry,
-                                const FHandles &fh,
-                                std::shared_ptr<SnapSyncStat> &sync_stat) {
-  int r =
-      ceph_mkdirat(m_remote_mount, fh.r_fd_dir_root, cur_entry->epath.c_str(),
-                   cur_entry->stx.stx_mode & ~S_IFDIR);
-  if (r < 0 && r != -EEXIST) {
-    derr << ": failed to create remote directory=" << cur_entry->epath << ": "
-         << cpp_strerror(r) << dendl;
-    return r;
-  }
-  if (r == 0) {
-    sync_stat->current_stat.inc_dir_created_count();
-  }
-  return 0;
-}
-
-int PeerReplayer::remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry,
-                               const FHandles &fh,
-                               std::shared_ptr<SnapSyncStat> &sync_stat) {
-  dout(10) << ": remote epath=" << cur_entry->epath << dendl;
-  int r = 0;
-  /*
-    We know that if it is not create fresh and purge remote
-    then remote already has the dir entry, we just need to
-    sync_attributes, thus saving a ceph_mkdirat call.
-  */
-  // if (cur_entry->create_fresh() || cur_entry->purge_remote()) {
-  r = _remote_mkdir(cur_entry, fh, sync_stat);
+  r = ceph_ll_setattr(m_remote_mount, r_inode_current.get(), &cstx, attr_mask,
+                      remote_perms);
   if (r < 0) {
     return r;
   }
-  // }
+  return 0;
+}
 
-  r = sync_attributes(cur_entry, fh);
+int PeerReplayer::remote_mkdir(InodeSharedPtr &parent_inode,
+                               const std::string &dir_name,
+                               InodeSharedPtr &inode_shared,
+                               struct ceph_statx &cstx,
+                               std::shared_ptr<SnapSyncStat> &sync_stat) {
+
+  struct ceph_statx rstx;
+  InodeRawPtr inode_raw = nullptr;
+  int r = ceph_ll_mkdir(m_remote_mount, parent_inode.get(), dir_name.c_str(),
+                        cstx.stx_mode & ~S_IFDIR, &inode_raw, &rstx, 0, 0,
+                        remote_perms);
+
+  if (r < 0) {
+    return r;
+  }
+  inode_shared = create_inode_shared_ptr(m_remote_mount, inode_raw);
+  sync_stat->current_stat.inc_dir_created_count();
   return r;
 }
 
@@ -1023,10 +1012,7 @@ void PeerReplayer::enqueue_file_transfer(
   file_mirror_pool.sync_file_data(syncm, registry->get_file_sync_queue_idx());
 }
 
-int PeerReplayer::remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
-                                 DirRegistry *registry,
-                                 std::shared_ptr<SnapSyncStat> &sync_stat,
-                                 const FHandles &fh) {
+int DirSyncMechanism::remote_file_op() {
   bool need_data_sync = cur_entry->create_fresh() ||
                         cur_entry->purge_remote() ||
                         ((cur_entry->change_mask & CEPH_STATX_SIZE) > 0) ||
@@ -1041,21 +1027,26 @@ int PeerReplayer::remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
   if (need_data_sync) {
     if (S_ISREG(cur_entry->stx.stx_mode)) {
       FileSyncMechanism *syncm = new FileSyncMechanism(
-          m_local_mount, std::move(cur_entry), registry, sync_stat, fh, this);
+          std::move(cur_entry), registry, sync_stat, this);
       enqueue_file_transfer(syncm, registry, sync_stat);
+      cur_entry = nullptr;
       return 0;
     } else if (S_ISLNK(cur_entry->stx.stx_mode)) {
       // free the remote link before relinking
-      r = ceph_unlinkat(m_remote_mount, fh.r_fd_dir_root,
-                        cur_entry->epath.c_str(), 0);
+      r = cleanup_remote_entry(
+          cur_entry->fh.r_inode_parent, cur_entry->dir_name, cur_entry->epath,
+          registry, sync_stat, cur_entry->wasnt_dir_in_prev_snapshot());
+      
       if (r < 0 && r != -ENOENT) {
         derr << ": failed to remove remote symlink=" << cur_entry->epath << ": "
              << cpp_strerror(r) << dendl;
         return r;
       }
       char *target = (char *)alloca(cur_entry->stx.stx_size + 1);
-      r = ceph_readlinkat(m_local_mount, fh.c_fd, cur_entry->epath.c_str(),
-                          target, cur_entry->stx.stx_size);
+
+      r = ceph_ll_readlink(replayer->m_local_mount,
+                           cur_entry->c_inode_current.get(), target,
+                           cur_entry->stx.stx_size, replayer->local_perms);
       if (r < 0) {
         derr << ": failed to readlink local path=" << cur_entry->epath << ": "
              << cpp_strerror(r) << dendl;
@@ -1065,11 +1056,19 @@ int PeerReplayer::remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
       target[cur_entry->stx.stx_size] = '\0';
       r = ceph_symlinkat(m_remote_mount, target, fh.r_fd_dir_root,
                          cur_entry->epath.c_str());
-      if (r < 0 && r != -EEXIST) {
+
+      InodeRawPtr inode_raw = nullptr;
+      struct ceph_statx rstx;
+      r = ceph_ll_symlink(replayer->m_remote_mount,
+                          cur_entry->fh.r_inode_parent,
+                          cur_entry->dir_name.c_str(), target, &inode_raw,
+                          &rstx, 0, 0, replayer->remote_perms);
+      if (r < 0) {
         derr << ": failed to symlink remote path=" << cur_entry->epath
              << " to target=" << target << ": " << cpp_strerror(r) << dendl;
         return r;
       }
+
       cur_entry->change_mask =
           (CEPH_STATX_MODE | CEPH_STATX_SIZE | CEPH_STATX_UID | CEPH_STATX_GID |
            CEPH_STATX_MTIME);
@@ -1083,8 +1082,12 @@ int PeerReplayer::remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
   unsigned int all_change =
       (CEPH_STATX_MODE | CEPH_STATX_SIZE | CEPH_STATX_UID | CEPH_STATX_GID |
        CEPH_STATX_MTIME);
-  r = sync_attributes(cur_entry, fh);
+  r = replayer->sync_attributes(
+      cur_entry->fh.r_inode_parent, cur_entry->dir_name,
+      cur_entry->fh.r_inode_current, cur_entry->stx, cur_entry->change_mask);
   if (r < 0) {
+    derr << ": failed to sync attributes for remote file=" << cur_entry->epath
+         << ": " << cpp_strerror(r) << dendl;
     return r;
   }
   if (cur_entry->change_mask & all_change) {
@@ -1092,13 +1095,99 @@ int PeerReplayer::remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
   } else {
     sync_stat->current_stat.inc_file_skipped_count();
   }
-  
+
   return 0;
 }
 
-int PeerReplayer::cleanup_remote_entry(const std::string &epath,
+int PeerReplayer::do_remote_walk(const std::string &epath,
+                                 InodeSharedPtr &inode_shared,
+                                 DirRegistry *registry, bool force) {
+  struct ceph_statx lstx, rstx;
+
+  int r = open_inode(m_remote_mount, registry->remote_root_inode, epath,
+                     inode_shared, rstx, 0, remote_perms);
+  if (inode_shared || !force) {
+    return r;
+  }
+
+  int pos = 1;
+  InodeSharedPtr local_parent = registry->local_root_inode;
+  InodeSharedPtr remote_parent = registry->remote_root_inode;
+  InodeSharedPtr remote_child, local_child;
+  while (pos < epath.size()) {
+    local_child = remote_child = nullptr;
+    int next = epath.find('/', pos);
+    std::string name = (next == std::string::npos)
+                           ? epath.substr(pos)
+                           : epath.substr(pos, next - pos);
+
+    if (!name.empty()) {
+      int r_local = open_inode(m_local_mount, local_parent, name, local_child,
+                               lstx, CEPH_STATX_MODE, local_perms);
+
+      if (r_local < 0) {
+        derr << ": failed to lookup local path=" << epath.substr(0, next)
+             << ": " << cpp_strerror(r_local) << dendl;
+        return r_local;
+      } else if (!S_ISDIR(lstx.stx_mode)) {
+        derr << ": expected local path=" << epath.substr(0, next)
+             << " to be a directory but it's not, mode=" << lstx.stx_mode
+             << dendl;
+        return -ENOTDIR;
+      }
+
+      int r_remote =
+          open_inode(m_remote_mount, remote_parent, name, remote_child, rstx,
+                     CEPH_STATX_MODE, remote_perms);
+
+      if (r_remote == -ENOENT) {
+
+        r_remote = remote_mkdir(remote_parent, name, remote_child, lstx);
+        if (r_remote < 0) {
+          derr << ": failed to create remote directory for path="
+               << epath.substr(0, next) << ": " << cpp_strerror(r_remote)
+               << dendl;
+          return r_remote;
+        }
+
+        r_remote = ceph_ll_setattr(
+            m_remote_mount, remote_child.get(), &lstx,
+            (CEPH_SETATTR_MODE | CEPH_SETATTR_UID | CEPH_SETATTR_GID),
+            remote_perms);
+
+        if (r_remote < 0) {
+          derr << ": failed to sync attributes for remote path="
+               << epath.substr(0, next) << ": " << cpp_strerror(r_remote)
+               << dendl;
+          return r_remote;
+        }
+
+      } else if (r_remote < 0) {
+        return r_remote;
+      } else if (!S_ISDIR(rstx.stx_mode)) {
+        derr << ": expected remote path=" << epath.substr(0, next)
+             << " to be a directory but it's not, mode=" << rstx.stx_mode
+             << dendl;
+        return -ENOTDIR;
+      }
+
+      local_parent = std::move(local_child_shared);
+      remote_parent = std::move(remote_child_shared);
+    }
+
+    if (next == std::string::npos) {
+      break;
+    }
+    pos = next + 1;
+  }
+  inode_shared = std::move(remote_parent);
+  return 0;
+}
+
+int PeerReplayer::cleanup_remote_entry(InodeSharedPtr &r_inode_parent,
+                                       const std::string &dir_name,
+                                       const std::string &epath,
                                        DirRegistry *registry,
-                                       const FHandles &fh,
                                        std::shared_ptr<SnapSyncStat> &sync_stat,
                                        int not_dir) {
   dout(20) << ": dir_root=" << registry->dir_root << ", epath=" << epath
@@ -1109,7 +1198,8 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
     This hint works always.
   */
   if (not_dir == 1) {
-    r = ceph_unlinkat(m_remote_mount, fh.r_fd_dir_root, epath.c_str(), 0);
+    r = ceph_ll_unlink(m_remote_mount, r_inode_parent.get(), dir_name.c_str(),
+                       remote_perms);
     if (r < 0 && r != -ENOENT && r != -EISDIR) {
       derr << ": failed to remove remote entry=" << epath << ": "
            << cpp_strerror(r) << dendl;
@@ -1126,11 +1216,12 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
   }
 
   r = 0;
+  FHandles fh;
+  fh.r_inode_parent = r_inode_parent;
+  fh.r_inode_current = nullptr;
   struct ceph_statx tstx;
-  r = ceph_statxat(m_remote_mount, fh.r_fd_dir_root, epath.c_str(), &tstx,
-                   CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
-                       CEPH_STATX_SIZE | CEPH_STATX_MTIME,
-                   AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
+  r = open_inode(m_remote_mount, fh.r_inode_parent, dir_name,
+                 fh.r_inode_current, tstx, CEPH_STATX_MODE, remote_perms);
   if (r == -ENOENT) {
     dout(10) << ": entry already removed=" << epath << dendl;
     return r;
@@ -1142,12 +1233,13 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
   }
 
   /*
-    if the hint didn't work(it should work always but for the sanity check), 
-    that means we thought it as a directory in base state, our goal is to 
+    if the hint didn't work(it should work always but for the sanity check),
+    that means we thought it as a directory in base state, our goal is to
     just clean it up. No matter it's file or directory.
   */
   if (!S_ISDIR(tstx.stx_mode)) {
-    r = ceph_unlinkat(m_remote_mount, fh.r_fd_dir_root, epath.c_str(), 0);
+    r = ceph_ll_unlink(m_remote_mount, fh.r_inode_parent.get(),
+                       dir_name.c_str(), remote_perms);
     if (r < 0) {
       derr << ": failed to remove remote entry=" << epath << ": "
            << cpp_strerror(r) << dendl;
@@ -1157,16 +1249,17 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
   }
 
   ceph_dir_result *tdirp;
-  r = opendirat(m_remote_mount, fh.r_fd_dir_root, epath, AT_SYMLINK_NOFOLLOW,
-                &tdirp);
+  r = ceph_ll_opendir(m_remote_mount, fh.r_inode_current.get(), &tdirp,
+                      remote_perms);
   if (r < 0) {
-    derr << ": failed to open remote directory=" << epath << ": "
-        << cpp_strerror(r) << dendl;
+    derr << ": failed to open remote directory=" << cur_entry->epath << ": "
+         << cpp_strerror(r) << dendl;
     return r;
   }
 
-  std::stack<SyncEntry> rm_stack;
-  rm_stack.emplace(SyncEntry(epath, tdirp, tstx));
+  std::stack<std::unique_ptr<SyncEntry>> rm_stack;
+  rm_stack.emplace(
+      std::make_unique<SyncEntry>(epath, dir_name, std::move(fh), tdirp, tstx));
   while (!rm_stack.empty()) {
     if (should_backoff(registry, &r)) {
       dout(0) << ": backing off r=" << r << dendl;
@@ -1174,18 +1267,18 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
     }
 
     dout(20) << ": " << rm_stack.size() << " entries in stack" << dendl;
-    std::string e_name;
+    std::string child_name;
     auto &entry = rm_stack.top();
-    dout(20) << ": top of stack path=" << entry.epath << dendl;
-    if (entry.is_directory()) {
-      struct ceph_statx stx;
+    dout(20) << ": top of stack path=" << entry->epath << dendl;
+    if (entry->is_directory()) {
+      struct ceph_statx child_stx;
       struct dirent de;
       while (true) {
-        r = ceph_readdirplus_r(m_remote_mount, entry.dirp, &de, &stx,
-                              CEPH_STATX_MODE,
-                              AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW, NULL);
+        r = ceph_readdirplus_r(m_remote_mount, entry->dirp, &de, &child_stx,
+                               CEPH_STATX_MODE,
+                               AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW, NULL);
         if (r < 0) {
-          derr << ": failed to read remote directory=" << entry.epath << dendl;
+          derr << ": failed to read remote directory=" << entry->epath << dendl;
           break;
         }
         if (r == 0) {
@@ -1194,24 +1287,26 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
 
         auto d_name = std::string(de.d_name);
         if (d_name != "." && d_name != "..") {
-          e_name = d_name;
+          child_name = d_name;
           break;
         }
       }
 
       if (r == 0) {
-        r = ceph_unlinkat(m_remote_mount, fh.r_fd_dir_root, entry.epath.c_str(),
-                          AT_REMOVEDIR);
+        r = ceph_ll_rmdir(m_remote_mount, entry->fh.r_inode_parent,
+                          entry->dir_name.c_str(), remote_perms);
         if (r < 0) {
-          derr << ": failed to remove remote directory=" << entry.epath << ": "
-              << cpp_strerror(r) << dendl;
+          derr << ": failed to remove remote directory=" << entry->epath << ": "
+               << cpp_strerror(r) << dendl;
           break;
         }
         sync_stat->current_stat.inc_dir_deleted_count();
 
-        dout(10) << ": done for remote directory=" << entry.epath << dendl;
-        if (entry.dirp && ceph_closedir(m_remote_mount, entry.dirp) < 0) {
-          derr << ": failed to close remote directory=" << entry.epath << dendl;
+        dout(10) << ": done for remote directory=" << entry->epath << dendl;
+        if (entry->dirp &&
+            ceph_ll_releasedir(m_remote_mount, entry->dirp) < 0) {
+          derr << ": failed to close remote directory=" << entry->epath
+               << dendl;
         }
         rm_stack.pop();
         continue;
@@ -1220,29 +1315,43 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
         break;
       }
 
-      auto epath = entry_path(entry.epath, e_name);
-      if (S_ISDIR(stx.stx_mode)) {
-        ceph_dir_result *dirp;
-        r = opendirat(m_remote_mount, fh.r_fd_dir_root, epath,
-                      AT_SYMLINK_NOFOLLOW, &dirp);
+      auto child_path = entry_path(entry->epath, child_name);
+      FHandles child_fh;
+      child_fh.r_inode_parent = entry->fh.r_inode_current;
+      child_fh.r_inode_current = nullptr;
+      if (S_ISDIR(child_stx.stx_mode)) {
+        ceph_dir_result *child_dirp;
+        r = open_inode(m_remote_mount, child_fh.r_inode_parent, child_name,
+                       child_fh.r_inode_current, 0, remote_perms);
         if (r < 0) {
-          derr << ": failed to open remote directory=" << epath << ": "
-              << cpp_strerror(r) << dendl;
+          derr << ": failed to open inode for remote directory=" << child_path
+               << ": " << cpp_strerror(r) << dendl;
           break;
         }
-        rm_stack.emplace(SyncEntry(epath, dirp, stx));
+        r = ceph_ll_opendir(m_remote_mount, child_fh.r_inode_current.get(),
+                            &child_dirp, remote_perms);
+        if (r < 0) {
+          derr << ": failed to open remote directory=" << child_path << ": "
+               << cpp_strerror(r) << dendl;
+          break;
+        }
+        rm_stack.emplace(std::make_unique<SyncEntry>(child_path, child_name,
+                                                     std::move(child_fh),
+                                                     child_dirp, child_stx));
       } else {
-        rm_stack.emplace(SyncEntry(epath, stx));
+        rm_stack.emplace(std::make_unique<SyncEntry>(
+            child_path, child_name, std::move(child_fh), nullptr, child_stx));
       }
     } else {
-      r = ceph_unlinkat(m_remote_mount, fh.r_fd_dir_root, entry.epath.c_str(),
-                        0);
+
+      r = ceph_ll_unlink(m_remote_mount, entry->fh.r_inode_parent,
+                         entry->dir_name.c_str(), remote_perms);
       if (r < 0) {
-        derr << ": failed to remove remote directory=" << entry.epath << ": "
-            << cpp_strerror(r) << dendl;
+        derr << ": failed to remove remote directory=" << entry->epath << ": "
+             << cpp_strerror(r) << dendl;
         break;
       }
-      dout(10) << ": done for remote file=" << entry.epath << dendl;
+      dout(10) << ": done for remote file=" << entry->epath << dendl;
       sync_stat->current_stat.inc_file_del_count();
       rm_stack.pop();
     }
@@ -1250,10 +1359,10 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
 
   while (!rm_stack.empty()) {
     auto &entry = rm_stack.top();
-    if (entry.is_directory()) {
-      dout(20) << ": closing remote directory=" << entry.epath << dendl;
-      if (entry.dirp && ceph_closedir(m_remote_mount, entry.dirp) < 0) {
-        derr << ": failed to close remote directory=" << entry.epath << dendl;
+    if (entry->is_directory()) {
+      dout(20) << ": closing remote directory=" << entry->epath << dendl;
+      if (entry->dirp && ceph_ll_releasedir(m_remote_mount, entry->dirp) < 0) {
+        derr << ": failed to close remote directory=" << entry->epath << dendl;
       }
     }
 
@@ -1307,30 +1416,15 @@ int PeerReplayer::should_sync_entry(const std::string &epath, const struct ceph_
   return 0;
 }
 
-int PeerReplayer::propagate_deleted_entries(
-    const std::string &epath, DirRegistry *registry,
-    std::shared_ptr<SnapSyncStat> &sync_stat, const FHandles &fh,
-    std::unordered_map<std::string, unsigned int> &change_mask_map,
-    int &change_mask_map_size) {
-  dout(10) << ": dir_root=" << registry->dir_root << ", epath=" << epath
-           << dendl;
+int DirSyncMechanism::propagate_deleted_entries() {
+  dout(10) << ": dir_root=" << registry->dir_root
+           << ", epath=" << cur_entry->epath << dendl;
   ceph_dir_result *dirp;
-  int r = opendirat(fh.p_mnt, fh.p_fd, epath, AT_SYMLINK_NOFOLLOW, &dirp);
+  int r = ceph_ll_opendir(cur_entry->fh.p_mnt, cur_entry->fh.c_inode_current,
+                          &dirp, cur_entry->fh.p_perms);
   if (r < 0) {
-    if (r == -ELOOP) {
-      dout(5) << ": epath=" << epath << " is a symbolic link -- mode sync"
-              << " done when traversing parent" << dendl;
-      return 0;
-    }
-    if (r == -ENOTDIR) {
-      dout(5) << ": epath=" << epath << " is not a directory -- mode sync"
-              << " done when traversing parent" << dendl;
-      return 0;
-    }
-    if (r == -ENOENT) {
-      dout(5) << ": epath=" << epath
-              << " missing in previous-snap/remote dir-root" << dendl;
-    }
+    derr << ": failed to open directory in previous snapshot="
+         << cur_entry->epath << ": " << cpp_strerror(r) << dendl;
     return r;
   }
   struct ceph_statx pstx;
@@ -1345,7 +1439,7 @@ int PeerReplayer::propagate_deleted_entries(
             ? (CEPH_STATX_UID | CEPH_STATX_GID | CEPH_STATX_SIZE |
                CEPH_STATX_MTIME)
             : 0;
-    r = ceph_readdirplus_r(fh.p_mnt, dirp, &de, &pstx,
+    r = ceph_readdirplus_r(cur_entry->fh.p_mnt, dirp, &de, &pstx,
                            CEPH_STATX_MODE | extra_flags,
                            AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW, NULL);
 
@@ -1421,92 +1515,98 @@ int PeerReplayer::propagate_deleted_entries(
   return r;
 }
 
-int PeerReplayer::open_dir(MountRef mnt, const std::string &dir_path,
-                           boost::optional<uint64_t> snap_id) {
+int PeerReplayer::open_inode(MountRef mnt, InodeSharedPtr &parent_inode,
+                             const std::string &dir_path,
+                             InodeSharedPtr &inode_shared,
+                             struct ceph_statx &stx, unsigned int want,
+                             UserPermRef perms,
+                             boost::optional<uint64_t> snap_id) {
   dout(20) << ": dir_path=" << dir_path << dendl;
   if (snap_id) {
     dout(20) << ": expected snapshot id=" << *snap_id << dendl;
   }
 
-  int fd = ceph_open(mnt, dir_path.c_str(), O_DIRECTORY | O_RDONLY, 0);
-  if (fd < 0) {
-    derr << ": cannot open dir_path=" << dir_path << ": " << cpp_strerror(fd)
-         << dendl;
-    return fd;
+  InodeRawPtr inode = nullptr;
+  int r = ceph_ll_lookup(
+      mnt, parent_inode.get(), dir_path.c_str(), &inode, &stx, want,
+      (mnt == m_local_mount ? AT_STATX_DONT_SYNC : 0), perms);
+  if (r < 0) {
+    derr << ": cannot get inode for dir_path=" << dir_path << ": "
+         << cpp_strerror(r) << dendl;
+    goto safe_exit;
   }
 
   if (!snap_id) {
-    return fd;
+    goto safe_exit;
   }
 
   snap_info info;
-  int r = ceph_get_snap_info(mnt, dir_path.c_str(), &info);
+  r = ceph_get_snap_info(mnt, dir_path.c_str(), &info);
   if (r < 0) {
-    derr << ": failed to fetch snap_info for path=" << dir_path
-         << ": " << cpp_strerror(r) << dendl;
-    ceph_close(mnt, fd);
-    return r;
+    derr << ": failed to fetch snap_info for path=" << dir_path << ": "
+         << cpp_strerror(r) << dendl;
+    goto safe_exit;
   }
 
   if (info.id != *snap_id) {
-    dout(5) << ": got mismatching snapshot id for path=" << dir_path << " (" << info.id
-            << " vs " << *snap_id << ") -- possible recreate" << dendl;
-    ceph_close(mnt, fd);
-    return -EINVAL;
+    dout(5) << ": got mismatching snapshot id for path=" << dir_path << " ("
+            << info.id << " vs " << *snap_id << ") -- possible recreate"
+            << dendl;
+    r = -EINVAL;
   }
 
-  return fd;
+safe_exit:
+  if (r < 0) {
+    inode = nullptr;
+  }
+  inode_shared = create_inode_shared_ptr(mnt, inode);
+  return r;
 }
 
 int PeerReplayer::pre_sync_check_and_open_handles(
-    const std::string &dir_root,
-    const Snapshot &current, boost::optional<Snapshot> prev,
-    FHandles *snapdiff_fh, FHandles* remotediff_fh) {
-  dout(20) << ": dir_root=" << dir_root << ", current=" << current << dendl;
+    DirRegistry *registry, const Snapshot &current,
+    boost::optional<Snapshot> prev, FHandles *fh) {
+  dout(20) << ": dir_root=" << registry->dir_root << ", current=" << current
+           << dendl;
   if (prev) {
     dout(20) << ": prev=" << prev << dendl;
   }
 
-  auto cur_snap_path = snapshot_path(m_cct, dir_root, current.first);
-  auto fd = open_dir(m_local_mount, cur_snap_path, current.second);
-  if (fd < 0) {
-    return fd;
+  auto cur_snap_rel_path = snapshot_path(m_cct, current.first);
+  struct ceph_statx stx;
+  int r =
+      open_inode(m_local_mount, registry->local_root_inode, cur_snap_rel_path,
+                 fh->c_inode_parent, stx, 0, local_perms, current.second);
+  if (r < 0) {
+    return r;
   }
-  snapdiff_fh->c_fd = snapdiff_fh->p_fd = remotediff_fh->c_fd =
-      remotediff_fh->p_fd = -1;
 
   // current snapshot file descriptor
-  snapdiff_fh->m_current = current;
-  snapdiff_fh->m_prev = prev;
-  snapdiff_fh->c_fd = fd;
-  remotediff_fh->c_fd = fd;
+  fh->m_current = current;
+  fh->m_prev = prev;
 
   if (prev) {
-    auto prev_snap_path = snapshot_path(m_cct, dir_root, (*prev).first);
-    snapdiff_fh->p_fd = open_dir(m_local_mount, prev_snap_path, (*prev).second);
-    snapdiff_fh->p_mnt = m_local_mount;
-  }
-  remotediff_fh->p_fd = open_dir(m_remote_mount, dir_root, boost::none);
-  remotediff_fh->p_mnt = m_remote_mount;
-
-  if (remotediff_fh->p_fd < 0) {
-    ceph_close(m_local_mount, remotediff_fh->c_fd);
-    if (snapdiff_fh->p_fd >= 0) {
-      ceph_close(m_local_mount, snapdiff_fh->p_fd);
-    }
-    return remotediff_fh->p_fd;
+    auto prev_snap_rel_path = snapshot_path(m_cct, (*prev).first);
+    r = open_inode(m_local_mount, registry->local_root_inode,
+                   prev_snap_rel_path, fh->p_inode_parent, stx, 0, local_perms,
+                   (*prev).second);
+    fh->p_mnt = m_local_mount;
+    fh->p_perms = local_perms;
   }
 
   {
     std::scoped_lock locker(m_lock);
-    auto it = m_registered.find(dir_root);
-    ceph_assert(it != m_registered.end());
-    snapdiff_fh->r_fd_dir_root = it->second->fd;
-    remotediff_fh->r_fd_dir_root = it->second->fd;
+    fh->r_inode_parent = registry->remote_root_inode;
+    registry->local_snap_inode = fh->c_inode_parent;
+    if (!fh->p_inode_parent) {
+      fh->p_mnt = m_remote_mount;
+      fh->p_perms = remote_perms;
+      fh->p_inode_parent = fh->r_inode_parent;
+    }
   }
 
   dout(0) << ": using "
-          << ((snapdiff_fh->p_fd >= 0)
+          << ((fh->p_mnt == m_local_mount)
                   ? ("local (previous) snapshot " + (*prev).first)
                   : "remote dir_root")
           << " for incremental transfer" << dendl;
@@ -1709,27 +1809,31 @@ void PeerReplayer::DirSyncPool::update_qlimit(int _qlimit) {
   qlimit = _qlimit;
 }
 
-int SyncMechanism::populate_current_stat(const PeerReplayer::FHandles &fh) {
+int SyncMechanism::populate_current(unsigned int want) {
   int r = 0;
-  if (!cur_entry->stat_known) { // stat populated
-    r = ceph_statxat(m_local, fh.c_fd, cur_entry->epath.c_str(),
-                     &cur_entry->stx,
-                     CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
-                         CEPH_STATX_SIZE | CEPH_STATX_ATIME | CEPH_STATX_MTIME,
-                     AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
+  if (!cur_entry->fh.c_inode_current) { // stat populated
+    struct ceph_statx stx;
+    if (want) {
+      r = replayer->open_inode(
+          replayer->m_local_mount, cur_entry->fh.c_inode_parent,
+          cur_entry->dir_name, cur_entry->fh.c_inode_current, cur_entry->stx,
+          want, replayer->local_perms);
+    } else {
+      r = replayer->open_inode(
+          replayer->m_local_mount, cur_entry->fh.c_inode_parent,
+          cur_entry->dir_name, cur_entry->fh.c_inode_current, stx, want,
+          replayer->local_perms);
+    }
     if (r < 0) {
-      derr << ": failed to stat cur entry= " << cur_entry->epath << ": "
+      derr << ": failed to populate cur entry= " << cur_entry->epath << ": "
            << cpp_strerror(r) << dendl;
-      derr << ": failed to stat cur entry= " << cur_entry->epath << ", "
-           << cur_entry->sync_is_snapdiff() << dendl;
       return r;
     }
-    cur_entry->set_stat_known();
   }
   return r;
 }
 
-int SyncMechanism::populate_change_mask(const PeerReplayer::FHandles &fh) {
+int SyncMechanism::populate_previous() {
   int r = 0;
   bool purge_remote = cur_entry->purge_remote();
   bool create_fresh = cur_entry->create_fresh();
@@ -1738,24 +1842,63 @@ int SyncMechanism::populate_change_mask(const PeerReplayer::FHandles &fh) {
     return 0;
   }
   if (!create_fresh && !purge_remote) {
-    int pstat_r =
-        ceph_statxat(fh.p_mnt, fh.p_fd, cur_entry->epath.c_str(), &pstx,
-                     CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
-                         CEPH_STATX_SIZE | CEPH_STATX_ATIME | CEPH_STATX_MTIME,
-                     AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
-    if (pstat_r < 0 && pstat_r != -ENOENT && pstat_r != -ENOTDIR) {
-      r = pstat_r;
-      derr << ": failed to stat prev entry= " << cur_entry->epath << ": "
+    if (cur_entry->fh.p_inode_parent || cur_entry->fh.r_inode_parent) {
+      if (!cur_entry->fh.p_inode_parent) {
+        cur_entry->fh.p_mnt = replayer->m_remote_mount;
+        cur_entry->fh.p_perms = replayer->remote_perms;
+        cur_entry->fh.p_inode_current = cur_entry->fh.r_inode_current;
+        cur_entry->fh.p_inode_parent = cur_entry->fh.r_inode_parent;
+      }
+      r = replayer->open_inode(
+          cur_entry->fh.p_mnt, cur_entry->fh.p_inode_parent,
+          cur_entry->dir_name, cur_entry->fh.p_inode_current, pstx,
+          CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID | CEPH_STATX_SIZE |
+              CEPH_STATX_MTIME,
+          cur_entry->fh.p_perms);
+    } else {
+      cur_entry->fh.p_mnt = replayer->m_remote_mount;
+      cur_entry->fh.p_perms = replayer->remote_perms;
+      r = replayer->open_inode(
+          replayer->m_remote_mount, registry->remote_root_inode,
+          cur_entry->epath, cur_entry->fh.p_inode_current, pstx,
+          CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID | CEPH_STATX_SIZE |
+              CEPH_STATX_MTIME,
+          replayer->remote_perms);
+    }
+    if (r < 0 && r != -ENOENT && r != -ENOTDIR) {
+      derr << ": failed to lookup prev entry= " << cur_entry->epath << ": "
            << cpp_strerror(r) << dendl;
       return r;
     }
-    purge_remote = pstat_r == 0 && ((cur_entry->stx.stx_mode & S_IFMT) !=
-                                    (pstx.stx_mode & S_IFMT));
-    create_fresh = (pstat_r < 0);
+    purge_remote = r == 0 && ((cur_entry->stx.stx_mode & S_IFMT) !=
+                              (pstx.stx_mode & S_IFMT));
+    create_fresh = (r < 0);
   }
   replayer->build_change_mask(pstx, cur_entry->stx, create_fresh, purge_remote,
                               cur_entry->change_mask);
   return 0;
+}
+
+int SyncMechanism::populate_remote() {
+  if (cur_entry->fh.p_mnt == replayer->m_remote_mount &&
+      (cur_entry->fh.p_inode_parent || cur_entry->fh.p_inode_current)) {
+    cur_entry->fh.r_inode_current = cur_entry->fh.p_inode_current;
+    cur_entry->fh.r_inode_parent = cur_entry->fh.p_inode_parent;
+    return 0;
+  }
+  if ((!cur_entry->purge_remote() && !cur_entry->create_fresh() &&
+       !cur_entry->stats_changed()) ||
+      cur_entry->fh.r_inode_parent || cur_entry->fh.r_inode_current) {
+    return 0;
+  }
+  int r = replayer->do_remote_walk(cur_entry->ppath,
+                                   cur_entry->fh.r_inode_parent, registry);
+
+  if (r < 0) {
+    derr << ": failed to populate remote entry= " << cur_entry->epath << ": "
+         << cpp_strerror(r) << dendl;
+  }
+  return r;
 }
 
 void DeleteMechanism::finish(int r) {
@@ -1822,7 +1965,7 @@ void PeerReplayer::build_change_mask(const struct ceph_statx &pstx,
   if ((cstx.stx_mode & ~S_IFMT) != (pstx.stx_mode & ~S_IFMT)) {
     change_mask = change_mask | CEPH_STATX_MODE;
   }
-  if (cstx.stx_size != pstx.stx_size) {
+  if (cstx.stx_size != pstx.stx_size && !S_ISDIR(cstx.stx_mode)) {
     change_mask = change_mask | CEPH_STATX_SIZE;
   }
   if (cstx.stx_uid != pstx.stx_uid) {
@@ -1831,7 +1974,7 @@ void PeerReplayer::build_change_mask(const struct ceph_statx &pstx,
   if (cstx.stx_gid != pstx.stx_gid) {
     change_mask = change_mask | CEPH_STATX_GID;
   }
-  if (cstx.stx_mtime != pstx.stx_mtime) {
+  if (cstx.stx_mtime != pstx.stx_mtime && !S_ISDIR(cstx.stx_mode)) {
     change_mask = change_mask | CEPH_STATX_MTIME;
   }
 }
@@ -1879,6 +2022,49 @@ bool DirSyncMechanism::try_spawning(SyncMechanism *syncm) {
   return false;
 }
 
+int DirSyncMechanism::remote_dir_op() {
+  int r = 0;
+  if (cur_entry->create_fresh() || cur_entry->purge_remote()) {
+    r = replayer->remote_mkdir(
+        cur_entry->fh.r_inode_parent, cur_entry->dir_name,
+        cur_entry->fh.r_inode_current, cur_entry->stx, sync_stat);
+
+    if (r < 0 && r != -EEXIST) {
+      derr << ": failed to create remote directory=" << cur_entry->epath << ": "
+           << cpp_strerror(r) << dendl;
+      return r;
+    } else if (r == -EEXIST) {
+      r = replayer->cleanup_remote_entry(cur_entry->fh.r_inode_parent,
+                                         cur_entry->dir_name, cur_entry->epath,
+                                         registry, sync_stat);
+      if (r < 0 && r != -ENOENT) {
+        derr << ": failed to force cleanup existing remote entry="
+             << cur_entry->epath << ": " << cpp_strerror(r) << dendl;
+        return r;
+      }
+      r = replayer->remote_mkdir(
+          cur_entry->fh.r_inode_parent, cur_entry->dir_name,
+          cur_entry->fh.r_inode_current, cur_entry->stx, sync_stat);
+      if (r < 0) {
+        derr << ": failed to create remote directory=" << cur_entry->epath
+             << " after force cleanup: " << cpp_strerror(r) << dendl;
+        return r;
+      }
+    }
+  }
+  r = replayer->sync_attributes(
+      cur_entry->fh.r_inode_parent, cur_entry->dir_name,
+      cur_entry->fh.r_inode_current, cur_entry->stx, cur_entry->change_mask);
+  if (r < 0) {
+    derr << ": failed to sync attributes for remote directory="
+         << cur_entry->epath << ": " << cpp_strerror(r) << dendl;
+    return r;
+  }
+
+  sync_stat->current_stat.inc_dir_scanned_count();
+  return 0;
+}
+
 int DirSnapDiffSync::go_next() {
   int r = 0;
   while (!m_sync_stack.empty()) {
@@ -1896,7 +2082,8 @@ int DirSnapDiffSync::go_next() {
         derr << ": failed to read directory=" << entry->epath << dendl;
         if (replayer->skip_error) {
           registry->set_failed(r);
-          r = 0; break;
+          r = 0;
+          break;
         }
         return r;
       }
@@ -1974,37 +2161,6 @@ int DirSnapDiffSync::sync_current_entry() {
   int r = 0;
   bool failed_prev =
       (sync_stat->synced_snap_count == 0 || sync_stat->nr_failures > 0);
-  /*
-  Our goal here, when this is a fresh syncing we will go for DirSnapDiffSync.
-  When we already know that previous sync failed, then our goal is to, for the
-  unchanged part(same as previous snapshot) we will scan through DirSnapDiffSync
-  for other parts we will scan through DirBruteDiffSync comparing with the
-  remote state(more specifically keeping remote as diff base). With this
-  strategy we will get rid of transferring already transferred file for a failed
-  scenario. Also, we are traversing the unchanged part(between previous and
-  current snapshot) of the tree using snapdiff.
-
-  Scenario when previous sync failed:
-  1. For file, we completely skipped file blockdiff strategy and based on
-    remote we synced the file. Which will eventually save us from already
-    synced file.
-  2. For directory, we used local previous snapshot as diff base for
-    change mask building to find out whether is a newly created entry
-    (or previous snapshot has same entry with different type). Some cases are
-    give below,
-    * If directory doesn't exist in prev snapshot, it might be possible
-      that remote state has some patial subtree under that directory. So
-      we let DirBruteDiffSync class to handle by using remote diff base
-      by sending registry->remotediff_fh.
-    * Same case for when entry type is different in previous snapshot
-    * If both is not the case, then we went for snapdiff optimized strategy.
-
-  Scenario when previous sync didn't fail:
-    For every new entry or entry need to be purged in remote before creating
-    We let DirBruteDiffSync class handle this matter as we know snapdiff
-    has no impact here. And as remote state is not corrupted, we let
-  DirBruteDiffSync class to use local previous snapshot as diff base.
-  */
 
   r = populate_current_stat(fh);
   if (r < 0) {
@@ -2094,7 +2250,8 @@ int DirBruteDiffSync::go_next() {
         derr << ": failed to local read directory=" << entry->epath << dendl;
         if (replayer->skip_error) {
           registry->set_failed(r);
-          r = 0; break;
+          r = 0;
+          break;
         }
         return r;
       }
@@ -2163,52 +2320,63 @@ int DirBruteDiffSync::sync_current_entry() {
   bool failed_prev =
       (sync_stat->synced_snap_count == 0 || sync_stat->nr_failures > 0);
   int r = 0, rem_r = 0;
-  r = populate_current_stat(fh);
+  r = populate_current();
   if (r < 0) {
     return r;
   }
 
-  r = populate_change_mask(fh);
+  r = populate_previous();
   if (r < 0) {
     return r;
   }
 
-  if (failed_prev && fh.p_mnt == m_local &&
+  r = populate_remote();
+  if (r < 0) {
+    return r;
+  }
+
+  if (failed_prev && cur_entry->fh.p_mnt == replayer->m_local_mount &&
       (cur_entry->create_fresh() || cur_entry->purge_remote())) {
     // dout(0) << ": remote fix-->" << cur_entry->epath << dendl;
     cur_entry->reset_change_mask();
-    cur_entry->set_is_snapdiff(false);
-    SyncMechanism *syncm =
-        new DirBruteDiffSync(m_local, std::move(cur_entry), registry, sync_stat,
-                             registry->remotediff_fh, replayer);
+    cur_entry->fh.reset_p_inode();
+    SyncMechanism *syncm = new DirBruteDiffSync(std::move(cur_entry), registry,
+                                                sync_stat, replayer);
     registry->sync_pool->sync_direct(syncm);
     return 0;
   }
 
   if (cur_entry->purge_remote()) {
-    rem_r = replayer->cleanup_remote_entry(
-        cur_entry->epath, registry, fh, sync_stat,
-        cur_entry->wasnt_dir_in_prev_snapshot());
-    if (rem_r < 0 && rem_r != -ENOENT) {
+    r = replayer->cleanup_remote_entry(
+        cur_entry->fh.r_inode_parent, cur_entry->dir_name, cur_entry->epath,
+        registry, sync_stat, cur_entry->wasnt_dir_in_prev_snapshot());
+    if (r < 0 && r != -ENOENT) {
       derr << ": failed to cleanup remote entry=" << cur_entry->epath << ": "
-           << cpp_strerror(rem_r) << dendl;
-      r = rem_r;
+           << cpp_strerror(r) << dendl;
       return r;
     }
+    r = 0;
   }
   if (S_ISDIR(cur_entry->stx.stx_mode)) {
-    r = replayer->remote_mkdir(cur_entry, fh, sync_stat);
+    r = remote_dir_op();
     if (r < 0) {
+      derr << ": failed to sync remote directory=" << cur_entry->epath << ": "
+           << cpp_strerror(r) << dendl;
       return r;
     }
-    sync_stat->current_stat.inc_dir_scanned_count();
   } else {
-    r = replayer->remote_file_op(cur_entry, registry, sync_stat, fh);
-    cur_entry = nullptr;
-    return r;
+    r = remote_file_op();
+    if (r < 0) {
+      derr << ": failed to sync remote file=" << cur_entry->epath << ": "
+           << cpp_strerror(r) << dendl;
+      return r;
+    }
+    return 0;
   }
-  r = opendirat(m_local, fh.c_fd, cur_entry->epath, AT_SYMLINK_NOFOLLOW,
-                &cur_entry->dirp);
+
+  r = ceph_ll_opendir(replayer->m_local_mount,
+                      cur_entry->fh.c_inode_current.get(), &cur_entry->dirp,
+                      replayer->local_perms);
   if (r < 0) {
     derr << ": failed to open local directory=" << cur_entry->epath << ": "
          << cpp_strerror(r) << dendl;
@@ -2223,9 +2391,7 @@ int DirBruteDiffSync::sync_current_entry() {
   */
 
   if (!cur_entry->create_fresh() && !cur_entry->purge_remote()) {
-    r = replayer->propagate_deleted_entries(cur_entry->epath, registry,
-                                            sync_stat, fh, change_mask_map,
-                                            change_mask_map_size);
+    r = propagate_deleted_entries();
     if (r < 0 && r != -ENOENT) {
       derr << ": failed to propagate missing dirs: " << cpp_strerror(r)
            << dendl;
@@ -2290,62 +2456,32 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   dout(0) << ": sync start-->" << dir_root << ",cur_snap= " << current.first
           << ", diff_base=" << (prev ? (*prev).first : "remote") << dendl;
   dout(20) << ": dir_root=" << dir_root << ", current=" << current << dendl;
+
   std::unique_lock<ceph::mutex> lock(m_lock);
   DirRegistry *registry = m_registered.at(dir_root);
+  registry->dir_root = dir_root, registry->failed = registry->canceled = false;
+  registry->failed_reason = 0;
   auto sync_stat = m_snap_sync_stats.at(dir_root);
   lock.unlock();
-  int r = pre_sync_check_and_open_handles(dir_root, current, prev,
-                                          &registry->snapdiff_fh,
-                                          &registry->remotediff_fh);
+
+  FHandles fh;
+  int r = pre_sync_check_and_open_handles(registry, current, prev, &fh);
   if (r < 0) {
     dout(5) << ": cannot proceed with sync: " << cpp_strerror(r) << dendl;
     return r;
   }
-  registry->dir_root = dir_root, registry->failed = registry->canceled = false;
-  registry->failed_reason = 0;
-  FHandles *fh;
-  if (registry->snapdiff_fh.p_fd >= 0) {
-    fh = &registry->snapdiff_fh;
-  } else {
-    fh = &registry->remotediff_fh;
-  }
 
-  auto close_p_fd = [&registry]() {
-    if (registry->snapdiff_fh.p_fd >= 0) {
-      ceph_close(registry->snapdiff_fh.p_mnt, registry->snapdiff_fh.p_fd);
-    }
-    if (registry->remotediff_fh.p_fd >= 0) {
-      ceph_close(registry->remotediff_fh.p_mnt, registry->remotediff_fh.p_fd);
-    }
-  };
-
-  if (registry->snapdiff_fh.p_fd < 0) {
+  if (fh.p_mnt == m_remote_mount) {
     r = set_snap_id_attr(dir_root, "ceph.mirror.diff_base", 0);
     if (r < 0) {
-      ceph_close(m_local_mount, fh->c_fd);
-      close_p_fd();
       return r;
     }
   }
 
-  struct ceph_statx stx;
-  r = ceph_fstatx(m_local_mount, fh->c_fd, &stx,
-                  CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
-                      CEPH_STATX_SIZE | CEPH_STATX_MTIME,
-                  AT_STATX_DONT_SYNC | AT_SYMLINK_NOFOLLOW);
-  if (r < 0) {
-    derr << ": failed to stat snap=" << current.first << ": " << cpp_strerror(r)
-         << dendl;
-    ceph_close(m_local_mount, fh->c_fd);
-    close_p_fd();
-    return r;
-  }
-
-  std::string cur_snap_path = snapshot_path(m_cct, dir_root, current.first);
   void *buf_file_count = malloc(20);
   std::string rfiles = "";
-  int x1 = ceph_getxattr(m_local_mount, cur_snap_path.c_str(),
-                         "ceph.dir.rfiles", buf_file_count, 20);
+  int x1 = ceph_ll_getxattr(m_local_mount, fh.c_inode_parent.get(),
+                            "ceph.dir.rfiles", buf_file_count, 20, local_perms);
   if (x1 < 0) {
     derr << ": failed to read ceph.dir.rfiles xattr for directory=" << dir_root
          << dendl;
@@ -2357,8 +2493,8 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
 
   void *buf_file_bytes = malloc(20);
   std::string rbytes = "";
-  int x2 = ceph_getxattr(m_local_mount, cur_snap_path.c_str(),
-                         "ceph.dir.rbytes", buf_file_bytes, 20);
+  int x2 = ceph_ll_getxattr(m_local_mount, fh.c_inode_parent.get(),
+                            "ceph.dir.rbytes", buf_file_bytes, 20, local_perms);
   if (x2 < 0) {
     derr << ": failed to read ceph.dir.rfiles xattr for directory=" << dir_root
          << dendl;
@@ -2369,7 +2505,6 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   }
 
   SyncMechanism *syncm;
-  std::shared_ptr <SyncEntry> root_entry;
 
   lock.lock();
   dout(0) << ": Number of dir scanning threads=" << dir_scanning_thread
@@ -2383,51 +2518,32 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   registry->sync_pool->activate();
   lock.unlock();
 
-  if (registry->snapdiff_fh.p_fd >= 0) {
-    // dout(0) << ": snapdiff-->" << dendl;
+  std::shared_ptr<SyncEntry> cur_entry;
+  cur_entry = std::make_shared<SyncEntry>("", ".", ".", std::move(fh), 0);
+
+  if (cur_entry->fh.p_mnt == m_local_mount) {
     sync_stat->current_stat.set_diff_base("local_" + (*prev).first);
-    std::shared_ptr<SyncEntry> cur_entry;
-    if (use_snapdiff_api) {
-      cur_entry =
-          std::make_shared<SyncEntry>(".", ceph_snapdiff_info(), stx, 0);
-    } else {
-      cur_entry = std::make_shared<SyncEntry>(".", nullptr, stx, 0, true);
-    }
-    cur_entry->set_stat_known();
-    root_entry = cur_entry;
 
     if (use_snapdiff_api) {
-      dout(0) << ": started syncing of dir_root=" << dir_root << ", using snapdiff api" << dendl;
-      syncm = new DirSnapDiffSync(m_local_mount, std::move(cur_entry), registry,
-                                  sync_stat, registry->snapdiff_fh, this);
+      dout(0) << ": started syncing of dir_root=" << dir_root
+              << ", using snapdiff api" << dendl;
+      syncm =
+          new DirSnapDiffSync(std::move(cur_entry), registry, sync_stat, this);
     } else {
       dout(0) << ": started syncing of dir_root=" << dir_root
               << ", using snapdiff legacy calculation" << dendl;
       syncm =
-          new DirBruteDiffSync(m_local_mount, std::move(cur_entry), registry,
-                               sync_stat, registry->snapdiff_fh, this);
+          new DirBruteDiffSync(std::move(cur_entry), registry, sync_stat, this);
     }
   } else {
     dout(0) << ": started syncing of dir_root=" << dir_root
             << ", using remote as diff base" << dendl;
     sync_stat->current_stat.set_diff_base("remote");
-    std::shared_ptr<SyncEntry> cur_entry =
-        std::make_shared<SyncEntry>(".", nullptr, stx, 0, false);
-    cur_entry->set_stat_known();
-    root_entry = cur_entry;
-    syncm = new DirBruteDiffSync(m_local_mount, std::move(cur_entry), registry,
-                                 sync_stat, registry->remotediff_fh, this);
+    syncm =
+        new DirBruteDiffSync(std::move(cur_entry), registry, sync_stat, this);
   }
   registry->sync_pool->sync_anyway(syncm);
   registry->wait_for_sync_finish();
-  if (!prev || registry->snapdiff_fh.p_fd < 0 || !use_snapdiff_api) {
-    if (root_entry->dirp &&
-        ceph_closedir(m_local_mount, root_entry->dirp) < 0) {
-      derr << ": failed to close local directory=." << dendl;
-    }
-  } else if (ceph_close_snapdiff(&root_entry->info) < 0) {
-    derr << ": failed to close local directory=." << dendl;
-  }
 
   should_backoff(registry, &r);
   if (registry->failed) {
@@ -2442,18 +2558,6 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   sync_stat->reset_stats(r);
   lock.unlock();
 
-  dout(20) << " cur:" << fh->c_fd
-           << " prev:" << fh->p_fd
-           << " ret = " << r
-           << dendl;
-
-  // @FHandles.r_fd_dir_root is closed in @unregister_directory since
-  // its used to acquire an exclusive lock on remote dir_root.
-
-  // c_fd has been used in ceph_fdopendir call so
-  // there is no need to close this fd manually.
-  ceph_close(m_local_mount, fh->c_fd);
-  close_p_fd();
   dout(0) << ": sync done-->" << dir_root << ", " << current.first << dendl;
 
   return r;
