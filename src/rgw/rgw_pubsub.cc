@@ -299,6 +299,7 @@ void rgw_pubsub_dest::dump(Formatter *f) const
   encode_json("time_to_live", time_to_live!=DEFAULT_GLOBAL_VALUE? std::to_string(time_to_live): DEFAULT_CONFIG, f);
   encode_json("max_retries", max_retries!=DEFAULT_GLOBAL_VALUE? std::to_string(max_retries): DEFAULT_CONFIG, f);
   encode_json("retry_sleep_duration", retry_sleep_duration!=DEFAULT_GLOBAL_VALUE? std::to_string(retry_sleep_duration): DEFAULT_CONFIG, f);
+  encode_json("num_shards", num_shards, f);
 }
 
 void rgw_pubsub_dest::dump_xml(Formatter *f) const
@@ -358,6 +359,11 @@ void rgw_pubsub_dest::decode_json(JSONObj* f) {
   retry_sleep_duration = sleep_dur == DEFAULT_CONFIG ? DEFAULT_GLOBAL_VALUE
                                                      : std::stoul(sleep_dur);
 
+  // num_shards defaults to 1 for backward compatibility with pre-sharding topics
+  JSONDecoder::decode_json("num_shards", num_shards, f);
+  if (num_shards == 0 && persistent) {
+    num_shards = 1;
+  }
 }
 
 ShardNamesView rgw_pubsub_dest::get_shard_names() const {

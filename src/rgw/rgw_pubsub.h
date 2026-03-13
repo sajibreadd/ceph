@@ -266,7 +266,7 @@ struct rgw_pubsub_dest {
   uint32_t max_retries;
   uint32_t retry_sleep_duration;
   // naming convention of sharded queues in the 'notif' pool -> persistent_queue, persistent_queue.1, persistent_queue.(num_shards -1)...
-  uint64_t num_shards; //defaults to a single shard for now, for backward compatibility
+  uint64_t num_shards = 0; // 0 shards means non-persistent, will be set from config on CreateTopic
 
 
   void encode(bufferlist& bl) const {
@@ -322,6 +322,11 @@ struct rgw_pubsub_dest {
     }
     if (struct_v >= 8) { 
       decode(num_shards, bl);
+    } else if (persistent) {
+      // persistent topics created before v8 used a single shard
+      num_shards = 1;
+    } else {
+      num_shards = 0;
     }
 
     DECODE_FINISH(bl);
