@@ -6,7 +6,7 @@ Reef is the 18th stable release of Ceph. It is named after the reef squid (Sepio
 
 v18.2.8 Reef
 ============
-This is the eigth backport release in the Reef series. We recommend that all users update to this release.
+This is the eighth, and expected to be last, backport release in the Reef series. We recommend that all users update to this release.
 
 Release Date
 ------------
