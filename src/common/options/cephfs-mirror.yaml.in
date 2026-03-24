@@ -136,7 +136,7 @@ options:
   level: advanced
   desc: take lates snapshot for syncing
   long_desc: take lates snapshot for syncing
-  default: true
+  default: false
   services:
   - cephfs-mirror
 - name: cephfs_mirror_thread_pool_queue_size
@@ -185,7 +185,7 @@ options:
   desc: if this true, mirror daemon will use snapdiff api for snapshot diff
   long_desc: if this true, mirror daemon will use snapdiff api for snapshot diff
       calculation otherwise it will use legacy way of snapshot diff calculation
-  default: false
+  default: true
   services:
   - cephfs-mirror
 - name: cephfs_mirror_lock_directory_before_sync
@@ -230,6 +230,22 @@ options:
   level: advanced
   desc: if this true, mirror daemon will skip the error and keep syncing
   long_desc: if this true, mirror daemon will skip the error and keep syncing
+  default: false
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_use_low_level_api
+  type: bool
+  level: advanced
+  desc: if this true, mirror daemon will use low level apis
+  long_desc: if this true, mirror daemon will use low level apis
+  default: true
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_use_at_statx_dont_sync
+  type: bool
+  level: advanced
+  desc: if this true, mirror daemon will use AT_STATX_DONT_SYNC
+  long_desc: if this true, mirror daemon will use AT_STATX_DONT_SYNC
   default: true
   services:
   - cephfs-mirror

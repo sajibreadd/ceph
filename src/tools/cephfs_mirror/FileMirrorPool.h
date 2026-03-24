@@ -25,7 +25,7 @@ class FileMirrorPool : public md_config_obs_t{
     void activate();
     void deactivate();
     void sync_file_data(FileSyncMechanism *task, int sync_idx);
-    int sync_start(const std::string &dir_root);
+    int sync_start(const std::string &dir_root, bool low_level = false);
     void sync_finish(int idx, const std::string &dir_root);
     void update_state(int thread_count);
     void drain_queue(int idx = -1);
@@ -48,6 +48,7 @@ class FileMirrorPool : public md_config_obs_t{
         FILE_OPEN_REMOTE,
         FILE_READ,
         FILE_WRITE,
+        FILE_FTRUNC,
         FILE_FSYNC,
         FREE_BUFFER,
         FILE_CLOSE_REMOTE,
@@ -83,6 +84,7 @@ class FileMirrorPool : public md_config_obs_t{
       std::string dir_root;
       std::queue<FileSyncMechanism *> sync_queue;
       std::condition_variable give_cv;
+      bool low_level = false;
       SyncQueue(const std::string &dir_root) : dir_root(dir_root) {}
       SyncQueue(const SyncQueue &other)
           : dir_root(other.dir_root), sync_queue(other.sync_queue) {}
@@ -95,6 +97,8 @@ class FileMirrorPool : public md_config_obs_t{
         return *this;
       }
       void drain_queue();
+      void set_low_level(bool _low_level) { low_level = _low_level; }
+      bool get_low_level() { return low_level; }
     };
 
     void run(FileWorker* file_worker);

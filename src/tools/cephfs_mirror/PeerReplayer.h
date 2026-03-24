@@ -51,13 +51,15 @@ struct SnapSyncStat {
     uint64_t rbytes;
     std::string diff_base = "";
     std::atomic<uint64_t> files_in_flight{0};
-    std::atomic<uint64_t> files_synced{0};
+    std::atomic<uint64_t> files_data_synced{0};
+    std::atomic<uint64_t> files_attr_synced{0};
     std::atomic<uint64_t> files_deleted{0};
     std::atomic<uint64_t> files_skipped{0};
     std::atomic<uint64_t> file_bytes_synced{0};
     std::atomic<uint64_t> dir_created{0};
     std::atomic<uint64_t> dir_deleted{0};
     std::atomic<uint64_t> dir_scanned{0};
+    std::atomic<uint64_t> dir_attr_synced{0};
     std::atomic<uint64_t> cache_hit{0};
     boost::optional<monotime> start_time;
     SyncStat() : start_time(boost::none) {}
@@ -65,13 +67,15 @@ struct SnapSyncStat {
         : rfiles(other.rfiles), rbytes(other.rbytes),
           diff_base(other.diff_base),
           files_in_flight(other.files_in_flight.load()),
-          files_synced(other.files_synced.load()),
+          files_data_synced(other.files_data_synced.load()),
+          files_attr_synced(other.files_attr_synced.load()),
           files_deleted(other.files_deleted.load()),
           files_skipped(other.files_skipped.load()),
           file_bytes_synced(other.file_bytes_synced.load()),
           dir_created(other.dir_created.load()),
           dir_deleted(other.dir_deleted.load()),
           dir_scanned(other.dir_scanned.load()),
+          dir_attr_synced(other.dir_attr_synced.load()),
           cache_hit(other.cache_hit.load()) {}
     SyncStat &operator=(const SyncStat &other) {
       if (this != &other) { // Self-assignment check
@@ -79,48 +83,82 @@ struct SnapSyncStat {
         rbytes = other.rbytes;
         diff_base = other.diff_base;
         files_in_flight.store(other.files_in_flight.load());
-        files_synced.store(other.files_synced.load());
+        files_data_synced.store(other.files_data_synced.load());
+        files_attr_synced.store(other.files_attr_synced.load());
         files_deleted.store(other.files_deleted.load());
         files_skipped.store(other.files_skipped.load());
         file_bytes_synced.store(other.file_bytes_synced.load());
         dir_created.store(other.dir_created.load());
         dir_deleted.store(other.dir_deleted.load());
         dir_scanned.store(other.dir_scanned.load());
+        dir_attr_synced.store(other.dir_attr_synced.load());
         cache_hit.store(other.cache_hit.load());
       }
       return *this;
     }
-    inline void inc_cache_hit() { cache_hit++; }
-    inline void inc_file_del_count() { files_deleted++; }
-    inline void inc_file_skipped_count() { files_skipped++; }
-    inline void inc_files_synced(bool data_synced, uint64_t file_size) {
-      files_synced++;
-      if (data_synced) {
-        file_bytes_synced += file_size;
-      }
+    inline void inc_cache_hit() {
+      cache_hit.fetch_add(1, std::memory_order_relaxed);
+    }
+    inline void inc_file_del_count() {
+      files_deleted.fetch_add(1, std::memory_order_relaxed);
+    }
+    inline void inc_file_skipped_count() {
+      files_skipped.fetch_add(1, std::memory_order_relaxed);
+    }
+    inline void inc_file_data_synced_count(uint64_t file_size) {
+      files_data_synced.fetch_add(1, std::memory_order_relaxed);
+      file_bytes_synced.fetch_add(file_size, std::memory_order_relaxed);
+    }
+    inline void inc_file_attr_synced_count() {
+      files_attr_synced.fetch_add(1, std::memory_order_relaxed);
     }
     inline void set_diff_base(const std::string &_diff_base) {
       diff_base = _diff_base;
     }
-    inline void inc_file_in_flight_count() { files_in_flight++; }
-    inline void dec_file_in_flight_count() { files_in_flight--; }
-    inline void inc_dir_created_count() { dir_created++; }
-    inline void inc_dir_deleted_count() { dir_deleted++; }
-    inline void inc_dir_scanned_count() { dir_scanned++; }
+    inline void inc_file_in_flight_count() {
+      files_in_flight.fetch_add(1, std::memory_order_relaxed);
+    }
+    inline void dec_file_in_flight_count() {
+      files_in_flight.fetch_sub(1, std::memory_order_relaxed);
+    }
+    inline void inc_dir_created_count() {
+      dir_created.fetch_add(1, std::memory_order_relaxed);
+    }
+    inline void inc_dir_deleted_count() {
+      dir_deleted.fetch_add(1, std::memory_order_relaxed);
+    }
+    inline void inc_dir_scanned_count() {
+      dir_scanned.fetch_add(1, std::memory_order_relaxed);
+    }
+    inline void inc_dir_attr_synced_count() {
+      dir_attr_synced.fetch_add(1, std::memory_order_relaxed);
+    }
     inline void start_timer() { start_time = clock::now(); }
     void dump(Formatter *f) {
       f->dump_unsigned("rfiles", rfiles);
       f->dump_unsigned("rbytes", rbytes);
       f->dump_string("diff_base", diff_base);
-      f->dump_unsigned("files_in_flight", files_in_flight.load());
-      f->dump_unsigned("files_synced", files_synced.load());
-      f->dump_unsigned("files_deleted", files_deleted.load());
-      f->dump_unsigned("files_skipped", files_skipped.load());
-      f->dump_unsigned("files_bytes_synced", file_bytes_synced.load());
-      f->dump_unsigned("dir_created", dir_created);
-      f->dump_unsigned("dir_scanned", dir_scanned);
-      f->dump_unsigned("dir_deleted", dir_deleted);
-      f->dump_unsigned("cache_hit", cache_hit);
+      f->dump_unsigned("files_in_flight",
+                       files_in_flight.load(std::memory_order_relaxed));
+      f->dump_unsigned("files_data_synced",
+                       files_data_synced.load(std::memory_order_relaxed));
+      f->dump_unsigned("files_attr_synced",
+                       files_attr_synced.load(std::memory_order_relaxed));
+      f->dump_unsigned("files_deleted",
+                       files_deleted.load(std::memory_order_relaxed));
+      f->dump_unsigned("files_skipped",
+                       files_skipped.load(std::memory_order_relaxed));
+      f->dump_unsigned("files_bytes_synced",
+                       file_bytes_synced.load(std::memory_order_relaxed));
+      f->dump_unsigned("dir_created",
+                       dir_created.load(std::memory_order_relaxed));
+      f->dump_unsigned("dir_scanned",
+                       dir_scanned.load(std::memory_order_relaxed));
+      f->dump_unsigned("dir_deleted",
+                       dir_deleted.load(std::memory_order_relaxed));
+      f->dump_unsigned("dir_attr_synced",
+                       dir_attr_synced.load(std::memory_order_relaxed));
+      f->dump_unsigned("cache_hit", cache_hit.load(std::memory_order_relaxed));
       if (start_time) {
         std::chrono::duration<double> duration = clock::now() - *start_time;
         double time_elapsed = duration.count();
@@ -128,7 +166,8 @@ struct SnapSyncStat {
         double speed = 0;
         std::string syncing_speed = "";
         if (time_elapsed > 0) {
-          speed = (file_bytes_synced * 8.0) / time_elapsed;
+          speed = (file_bytes_synced.load(std::memory_order_relaxed) * 8.0) /
+                  time_elapsed;
           if (speed >= (double)1e9) {
             syncing_speed = std::to_string(speed / (double)1e9) + "Gbps";
           } else if (speed >= (double)1e6) {
@@ -190,6 +229,7 @@ struct SnapSyncStat {
 
 class SyncMechanism;
 class DeleteMechanism;
+class LL_DeleteMechanism;
 class FileSyncMechanism;
 class DirSyncMechanism;
 class DirBruteDiffSync;
@@ -226,6 +266,7 @@ public:
   void reopen_logs();
   friend class SyncMechanism;
   friend class DeleteMechanism;
+  friend class LL_DeleteMechanism;
   friend class FileSyncMechanism;
   friend class DirSyncMechanism;
   friend class DirBruteDiffSync;
@@ -238,7 +279,7 @@ private:
   inline static const std::string SERVICE_DAEMON_RECOVERED_DIR_COUNT_KEY = "recovery_count";
 
   bool start_syncing = false;
-  bool use_snapdiff_api = false;
+  bool use_snapdiff_api = true;
   bool lock_directory_before_sync = false;
   uint64_t remote_timeout = 0;
   uint64_t local_timeout = 0;
@@ -248,7 +289,10 @@ private:
   uint64_t thread_pool_queue_size = 5000;
   uint64_t max_element_in_cache_per_thread = 1000000;
   uint64_t max_consecutive_failures_before_remote_sync = 2;
-  bool skip_error = true;
+  bool skip_error = false;
+  bool use_low_level_api = true;
+  bool use_at_statx_dont_sync = true;
+  unsigned int sync_flags = AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC;
 
       // file descriptor "triplet" for synchronizing a snapshot
   // w/ an added MountRef for accessing "previous" snapshot.
@@ -256,6 +300,13 @@ private:
   using SnapshotPair = std::pair<Snapshot, Snapshot>;
   class DirSyncPool;
   struct FHandles {
+    struct LL_Fhandle_Info {
+      InodeSharedPtr c_parent_inode = nullptr, c_inode = nullptr;
+      InodeSharedPtr p_parent_inode = nullptr, p_inode = nullptr;
+      InodeSharedPtr r_parent_inode = nullptr, r_inode = nullptr;
+      std::string c_path = "", p_path = "", r_path = "";
+      UserPermRef p_perms;
+    }ll_info;
     // open file descriptor on the snap directory for snapshot
     // currently being synchronized. Always use this fd with
     // @m_local_mount.
@@ -290,7 +341,7 @@ private:
     std::unique_ptr<DirSyncPool> sync_pool = nullptr;
     void set_failed(int r) {
       ceph_assert(r < 0);
-      if (failed) {
+      if (failed || canceled) {
         return;
       }
       failed.store(true);
@@ -312,7 +363,24 @@ private:
     }
   };
 
+  struct CacheInfo {
+    InodeSharedPtr p_inode = nullptr;
+    struct ceph_statx pstx;
+    CacheInfo() {}
+    CacheInfo(InodeSharedPtr &&p_inode, const struct ceph_statx &pstx)
+        : p_inode(std::move(p_inode)), pstx(pstx) {}
+  };
+
   struct SyncEntry {
+    // ll_info
+    FHandles fh;
+    struct ceph_statx pstx;
+    bool pstat_known = false;
+    DirUniquePtr udirp = nullptr;
+    std::unordered_map<std::string, PeerReplayer::CacheInfo> cache_map;
+    int prev_d_type = -1;
+    // ll_info
+
     static const unsigned int PURGE_REMOTE = (1 << 20);
     static const unsigned int CREATE_FRESH = (1 << 21);
     static const unsigned int WASNT_DIR_IN_PREV_SNAPSHOT = (1 << 22);
@@ -334,9 +402,14 @@ private:
 
     SyncEntry() {}
 
-    SyncEntry(std::string_view path) : epath(path) {}
+    SyncEntry(const std::string& path) : epath(path) {}
 
-    SyncEntry(std::string_view path, const struct ceph_statx &stx)
+    SyncEntry(std::string &&path) : epath(std::move(path)) {}
+
+    SyncEntry(std::string &&path, const struct ceph_statx &stx)
+        : epath(std::move(path)), stx(stx) {}
+
+    SyncEntry(const std::string &path, const struct ceph_statx &stx)
         : epath(path), stx(stx) {}
     SyncEntry(std::string_view path, ceph_dir_result *dirp,
               const struct ceph_statx &stx)
@@ -374,6 +447,8 @@ private:
     bool wasnt_dir_in_prev_snapshot() {
       return (change_mask & WASNT_DIR_IN_PREV_SNAPSHOT);
     }
+
+    void rollout(FHandles &parent_fh, const std::string &ename);
   };
 
   class DirSyncPool {
@@ -392,6 +467,8 @@ private:
       f->dump_unsigned("dir_sync_queue_size", sync_queue.size());
     }
     void update_qlimit(int _qlimit);
+    void set_low_level(bool _low_level) { low_level = _low_level; }
+    bool get_low_level() { return low_level; }
     friend class PeerReplayer;
 
   private:
@@ -418,6 +495,7 @@ private:
     int qlimit;
     std::string epath;
     const Peer &m_peer; // just for using dout
+    bool low_level = false;
   };
 
   bool is_stopping() {
@@ -503,10 +581,13 @@ private:
   Filesystem m_filesystem;
   Peer m_peer;
   // probably need to be encapsulated when supporting cancelations
+  InodeSharedPtr local_root_inode = nullptr, remote_root_inode = nullptr; 
   std::map<std::string, DirRegistry*> m_registered;
   std::vector<std::string> m_directories, m_deleted_directories;
   std::map<std::string, std::shared_ptr<SnapSyncStat>> m_snap_sync_stats;
   MountRef m_local_mount;
+  UserPermRef m_local_perms, m_remote_perms;
+  InodeSharedPtr m_local_root_inode = nullptr, m_remote_root_inode = nullptr;
   ServiceDaemon *m_service_daemon;
   PeerReplayerAdminSocketHook *m_asok_hook = nullptr;
 
@@ -538,7 +619,7 @@ private:
       const std::string &dir_root,
       const std::map<uint64_t, std::pair<std::string, std::string>> &snaps);
   int propagate_deleted_entries(
-      const std::string &epath, DirRegistry *registry,
+      const  std::string &epath, DirRegistry *registry,
       std::shared_ptr<SnapSyncStat> &sync_stat, const FHandles &fh,
       std::unordered_map<std::string, unsigned int> &change_mask_map,
       int &change_mask_map_size);
@@ -550,6 +631,13 @@ private:
   int should_sync_entry(const std::string &epath, const struct ceph_statx &cstx,
                         const FHandles &fh, bool *need_data_sync, bool *need_attr_sync);
 
+  int ll_open_inode(MountRef mnt, InodeSharedPtr &parent_inode,
+                    const std::string &dir_path, InodeSharedPtr &inode_shared,
+                    struct ceph_statx &stx, unsigned int want,
+                    UserPermRef perms);
+  int ll_open_dirp(MountRef mnt, InodeSharedPtr &inode, DirUniquePtr &udirp,
+                   UserPermRef perms);
+
   int open_dir(MountRef mnt, const std::string &dir_path, boost::optional<uint64_t> snap_id);
   int pre_sync_check_and_open_handles(const std::string &dir_root,
                                       const Snapshot &current,
@@ -557,10 +645,22 @@ private:
                                       FHandles *snapdiff_fh,
                                       FHandles *remotediff_fh);
 
+  int ll_pre_sync_check_and_open_registry_inodes(const std::string &dir_root,
+                                                 const Snapshot &current,
+                                                 boost::optional<Snapshot> prev,
+                                                 DirRegistry *registry);
+
   int do_synchronize(const std::string &dir_root, const Snapshot &current,
                      boost::optional<Snapshot> prev);
   int do_synchronize(const std::string &dir_root, const Snapshot &current) {
     return do_synchronize(dir_root, current, boost::none);
+  }
+  int get_r_stats(const std::string &dir_path, uint64_t &rfiles,
+                  uint64_t &rbytes);
+  int ll_do_synchronize(const std::string &dir_root, const Snapshot &current,
+                        boost::optional<Snapshot> prev);
+  int ll_do_synchronize(const std::string &dir_root, const Snapshot &current) {
+    return ll_do_synchronize(dir_root, current, boost::none);
   }
 
   int synchronize(const std::string &dir_root, const Snapshot &current,
@@ -613,14 +713,19 @@ public:
       : m_local(m_local), m_peer(replayer->m_peer),
         cur_entry(std::move(cur_entry)), registry(registry),
         sync_stat(sync_stat), fh(fh), replayer(replayer) {}
+  SyncMechanism(MountRef m_local,
+                const std::shared_ptr<PeerReplayer::SyncEntry> &cur_entry,
+                PeerReplayer::DirRegistry *registry,
+                std::shared_ptr<SnapSyncStat> &sync_stat,
+                const PeerReplayer::FHandles &fh, PeerReplayer *replayer)
+      : m_local(m_local), m_peer(replayer->m_peer), cur_entry(cur_entry),
+        registry(registry), sync_stat(sync_stat), fh(fh), replayer(replayer) {}
 
   void sync_in_flight() { registry->inc_sync_indicator(); }
   bool sync_failed_or_canceled() {
     return (registry->failed || registry->canceled);
   }
-  std::shared_ptr<PeerReplayer::SyncEntry> &&move_cur_entry() {
-    return std::move(cur_entry);
-  }
+  friend class DirSyncMechanism;
 
 protected:
   MountRef m_local;
@@ -632,6 +737,17 @@ protected:
   PeerReplayer *replayer;
   int populate_change_mask(const PeerReplayer::FHandles &fh);
   int populate_current_stat(const PeerReplayer::FHandles &fh);
+  int ll_populate_cur_stat_and_cur_inode();
+  int ll_populate_prev_stat_and_prev_inode();
+  int ll_update_remote_stat();
+  int ll_populate_remote_inode();
+  bool ll_populate_remote_inode_with_diff_base();
+  int ll_remote_file_op();
+  int ll_unlink_cur_file_entry();
+  int ll_unlink_cur_dir_entry();
+  int ll_cleanup_remote_entry();
+  int ll_remote_mkdir();
+  int ll_propagate_deleted_entries(int &cache_size);
 };
 
 class DeleteMechanism : public SyncMechanism {
@@ -649,6 +765,26 @@ public:
 private:
   void finish(int r) override;
   int not_dir = -1;
+};
+
+class LL_DeleteMechanism : public SyncMechanism {
+public:
+  LL_DeleteMechanism(MountRef m_local,
+                     std::shared_ptr<PeerReplayer::SyncEntry> &&cur_entry,
+                     PeerReplayer::DirRegistry *registry,
+                     std::shared_ptr<SnapSyncStat> &sync_stat,
+                     const PeerReplayer::FHandles &fh, PeerReplayer *replayer)
+      : SyncMechanism(m_local, std::move(cur_entry), registry, sync_stat, fh,
+                      replayer) {}
+  LL_DeleteMechanism(MountRef m_local,
+                     const std::shared_ptr<PeerReplayer::SyncEntry> &cur_entry,
+                     PeerReplayer::DirRegistry *registry,
+                     std::shared_ptr<SnapSyncStat> &sync_stat,
+                     const PeerReplayer::FHandles &fh, PeerReplayer *replayer)
+      : SyncMechanism(m_local, cur_entry, registry, sync_stat, fh, replayer) {}
+
+private:
+  void finish(int r) override;
 };
 
 class FileSyncMechanism : public SyncMechanism {
@@ -674,6 +810,8 @@ public:
 private:
   void finish(int r) override;
   int sync_file();
+  int ll_sync_file();
+  int ll_copy_to_remote();
   FileMirrorPool::FileWorker* file_worker;
 };
 
@@ -690,13 +828,17 @@ public:
 protected:
   void finish(int r) override;
   int sync_tree();
+  int ll_sync_tree();
   bool try_spawning(SyncMechanism *syncm);
   std::stack<std::shared_ptr<PeerReplayer::SyncEntry>> m_sync_stack;
 
 private:
   virtual void finish_sync() = 0;
   virtual int go_next() = 0;
+  virtual int ll_go_next() = 0;
   virtual int sync_current_entry() = 0;
+  virtual int ll_sync_current_entry() = 0;
+  virtual void ll_finish_sync() = 0;
 };
 
 class DirBruteDiffSync : public DirSyncMechanism {
@@ -713,9 +855,13 @@ private:
   std::stack<std::unordered_map<std::string, unsigned int>>
       m_change_mask_map_stack;
   int change_mask_map_size = 0;
+  int cache_size = 0;
   void finish_sync() override;
   int go_next() override;
+  int ll_go_next() override;
   int sync_current_entry() override;
+  int ll_sync_current_entry() override;
+  void ll_finish_sync() override {}
 };
 
 class DirSnapDiffSync : public DirSyncMechanism {
@@ -731,8 +877,11 @@ public:
 private:
   void finish_sync() override;
   int go_next() override;
+  int ll_go_next() override;
   int sync_current_entry() override;
+  int ll_sync_current_entry() override;
   bool should_delete_current_entry(int not_dir = -1);
+  void ll_finish_sync() override;
 };
 
 } // namespace mirror

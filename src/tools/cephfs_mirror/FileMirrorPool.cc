@@ -16,13 +16,14 @@ namespace cephfs {
 namespace mirror {
 
 std::string FileMirrorPool::FileWorker::state_name[] = {
-    "LOCKCONTEST",       "IDLE",
-    "CONSUME",           "EXECUTE",
-    "BACKOFF_CHECK1",    "BACKOFF_CHECK2",
-    "FILE_OPEN_LOCAL",   "FILE_OPEN_REMOTE",
-    "FILE_READ",         "FILE_WRITE",
-    "FILE_FSYNC",        "FREE_BUFFER",
-    "FILE_CLOSE_REMOTE", "FILE_CLOSE_LOCAL"};
+    "LOCKCONTEST",     "IDLE",
+    "CONSUME",         "EXECUTE",
+    "BACKOFF_CHECK1",  "BACKOFF_CHECK2",
+    "FILE_OPEN_LOCAL", "FILE_OPEN_REMOTE",
+    "FILE_READ",       "FILE_WRITE",
+    "FILE_FTRUNC",     "FILE_FSYNC",
+    "FREE_BUFFER",     "FILE_CLOSE_REMOTE",
+    "FILE_CLOSE_LOCAL"};
 
 FileMirrorPool::FileMirrorPool(int num_threads)
     : num_threads(num_threads), qlimit(std::max(10 * num_threads, 5000)),
@@ -116,7 +117,7 @@ void FileMirrorPool::run(FileWorker *file_worker) {
       task->set_worker_ref(file_worker);
     }
     sq->give_cv.notify_one();
-    task->complete(0);
+    task->complete(sq->get_low_level());
   }
 }
 
@@ -138,7 +139,7 @@ void FileMirrorPool::sync_file_data(FileSyncMechanism *task, int sync_idx) {
   pick_cv.notify_one();
 }
 
-int FileMirrorPool::sync_start(const std::string &dir_root) {
+int FileMirrorPool::sync_start(const std::string &dir_root, bool low_level) {
   std::scoped_lock lock(mtx);
   int sync_idx = 0;
   if (!unassigned_sync_ids.empty()) {
@@ -146,10 +147,12 @@ int FileMirrorPool::sync_start(const std::string &dir_root) {
     delete sync_queues[sync_idx];
     sync_queues[sync_idx] = nullptr;
     sync_queues[sync_idx] = new SyncQueue(dir_root);
+    sync_queues[sync_idx]->set_low_level(low_level);
     unassigned_sync_ids.pop_back();
   } else {
     sync_idx = sync_count++;
     sync_queues.emplace_back(new SyncQueue(dir_root));
+    sync_queues.back()->set_low_level(low_level);
   }
   return sync_idx;
 }
