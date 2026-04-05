@@ -301,9 +301,12 @@ private:
   class DirSyncPool;
   struct FHandles {
     struct LL_Fhandle_Info {
-      InodeSharedPtr c_parent_inode = nullptr, c_inode = nullptr;
-      InodeSharedPtr p_parent_inode = nullptr, p_inode = nullptr;
-      InodeSharedPtr r_parent_inode = nullptr, r_inode = nullptr;
+      std::vector<InodeSharedPtr> c_parent_inode = {nullptr};
+      InodeSharedPtr c_inode = nullptr;
+      std::vector<InodeSharedPtr> p_parent_inode = {nullptr};
+      InodeSharedPtr p_inode = nullptr;
+      std::vector<InodeSharedPtr> r_parent_inode = {nullptr};
+      InodeSharedPtr r_inode = nullptr;
       std::string c_path = "", p_path = "", r_path = "";
       UserPermRef p_perms;
     }ll_info;

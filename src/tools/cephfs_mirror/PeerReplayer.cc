@@ -964,15 +964,16 @@ int PeerReplayer::_remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry,
 }
 
 int SyncMechanism::ll_remote_mkdir() {
-  ceph_assert(cur_entry->fh.ll_info.r_parent_inode != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
   ceph_assert(cur_entry->fh.ll_info.r_inode == nullptr);
   int r = 0;
   InodeRawPtr raw_inode = nullptr;
   struct ceph_statx rstx;
-  r = ceph_ll_mkdir(
-      replayer->m_remote_mount, cur_entry->fh.ll_info.r_parent_inode.get(),
-      cur_entry->fh.ll_info.r_path.c_str(), cur_entry->stx.stx_mode & ~S_IFDIR,
-      &raw_inode, &rstx, 0, replayer->sync_flags, replayer->m_remote_perms);
+  r = ceph_ll_mkdir(replayer->m_remote_mount,
+                    cur_entry->fh.ll_info.r_parent_inode.back().get(),
+                    cur_entry->fh.ll_info.r_path.c_str(),
+                    cur_entry->stx.stx_mode & ~S_IFDIR, &raw_inode, &rstx, 0,
+                    replayer->sync_flags, replayer->m_remote_perms);
   if (r < 0) {
     return r;
   }
@@ -980,7 +981,7 @@ int SyncMechanism::ll_remote_mkdir() {
   cur_entry->fh.ll_info.r_inode =
       create_inode_shared_ptr(replayer->m_remote_mount, raw_inode);
   sync_stat->current_stat.inc_dir_created_count();
-  dout(0) << ": --->" << cur_entry->epath << dendl;
+  // dout(0) << ": --->" << cur_entry->epath << dendl;
   return 0;
 }
 
@@ -1008,6 +1009,7 @@ int PeerReplayer::remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry,
 #define NR_IOVECS 4 // # iovecs
 #define IOVEC_SIZE (1024 * 1024) // buffer size for each iovec
 int FileSyncMechanism::ll_copy_to_remote() {
+  // dout(0) << ": 1--->" << cur_entry->epath << dendl;
   uint64_t total_read = 0, total_wrote = 0;
   int r = 0;
   file_worker->state = FileMirrorPool::FileWorker::ThreadState::BACKOFF_CHECK1;
@@ -1017,6 +1019,8 @@ int FileSyncMechanism::ll_copy_to_remote() {
   file_worker->state = FileMirrorPool::FileWorker::ThreadState::FILE_OPEN_LOCAL;
   FhRawPtr fh_raw = nullptr;
   ceph_assert(cur_entry->fh.ll_info.c_inode != nullptr);
+  // dout(0) << ": --->" << cur_entry->epath
+  //         << ", in=" << cur_entry->fh.ll_info.c_inode.get() << dendl;
   r = ceph_ll_open(replayer->m_local_mount, cur_entry->fh.ll_info.c_inode.get(),
                    O_RDONLY | O_NOFOLLOW, &fh_raw, replayer->m_local_perms);
   if (r < 0) {
@@ -1036,13 +1040,14 @@ int FileSyncMechanism::ll_copy_to_remote() {
     ll_populate_remote_inode_with_diff_base();
   }
   if (cur_entry->fh.ll_info.r_inode == nullptr) {
-    ceph_assert(cur_entry->fh.ll_info.r_parent_inode != nullptr);
+    ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
     InodeRawPtr inode_raw = nullptr;
-    r = ceph_ll_create(
-        replayer->m_remote_mount, cur_entry->fh.ll_info.r_parent_inode.get(),
-        cur_entry->fh.ll_info.r_path.c_str(), cur_entry->stx.stx_mode,
-        O_CREAT | O_WRONLY | O_NOFOLLOW, &inode_raw, &fh_raw, &rstx, 0,
-        replayer->sync_flags, replayer->m_remote_perms);
+    r = ceph_ll_create(replayer->m_remote_mount,
+                       cur_entry->fh.ll_info.r_parent_inode.back().get(),
+                       cur_entry->fh.ll_info.r_path.c_str(),
+                       cur_entry->stx.stx_mode, O_CREAT | O_WRONLY | O_NOFOLLOW,
+                       &inode_raw, &fh_raw, &rstx, 0, replayer->sync_flags,
+                       replayer->m_remote_perms);
     if (r < 0) {
       derr << ": failed to create remote file path="
            << abs_path(registry->dir_root, cur_entry->epath) << ": "
@@ -1136,7 +1141,7 @@ int FileSyncMechanism::ll_copy_to_remote() {
   sync_stat->current_stat.inc_file_data_synced_count(cur_entry->stx.stx_size);
 free_ptr:
   free(ptr);
-  dout(0) << ": --->" << cur_entry->epath << dendl;
+  // dout(0) << ": 2--->" << cur_entry->epath << dendl;
   return (r < 0 ? r : 0);
 }
 int PeerReplayer::copy_to_remote(std::shared_ptr<SyncEntry> &cur_entry,
@@ -1274,10 +1279,11 @@ void PeerReplayer::enqueue_file_transfer(
 }
 
 int SyncMechanism::ll_unlink_cur_file_entry() {
-  ceph_assert(cur_entry->fh.ll_info.r_parent_inode != nullptr);
-  int r = ceph_ll_unlink(
-      replayer->m_remote_mount, cur_entry->fh.ll_info.r_parent_inode.get(),
-      cur_entry->fh.ll_info.r_path.c_str(), replayer->m_remote_perms);
+  ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
+  int r = ceph_ll_unlink(replayer->m_remote_mount,
+                         cur_entry->fh.ll_info.r_parent_inode.back().get(),
+                         cur_entry->fh.ll_info.r_path.c_str(),
+                         replayer->m_remote_perms);
   if (r < 0 && r != -ENOENT) {
     return r;
   }
@@ -1286,15 +1292,16 @@ int SyncMechanism::ll_unlink_cur_file_entry() {
     cur_entry->fh.ll_info.p_inode = nullptr;
   }
   sync_stat->current_stat.inc_file_del_count();
-  dout(0) << ": --->" << cur_entry->epath << dendl;
+  // dout(0) << ": --->" << cur_entry->epath << dendl;
   return 0;
 }
 
 int SyncMechanism::ll_unlink_cur_dir_entry() {
-  ceph_assert(cur_entry->fh.ll_info.r_parent_inode != nullptr);
-  int r = ceph_ll_rmdir(
-      replayer->m_remote_mount, cur_entry->fh.ll_info.r_parent_inode.get(),
-      cur_entry->fh.ll_info.r_path.c_str(), replayer->m_remote_perms);
+  ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
+  int r = ceph_ll_rmdir(replayer->m_remote_mount,
+                        cur_entry->fh.ll_info.r_parent_inode.back().get(),
+                        cur_entry->fh.ll_info.r_path.c_str(),
+                        replayer->m_remote_perms);
   if (r < 0 && r != -ENOENT) {
     return r;
   }
@@ -1302,7 +1309,7 @@ int SyncMechanism::ll_unlink_cur_dir_entry() {
   if (fh.p_mnt == replayer->m_remote_mount) {
     cur_entry->fh.ll_info.p_inode = nullptr;
   }
-  dout(0) << ": --->" << cur_entry->epath << dendl;
+  // dout(0) << ": --->" << cur_entry->epath << dendl;
   sync_stat->current_stat.inc_dir_deleted_count();
   return 0;
 }
@@ -1310,11 +1317,11 @@ int SyncMechanism::ll_unlink_cur_dir_entry() {
 int SyncMechanism::ll_remote_file_op() {
   struct ceph_statx& cstx = cur_entry->stx;
   struct ceph_statx& pstx = cur_entry->pstx;
-  if (S_ISREG(cstx.stx_mode)) {
-    dout(0) << ": file--->" << cur_entry->epath << dendl;
-  } else if (S_ISLNK(cstx.stx_mode)) {
-    dout(0) << ": link--->" << cur_entry->epath << dendl;
-  }
+  // if (S_ISREG(cstx.stx_mode)) {
+  //   dout(0) << ": file--->" << cur_entry->epath << dendl;
+  // } else if (S_ISLNK(cstx.stx_mode)) {
+  //   dout(0) << ": link--->" << cur_entry->epath << dendl;
+  // }
   bool need_data_sync =
       cur_entry->create_fresh() || cur_entry->purge_remote() ||
       (cstx.stx_mtime != pstx.stx_mtime) || (cstx.stx_size != pstx.stx_size);
@@ -1354,10 +1361,11 @@ int SyncMechanism::ll_remote_file_op() {
       struct ceph_statx rstx;
       InodeRawPtr link_raw = nullptr;
       target[cstx.stx_size] = '\0';
-      r = ceph_ll_symlink(
-          replayer->m_remote_mount, cur_entry->fh.ll_info.r_parent_inode.get(),
-          cur_entry->fh.ll_info.r_path.c_str(), target, &link_raw, &rstx, 0,
-          replayer->sync_flags, replayer->m_remote_perms);
+      r = ceph_ll_symlink(replayer->m_remote_mount,
+                          cur_entry->fh.ll_info.r_parent_inode.back().get(),
+                          cur_entry->fh.ll_info.r_path.c_str(), target,
+                          &link_raw, &rstx, 0, replayer->sync_flags,
+                          replayer->m_remote_perms);
 
       if (r < 0 && r != -EEXIST) {
         derr << ": failed to do low level symlink on remote cur entry="
@@ -1464,9 +1472,9 @@ int PeerReplayer::remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
 }
 
 int SyncMechanism::ll_cleanup_remote_entry() {
-  dout(0) << ": --->" << cur_entry->epath << dendl;
+  // dout(0) << ": --->" << cur_entry->epath << dendl;
   int r = 0;
-  ceph_assert(cur_entry->fh.ll_info.r_parent_inode != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
   if (cur_entry->prev_d_type != DT_DIR) {
     r = ll_unlink_cur_file_entry();
     if (r == 0) {
@@ -1781,7 +1789,7 @@ int PeerReplayer::should_sync_entry(const std::string &epath, const struct ceph_
 }
 
 int SyncMechanism::ll_propagate_deleted_entries(int &cache_size) {
-  dout(0) << ": --->" << cur_entry->epath << dendl;
+  // dout(0) << ": --->" << cur_entry->epath << dendl;
   ceph_assert(cur_entry->fh.ll_info.p_inode != nullptr);
   ceph_assert(cur_entry->fh.ll_info.c_inode != nullptr);
   int r = 0;
@@ -2064,10 +2072,12 @@ int PeerReplayer::ll_pre_sync_check_and_open_registry_inodes(
   std::size_t pos = dir_root.find_first_not_of('/');
   std::string cur_path = (pos == std::string::npos ? "." : dir_root.substr(pos));
   auto cur_snap_path = snapshot_path(m_cct, cur_path, current.first);
+
   struct ceph_statx stx;
+
   int r = ll_open_inode(m_local_mount, m_local_root_inode, cur_snap_path,
-                        registry->remotediff_fh.ll_info.c_parent_inode, stx, 0,
-                        m_local_perms);
+                        registry->remotediff_fh.ll_info.c_parent_inode.back(),
+                        stx, 0, m_local_perms);
 
   if (r < 0) {
     derr << ": error occurred while doing low level opening of local inode of "
@@ -2084,8 +2094,8 @@ int PeerReplayer::ll_pre_sync_check_and_open_registry_inodes(
   if (prev) {
     auto prev_snap_path = snapshot_path(m_cct, cur_path, (*prev).first);
     r = ll_open_inode(m_local_mount, m_local_root_inode, prev_snap_path,
-                      registry->snapdiff_fh.ll_info.p_parent_inode, stx, 0,
-                      m_local_perms);
+                      registry->snapdiff_fh.ll_info.p_parent_inode.back(), stx,
+                      0, m_local_perms);
     if (r < 0) {
       derr << ": error occurred while doing low level opening of local inode "
               "of dir="
@@ -2095,8 +2105,8 @@ int PeerReplayer::ll_pre_sync_check_and_open_registry_inodes(
     registry->snapdiff_fh.ll_info.p_perms = m_local_perms;
   }
   r = ll_open_inode(m_remote_mount, m_remote_root_inode, cur_path,
-                    registry->remotediff_fh.ll_info.r_parent_inode, stx, 0,
-                    m_remote_perms);
+                    registry->remotediff_fh.ll_info.r_parent_inode.back(), stx,
+                    0, m_remote_perms);
   if (r < 0) {
     derr << ": error occurred while opening remote low level inode of dir="
          << dir_root << " : " << cpp_strerror(r) << dendl;
@@ -2110,17 +2120,17 @@ int PeerReplayer::ll_pre_sync_check_and_open_registry_inodes(
   registry->remotediff_fh.ll_info.p_perms = m_remote_perms;
 
   registry->snapdiff_fh.ll_info.c_inode =
-      registry->snapdiff_fh.ll_info.c_parent_inode;
+      registry->snapdiff_fh.ll_info.c_parent_inode.back();
   registry->snapdiff_fh.ll_info.p_inode =
-      registry->snapdiff_fh.ll_info.p_parent_inode;
+      registry->snapdiff_fh.ll_info.p_parent_inode.back();
   registry->snapdiff_fh.ll_info.r_inode =
-      registry->snapdiff_fh.ll_info.r_parent_inode;
+      registry->snapdiff_fh.ll_info.r_parent_inode.back();
   registry->remotediff_fh.ll_info.c_inode =
-      registry->remotediff_fh.ll_info.c_parent_inode;
+      registry->remotediff_fh.ll_info.c_parent_inode.back();
   registry->remotediff_fh.ll_info.p_inode =
-      registry->remotediff_fh.ll_info.p_parent_inode;
+      registry->remotediff_fh.ll_info.p_parent_inode.back();
   registry->remotediff_fh.ll_info.r_inode =
-      registry->remotediff_fh.ll_info.r_parent_inode;
+      registry->remotediff_fh.ll_info.r_parent_inode.back();
   return 0;
 }
 
@@ -2378,7 +2388,7 @@ void PeerReplayer::DirSyncPool::update_qlimit(int _qlimit) {
 bool SyncMechanism::ll_populate_remote_inode_with_diff_base() {
   if (fh.p_mnt == replayer->m_remote_mount &&
       cur_entry->fh.ll_info.p_inode != nullptr) {
-    ceph_assert(cur_entry->fh.ll_info.p_parent_inode != nullptr);
+    ceph_assert(cur_entry->fh.ll_info.p_parent_inode.back() != nullptr);
     cur_entry->fh.ll_info.r_parent_inode = cur_entry->fh.ll_info.p_parent_inode;
     cur_entry->fh.ll_info.r_inode = cur_entry->fh.ll_info.p_inode;
     cur_entry->fh.ll_info.r_path = cur_entry->fh.ll_info.p_path;
@@ -2390,14 +2400,14 @@ bool SyncMechanism::ll_populate_remote_inode_with_diff_base() {
 int SyncMechanism::ll_populate_remote_inode() {
   int r = 0;
   if (cur_entry->fh.ll_info.r_inode != nullptr) {
-    ceph_assert(cur_entry->fh.ll_info.r_parent_inode != nullptr);
+    ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
     return 0;
   }
-  if (!ll_populate_remote_inode_with_diff_base()){
-    ceph_assert(cur_entry->fh.ll_info.r_parent_inode != nullptr);
+  if (!ll_populate_remote_inode_with_diff_base()) {
+    ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
     struct ceph_statx rstx;
     r = replayer->ll_open_inode(
-        replayer->m_remote_mount, cur_entry->fh.ll_info.r_parent_inode,
+        replayer->m_remote_mount, cur_entry->fh.ll_info.r_parent_inode.back(),
         cur_entry->fh.ll_info.r_path, cur_entry->fh.ll_info.r_inode, rstx, 0,
         replayer->m_remote_perms);
     if (r < 0) {
@@ -2468,19 +2478,19 @@ int SyncMechanism::ll_update_remote_stat() {
   } else {
     sync_stat->current_stat.inc_dir_attr_synced_count();
   }
-  dout(0) << ": --->" << cur_entry->epath << dendl;
+  // dout(0) << ": --->" << cur_entry->epath << dendl;
   return 0;
 }
 
 int SyncMechanism::ll_populate_cur_stat_and_cur_inode() {
-  dout(0) << ": 1--->" << cur_entry->epath << dendl;
+  // dout(0) << ": 1--->" << cur_entry->epath << dendl;
   int r = 0;
   int mask = CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
              CEPH_STATX_SIZE | CEPH_STATX_MTIME;
   if (cur_entry->fh.ll_info.c_inode == nullptr) {
-    ceph_assert(cur_entry->fh.ll_info.c_parent_inode != nullptr);
+    ceph_assert(cur_entry->fh.ll_info.c_parent_inode.back() != nullptr);
     r = replayer->ll_open_inode(
-        replayer->m_local_mount, cur_entry->fh.ll_info.c_parent_inode,
+        replayer->m_local_mount, cur_entry->fh.ll_info.c_parent_inode.back(),
         cur_entry->fh.ll_info.c_path, cur_entry->fh.ll_info.c_inode,
         cur_entry->stx, (cur_entry->stat_known ? 0 : mask),
         replayer->m_local_perms);
@@ -2505,7 +2515,7 @@ int SyncMechanism::ll_populate_cur_stat_and_cur_inode() {
     }
   }
   cur_entry->stat_known = true;
-  dout(0) << ": 2--->" << cur_entry->epath << dendl;
+  // dout(0) << ": 2--->" << cur_entry->epath << dendl;
   return 0;
 }
 
@@ -2536,19 +2546,19 @@ int SyncMechanism::ll_populate_prev_stat_and_prev_inode() {
   bool create_fresh = cur_entry->create_fresh();
   int mask = CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
              CEPH_STATX_SIZE | CEPH_STATX_MTIME;
-  dout(0) << ": 1--->" << cur_entry->epath << ", purge_remote=" << purge_remote
-          << ", create_fresh=" << create_fresh << dendl;
+  // dout(0) << ": 1--->" << cur_entry->epath << ", purge_remote=" << purge_remote
+  //         << ", create_fresh=" << create_fresh << dendl;
 
   if (create_fresh || (purge_remote && cur_entry->prev_d_type != -1)) {
     return 0;
   }
   if (cur_entry->fh.ll_info.p_inode == nullptr) {
-    ceph_assert(cur_entry->fh.ll_info.p_parent_inode != nullptr);
-    r = replayer->ll_open_inode(fh.p_mnt, cur_entry->fh.ll_info.p_parent_inode,
-                                cur_entry->fh.ll_info.p_path,
-                                cur_entry->fh.ll_info.p_inode, cur_entry->pstx,
-                                (cur_entry->pstat_known ? 0 : mask),
-                                fh.ll_info.p_perms);
+    ceph_assert(cur_entry->fh.ll_info.p_parent_inode.back() != nullptr);
+    r = replayer->ll_open_inode(
+        fh.p_mnt, cur_entry->fh.ll_info.p_parent_inode.back(),
+        cur_entry->fh.ll_info.p_path, cur_entry->fh.ll_info.p_inode,
+        cur_entry->pstx, (cur_entry->pstat_known ? 0 : mask),
+        fh.ll_info.p_perms);
     if (r < 0 && r != -ENOENT) {
       derr << ": failed to do low level openning of diff base's cur entry= "
            << (fh.p_mnt == replayer->m_local_mount
@@ -2587,8 +2597,8 @@ int SyncMechanism::ll_populate_prev_stat_and_prev_inode() {
                       : ((!S_ISDIR(cur_entry->pstx.stx_mode)) ? (int)DT_REG
                                                               : (int)DT_DIR));
   cur_entry->pstat_known = true;
-  dout(0) << ": 2--->" << cur_entry->epath << ", purge_remote=" << purge_remote
-          << ", create_fresh=" << create_fresh << dendl;
+  // dout(0) << ": 2--->" << cur_entry->epath << ", purge_remote=" << purge_remote
+  //         << ", create_fresh=" << create_fresh << dendl;
   return 0;
 }
 
@@ -2662,10 +2672,10 @@ notify_finish:
 int FileSyncMechanism::ll_sync_file() {
   int r = ll_copy_to_remote();
   if (r < 0) {
-    derr << ": failed to copy cur entry="
-         << abs_path(registry->dir_root, cur_entry->epath, fh.m_current.first,
-                     replayer->m_cct)
-         << ": " << cpp_strerror(r) << dendl;
+    // derr << ": failed to copy cur entry="
+    //      << abs_path(registry->dir_root, cur_entry->epath, fh.m_current.first,
+    //                  replayer->m_cct)
+    //      << ": " << cpp_strerror(r) << dendl;
     return r;
   }
   return 0;
@@ -2795,28 +2805,31 @@ bool DirSyncMechanism::try_spawning(SyncMechanism *syncm) {
 }
 
 void PeerReplayer::SyncEntry::rollout(FHandles &parent_fh,
-                                               const std::string &ename) {
+                                      const std::string &ename) {
   if (parent_fh.ll_info.c_inode != nullptr) {
-    fh.ll_info.c_parent_inode = parent_fh.ll_info.c_inode;
+    fh.ll_info.c_parent_inode = parent_fh.ll_info.c_parent_inode;
+    fh.ll_info.c_parent_inode.push_back(parent_fh.ll_info.c_inode);
     fh.ll_info.c_path = ename;
   } else {
-    ceph_assert(parent_fh.ll_info.c_parent_inode != nullptr);
+    ceph_assert(parent_fh.ll_info.c_parent_inode.back() != nullptr);
     fh.ll_info.c_parent_inode = parent_fh.ll_info.c_parent_inode;
     fh.ll_info.c_path = std::move(entry_path(parent_fh.ll_info.c_path, ename));
   }
   if (parent_fh.ll_info.p_inode != nullptr) {
-    fh.ll_info.p_parent_inode = parent_fh.ll_info.p_inode;
+    fh.ll_info.p_parent_inode = parent_fh.ll_info.p_parent_inode;
+    fh.ll_info.p_parent_inode.push_back(parent_fh.ll_info.p_inode);
     fh.ll_info.p_path = ename;
   } else {
-    ceph_assert(parent_fh.ll_info.p_parent_inode != nullptr);
+    ceph_assert(parent_fh.ll_info.p_parent_inode.back() != nullptr);
     fh.ll_info.p_parent_inode = parent_fh.ll_info.p_parent_inode;
     fh.ll_info.p_path = std::move(entry_path(parent_fh.ll_info.p_path, ename));
   }
   if (parent_fh.ll_info.r_inode != nullptr) {
-    fh.ll_info.r_parent_inode = parent_fh.ll_info.r_inode;
+    fh.ll_info.r_parent_inode = parent_fh.ll_info.r_parent_inode;
+    fh.ll_info.r_parent_inode.push_back(parent_fh.ll_info.r_inode);
     fh.ll_info.r_path = ename;
   } else {
-    ceph_assert(parent_fh.ll_info.r_parent_inode != nullptr);
+    ceph_assert(parent_fh.ll_info.r_parent_inode.back() != nullptr);
     fh.ll_info.r_parent_inode = parent_fh.ll_info.r_parent_inode;
     fh.ll_info.r_path = std::move(entry_path(parent_fh.ll_info.r_path, ename));
   }
@@ -3022,7 +3035,7 @@ int DirSnapDiffSync::go_next() {
 }
 
 int DirSnapDiffSync::ll_sync_current_entry() {
-  dout(0) << ": --->" << cur_entry->epath << dendl;
+  // dout(0) << ": --->" << cur_entry->epath << dendl;
   ceph_assert(fh.p_mnt == replayer->m_local_mount);
   int r = 0;
   bool failed_prev =
@@ -3402,9 +3415,9 @@ int DirBruteDiffSync::go_next() {
 }
 
 int DirBruteDiffSync::ll_sync_current_entry() {
-  dout(0) << ": --->" << cur_entry->epath << ", "
-          << ((fh.p_mnt == replayer->m_remote_mount) ? "remote" : "local")
-          << dendl;
+  // dout(0) << ": --->" << cur_entry->epath << ", "
+  //         << ((fh.p_mnt == replayer->m_remote_mount) ? "remote" : "local")
+  //         << dendl;
   int r = 0;
   bool failed_prev =
       (sync_stat->synced_snap_count == 0 || sync_stat->nr_failures > 0);
@@ -3685,6 +3698,8 @@ int PeerReplayer::ll_do_synchronize(const std::string &dir_root,
       << ", cephfs_mirror_use_low_level_api=" << use_low_level_api
       << ", cephfs_mirror_use_at_statx_dont_sync=" << use_at_statx_dont_sync
       << dendl;
+  // ceph_assert(sync_flags == AT_SYMLINK_NOFOLLOW);
+  // sync_flags = AT_SYMLINK_NOFOLLOW;
 
   dout(0) << ": sync start-->" << dir_root << ",cur_snap= " << current.first
           << ", diff_base=" << (prev ? (*prev).first : "remote") << dendl;
@@ -3703,7 +3718,7 @@ int PeerReplayer::ll_do_synchronize(const std::string &dir_root,
          << ": " << cpp_strerror(r) << dendl;
     return r;
   }
-  if (registry->snapdiff_fh.ll_info.p_parent_inode == nullptr) {
+  if (registry->snapdiff_fh.ll_info.p_parent_inode.back() == nullptr) {
     r = set_snap_id_attr(dir_root, "ceph.mirror.diff_base", 0);
     if (r < 0) {
       return r;
@@ -3728,13 +3743,14 @@ int PeerReplayer::ll_do_synchronize(const std::string &dir_root,
   SyncMechanism *syncm = nullptr;
   std::shared_ptr<SyncEntry> cur_entry =
       std::make_shared<SyncEntry>("");
-  cur_entry->fh = (registry->snapdiff_fh.ll_info.p_parent_inode == nullptr)
-                           ? registry->remotediff_fh
-                           : registry->snapdiff_fh;
+  cur_entry->fh =
+      (registry->snapdiff_fh.ll_info.p_parent_inode.back() == nullptr)
+          ? registry->remotediff_fh
+          : registry->snapdiff_fh;
 
   std::shared_ptr <SyncEntry> root_entry = cur_entry;
 
-  if (registry->snapdiff_fh.ll_info.p_parent_inode != nullptr) {
+  if (registry->snapdiff_fh.ll_info.p_parent_inode.back() != nullptr) {
     if (use_snapdiff_api) {
       sync_stat->current_stat.set_diff_base("ll_local_snapdiff_diff_base_" +
                                             (*prev).first);
@@ -3771,6 +3787,7 @@ int PeerReplayer::ll_do_synchronize(const std::string &dir_root,
   registry->file_sync_queue_idx = -2;
   registry->sync_pool->deactivate();
   registry->sync_pool = nullptr;
+  // sync_stat->reset_stats(r);
   lock.unlock();
   dout(0) << ": sync done-->" << dir_root << ", " << current.first << dendl;
   return r;
