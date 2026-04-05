@@ -3,8 +3,8 @@
 
 #include <string>
 #include <vector>
+#include "DentryRef.h"
 
-class Dentry;
 struct Inode;
 
 class Dir {
@@ -13,7 +13,7 @@ class Dir {
   ceph::unordered_map<std::string, Dentry*> dentries;
   unsigned num_null_dentries = 0;
 
-  std::vector<Dentry*> readdir_cache;
+  std::vector<DentryRef> readdir_cache;
 
   explicit Dir(Inode* in) { parent_inode = in; }
 

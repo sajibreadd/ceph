@@ -1489,7 +1489,8 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
 	dirp->cache_index++;
       }
       // add to cached result list
-      dirp->buffer.push_back(dir_result_t::dentry(dn->offset, dname, dn->alternate_name, in));
+      dirp->buffer.push_back(
+          dir_result_t::dentry(dn->offset, dname, dn->alternate_name, in, dn));
       ldout(cct, 15) << __func__ << "  " << hex << dn->offset << dec << ": '" << dname << "' -> " << in->ino << dendl;
     }
 
@@ -9248,7 +9249,7 @@ int Client::_readdir_get_frag(int op, dir_result_t* dirp,
 }
 
 struct dentry_off_lt {
-  bool operator()(const Dentry* dn, int64_t off) const {
+  bool operator()(const DentryRef& dn, int64_t off) const {
     return dir_result_t::fpos_cmp(dn->offset, off) < 0;
   }
 };
@@ -9269,7 +9270,7 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     return 0;
   }
 
-  vector<Dentry*>::iterator pd = std::lower_bound(dir->readdir_cache.begin(),
+  vector<DentryRef>::iterator pd = std::lower_bound(dir->readdir_cache.begin(),
 						  dir->readdir_cache.end(),
 						  dirp->offset, dentry_off_lt());
 
@@ -9280,7 +9281,7 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
       return -CEPHFS_EAGAIN;
     if (pd == dir->readdir_cache.end())
       break;
-    Dentry *dn = *pd;
+    Dentry *dn = pd->get();
     if (dn->inode == NULL) {
       ldout(cct, 15) << " skipping null '" << dn->name << "'" << dendl;
       ++pd;
@@ -12517,6 +12518,9 @@ int Client::_ll_put(Inode *in, uint64_t num)
       ceph_assert(p->second > 0);
       if (--p->second == 0)
 	ll_snap_ref.erase(p);
+    }
+    if (in->dir) {
+      in->dir->readdir_cache.clear();
     }
     put_inode(in);
     return 0;
