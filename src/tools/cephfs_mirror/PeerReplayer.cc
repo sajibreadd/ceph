@@ -603,7 +603,9 @@ void PeerReplayer::shutdown() {
     }
     dout(0) << ": All threads joined" << dendl;
   }
+  locker.lock();
   m_cond.notify_all();
+  locker.unlock();
 
   scanner_thread->join();
   dout(0) << ": scanner threads joined" << dendl;
@@ -3125,10 +3127,12 @@ int DirSnapDiffSync::ll_sync_current_entry() {
     cur_entry = nullptr;
     return 0;
   }
-
-  r = ceph_open_snapdiff(replayer->m_local_mount, registry->dir_root.c_str(),
-                         cur_entry->epath.c_str(), (*fh.m_prev).first.c_str(),
-                         fh.m_current.first.c_str(), &cur_entry->info);
+  ceph_assert(cur_entry->fh.ll_info.p_inode != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.c_inode != nullptr);
+  r = ceph_ll_open_snapdiff(replayer->m_local_mount,
+                            cur_entry->fh.ll_info.p_inode.get(),
+                            cur_entry->fh.ll_info.c_inode.get(),
+                            &cur_entry->info, replayer->m_local_perms);
 
   if (r != 0) {
     derr << ": failed to do low level openning of snapdiff between diff base's "
