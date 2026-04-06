@@ -249,3 +249,14 @@ options:
   default: true
   services:
   - cephfs-mirror
+- name: cephfs_mirror_stat_flush_counter_gap
+  type: uint
+  level: advanced
+  desc: for each thread local stat will be flushed into global stat
+    after counter gap is this
+  long_desc: for each thread local stat will be flushed into global stat
+    after counter gap is this
+  default: 100
+  services:
+  - cephfs-mirror
+  min: 0

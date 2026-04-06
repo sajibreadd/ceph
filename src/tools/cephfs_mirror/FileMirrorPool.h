@@ -15,6 +15,8 @@ namespace cephfs {
 namespace mirror {
 
 class FileSyncMechanism;
+class SnapSyncStat;
+class LocalSyncStat;
 
 class FileMirrorPool : public md_config_obs_t{
   public:
@@ -25,7 +27,9 @@ class FileMirrorPool : public md_config_obs_t{
     void activate();
     void deactivate();
     void sync_file_data(FileSyncMechanism *task, int sync_idx);
-    int sync_start(const std::string &dir_root, bool low_level = false);
+    int sync_start(const std::string &dir_root,
+                   const std::shared_ptr<SnapSyncStat> &sync_stat,
+                   bool low_level = false);
     void sync_finish(int idx, const std::string &dir_root);
     void update_state(int thread_count);
     void drain_queue(int idx = -1);
@@ -85,9 +89,19 @@ class FileMirrorPool : public md_config_obs_t{
       std::queue<FileSyncMechanism *> sync_queue;
       std::condition_variable give_cv;
       bool low_level = false;
-      SyncQueue(const std::string &dir_root) : dir_root(dir_root) {}
+      std::shared_ptr<SnapSyncStat> sync_stat = nullptr;
+      LocalSyncStat* local_stat = nullptr;
+      SyncQueue(const std::string &dir_root,
+                const std::shared_ptr<SnapSyncStat> &sync_stat);
+      ~SyncQueue() {
+        if (local_stat) {
+          delete local_stat;
+          local_stat = nullptr;
+        }
+      }
       SyncQueue(const SyncQueue &other)
-          : dir_root(other.dir_root), sync_queue(other.sync_queue) {}
+          : dir_root(other.dir_root), sync_queue(other.sync_queue),
+            sync_stat(other.sync_stat), local_stat(local_stat) {}
 
       SyncQueue& operator=(const SyncQueue& other) {
         if (this != &other) {

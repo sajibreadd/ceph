@@ -20,7 +20,6 @@ namespace mirror {
 class FSMirror;
 class PeerReplayerAdminSocketHook;
 class ServiceDaemon;
-
 struct SnapSyncStat {
   std::atomic <uint64_t> nr_failures = 0; // number of consecutive failures
   boost::optional<monotime> last_failed; // lat failed timestamp
@@ -50,12 +49,13 @@ struct SnapSyncStat {
     uint64_t rfiles;
     uint64_t rbytes;
     std::string diff_base = "";
-    std::atomic<uint64_t> files_in_flight{0};
-    std::atomic<uint64_t> files_data_synced{0};
+    uint64_t files_in_flight = 0;
+    uint64_t files_data_synced = 0;
     std::atomic<uint64_t> files_attr_synced{0};
     std::atomic<uint64_t> files_deleted{0};
     std::atomic<uint64_t> files_skipped{0};
-    std::atomic<uint64_t> file_bytes_synced{0};
+    uint64_t file_bytes_synced = 0;
+    std::atomic<uint64_t> symlink_synced{0};
     std::atomic<uint64_t> dir_created{0};
     std::atomic<uint64_t> dir_deleted{0};
     std::atomic<uint64_t> dir_scanned{0};
@@ -66,12 +66,13 @@ struct SnapSyncStat {
     SyncStat(const SyncStat &other)
         : rfiles(other.rfiles), rbytes(other.rbytes),
           diff_base(other.diff_base),
-          files_in_flight(other.files_in_flight.load()),
-          files_data_synced(other.files_data_synced.load()),
+          files_in_flight(other.files_in_flight),
+          files_data_synced(other.files_data_synced),
           files_attr_synced(other.files_attr_synced.load()),
           files_deleted(other.files_deleted.load()),
           files_skipped(other.files_skipped.load()),
-          file_bytes_synced(other.file_bytes_synced.load()),
+          file_bytes_synced(other.file_bytes_synced),
+          symlink_synced(other.symlink_synced.load()),
           dir_created(other.dir_created.load()),
           dir_deleted(other.dir_deleted.load()),
           dir_scanned(other.dir_scanned.load()),
@@ -82,12 +83,13 @@ struct SnapSyncStat {
         rfiles = other.rfiles;
         rbytes = other.rbytes;
         diff_base = other.diff_base;
-        files_in_flight.store(other.files_in_flight.load());
-        files_data_synced.store(other.files_data_synced.load());
+        files_in_flight = other.files_in_flight;
+        files_data_synced = other.files_data_synced;
         files_attr_synced.store(other.files_attr_synced.load());
         files_deleted.store(other.files_deleted.load());
         files_skipped.store(other.files_skipped.load());
-        file_bytes_synced.store(other.file_bytes_synced.load());
+        file_bytes_synced = other.file_bytes_synced;
+        symlink_synced.store(other.symlink_synced.load());
         dir_created.store(other.dir_created.load());
         dir_deleted.store(other.dir_deleted.load());
         dir_scanned.store(other.dir_scanned.load());
@@ -96,60 +98,52 @@ struct SnapSyncStat {
       }
       return *this;
     }
-    inline void inc_cache_hit() {
-      cache_hit.fetch_add(1, std::memory_order_relaxed);
+    inline void inc_cache_hit(uint64_t val = 1) {
+      cache_hit.fetch_add(val, std::memory_order_relaxed);
     }
-    inline void inc_file_del_count() {
-      files_deleted.fetch_add(1, std::memory_order_relaxed);
+    inline void inc_files_deleted_count(uint64_t val = 1) {
+      files_deleted.fetch_add(val, std::memory_order_relaxed);
     }
-    inline void inc_file_skipped_count() {
-      files_skipped.fetch_add(1, std::memory_order_relaxed);
+    inline void inc_files_skipped_count(uint64_t val = 1) {
+      files_skipped.fetch_add(val, std::memory_order_relaxed);
     }
-    inline void inc_file_data_synced_count(uint64_t file_size) {
-      files_data_synced.fetch_add(1, std::memory_order_relaxed);
-      file_bytes_synced.fetch_add(file_size, std::memory_order_relaxed);
-    }
-    inline void inc_file_attr_synced_count() {
-      files_attr_synced.fetch_add(1, std::memory_order_relaxed);
+    inline void inc_files_attr_synced_count(uint64_t val = 1) {
+      files_attr_synced.fetch_add(val, std::memory_order_relaxed);
     }
     inline void set_diff_base(const std::string &_diff_base) {
       diff_base = _diff_base;
     }
-    inline void inc_file_in_flight_count() {
-      files_in_flight.fetch_add(1, std::memory_order_relaxed);
+    inline void inc_dir_created_count(uint64_t val = 1) {
+      dir_created.fetch_add(val, std::memory_order_relaxed);
     }
-    inline void dec_file_in_flight_count() {
-      files_in_flight.fetch_sub(1, std::memory_order_relaxed);
+    inline void inc_dir_deleted_count(uint64_t val = 1) {
+      dir_deleted.fetch_add(val, std::memory_order_relaxed);
     }
-    inline void inc_dir_created_count() {
-      dir_created.fetch_add(1, std::memory_order_relaxed);
+    inline void inc_dir_scanned_count(uint64_t val = 1) {
+      dir_scanned.fetch_add(val, std::memory_order_relaxed);
     }
-    inline void inc_dir_deleted_count() {
-      dir_deleted.fetch_add(1, std::memory_order_relaxed);
+    inline void inc_dir_attr_synced_count(uint64_t val = 1) {
+      dir_attr_synced.fetch_add(val, std::memory_order_relaxed);
     }
-    inline void inc_dir_scanned_count() {
-      dir_scanned.fetch_add(1, std::memory_order_relaxed);
-    }
-    inline void inc_dir_attr_synced_count() {
-      dir_attr_synced.fetch_add(1, std::memory_order_relaxed);
+    inline void inc_symlink_synced_count() {
+      symlink_synced.fetch_add(1, std::memory_order_relaxed);
     }
     inline void start_timer() { start_time = clock::now(); }
     void dump(Formatter *f) {
       f->dump_unsigned("rfiles", rfiles);
       f->dump_unsigned("rbytes", rbytes);
       f->dump_string("diff_base", diff_base);
-      f->dump_unsigned("files_in_flight",
-                       files_in_flight.load(std::memory_order_relaxed));
-      f->dump_unsigned("files_data_synced",
-                       files_data_synced.load(std::memory_order_relaxed));
+      f->dump_unsigned("files_in_flight", files_in_flight);
+      f->dump_unsigned("files_data_synced", files_data_synced);
       f->dump_unsigned("files_attr_synced",
                        files_attr_synced.load(std::memory_order_relaxed));
       f->dump_unsigned("files_deleted",
                        files_deleted.load(std::memory_order_relaxed));
       f->dump_unsigned("files_skipped",
                        files_skipped.load(std::memory_order_relaxed));
-      f->dump_unsigned("files_bytes_synced",
-                       file_bytes_synced.load(std::memory_order_relaxed));
+      f->dump_unsigned("files_bytes_synced", file_bytes_synced);
+      f->dump_unsigned("symlink_synced",
+                       symlink_synced.load(std::memory_order_relaxed));
       f->dump_unsigned("dir_created",
                        dir_created.load(std::memory_order_relaxed));
       f->dump_unsigned("dir_scanned",
@@ -166,8 +160,7 @@ struct SnapSyncStat {
         double speed = 0;
         std::string syncing_speed = "";
         if (time_elapsed > 0) {
-          speed = (file_bytes_synced.load(std::memory_order_relaxed) * 8.0) /
-                  time_elapsed;
+          speed = (file_bytes_synced * 8.0) / time_elapsed;
           if (speed >= (double)1e9) {
             syncing_speed = std::to_string(speed / (double)1e9) + "Gbps";
           } else if (speed >= (double)1e6) {
@@ -224,6 +217,133 @@ struct SnapSyncStat {
     f->dump_unsigned("snaps_synced", synced_snap_count);
     f->dump_unsigned("snaps_deleted", deleted_snap_count);
     f->dump_unsigned("snaps_renamed", renamed_snap_count);
+  }
+};
+
+struct LocalSyncStat {
+  uint64_t files_attr_synced{0};
+  uint64_t files_deleted{0};
+  uint64_t files_skipped{0};
+  uint64_t dir_created{0};
+  uint64_t dir_deleted{0};
+  uint64_t dir_scanned{0};
+  uint64_t dir_attr_synced{0};
+  uint64_t cache_hit{0};
+  LocalSyncStat() = default;
+  LocalSyncStat(const LocalSyncStat &other)
+      : files_attr_synced(other.files_attr_synced),
+        files_deleted(other.files_deleted), files_skipped(other.files_skipped),
+        dir_created(other.dir_created), dir_deleted(other.dir_deleted),
+        dir_scanned(other.dir_scanned), dir_attr_synced(other.dir_attr_synced),
+        cache_hit(other.cache_hit) {}
+  LocalSyncStat &operator=(const LocalSyncStat &other) {
+    if (this != &other) { // Self-assignment check
+      files_attr_synced = other.files_attr_synced;
+      files_deleted = other.files_deleted;
+      files_skipped = other.files_skipped;
+      dir_created = other.dir_created;
+      dir_deleted = other.dir_deleted;
+      dir_scanned = other.dir_scanned;
+      dir_attr_synced = other.dir_attr_synced;
+      cache_hit = other.cache_hit;
+    }
+    return *this;
+  }
+  inline void flush_cache_hit(SnapSyncStat::SyncStat &sync_stat) {
+    sync_stat.inc_cache_hit(cache_hit);
+    cache_hit = 0;
+  }
+  inline void inc_cache_hit(SnapSyncStat::SyncStat &sync_stat, uint64_t gap) {
+    ++cache_hit;
+    if (cache_hit >= gap) {
+      flush_cache_hit(sync_stat);
+    }
+  }
+  inline void flush_dir_attr_synced_count(SnapSyncStat::SyncStat &sync_stat) {
+    sync_stat.inc_dir_attr_synced_count(dir_attr_synced);
+    dir_attr_synced = 0;
+  }
+  inline void inc_dir_attr_synced_count(SnapSyncStat::SyncStat &sync_stat, uint64_t gap) {
+    ++dir_attr_synced;
+    if (dir_attr_synced >= gap) {
+      flush_dir_attr_synced_count(sync_stat);
+    }
+  }
+  inline void flush_dir_scanned_count(SnapSyncStat::SyncStat &sync_stat) {
+    sync_stat.inc_dir_scanned_count(dir_scanned);
+    dir_scanned = 0;
+  }
+  inline void inc_dir_scanned_count(SnapSyncStat::SyncStat &sync_stat, uint64_t gap) {
+    ++dir_scanned;
+    if (dir_scanned >= gap) {
+      flush_dir_scanned_count(sync_stat);
+    }
+  }
+  inline void flush_dir_deleted_count(SnapSyncStat::SyncStat &sync_stat) {
+    sync_stat.inc_dir_deleted_count(dir_deleted);
+    dir_deleted = 0;
+  }
+  inline void inc_dir_deleted_count(SnapSyncStat::SyncStat &sync_stat, uint64_t gap) {
+    ++dir_deleted;
+    if (dir_deleted >= gap) {
+      flush_dir_deleted_count(sync_stat);
+    }
+  }
+
+  inline void flush_dir_created_count(SnapSyncStat::SyncStat &sync_stat) {
+    sync_stat.inc_dir_created_count(dir_created);
+    dir_created = 0;
+  }
+  inline void inc_dir_created_count(SnapSyncStat::SyncStat &sync_stat, uint64_t gap) {
+    ++dir_created;
+    if (dir_created >= gap) {
+      flush_dir_created_count(sync_stat);
+    }
+  }
+
+  inline void flush_files_attr_synced_count(SnapSyncStat::SyncStat &sync_stat) {
+    sync_stat.inc_files_attr_synced_count(files_attr_synced);
+    files_attr_synced = 0;
+  }
+  inline void inc_files_attr_synced_count(SnapSyncStat::SyncStat &sync_stat, uint64_t gap) {
+    ++files_attr_synced;
+    if (files_attr_synced >= gap) {
+      flush_files_attr_synced_count(sync_stat);
+    }
+  }
+
+  inline void flush_files_skipped_count(SnapSyncStat::SyncStat &sync_stat) {
+    sync_stat.inc_files_skipped_count(files_skipped);
+    files_skipped = 0;
+  }
+  inline void inc_files_skipped_count(SnapSyncStat::SyncStat &sync_stat, uint64_t gap) {
+    ++files_skipped;
+    if (files_skipped >= gap) {
+      flush_files_skipped_count(sync_stat);
+    }
+  }
+
+  inline void flush_files_deleted_count(SnapSyncStat::SyncStat &sync_stat) {
+    sync_stat.inc_files_deleted_count(files_deleted);
+    files_deleted = 0;
+  }
+  inline void inc_files_deleted_count(SnapSyncStat::SyncStat &sync_stat, uint64_t gap) {
+    ++files_deleted;
+    if (files_deleted >= gap) {
+      flush_files_deleted_count(sync_stat);
+    }
+  }
+
+  inline void flush(SnapSyncStat::SyncStat &sync_stat) {
+
+    flush_cache_hit(sync_stat);
+    flush_dir_attr_synced_count(sync_stat);
+    flush_dir_scanned_count(sync_stat);
+    flush_dir_deleted_count(sync_stat);
+    flush_dir_created_count(sync_stat);
+    flush_files_attr_synced_count(sync_stat);
+    flush_files_skipped_count(sync_stat);
+    flush_files_deleted_count(sync_stat);
   }
 };
 
@@ -293,6 +413,7 @@ private:
   bool use_low_level_api = true;
   bool use_at_statx_dont_sync = true;
   unsigned int sync_flags = AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC;
+  uint64_t stat_flush_counter_gap = 100;
 
       // file descriptor "triplet" for synchronizing a snapshot
   // w/ an added MountRef for accessing "previous" snapshot.
@@ -456,14 +577,17 @@ private:
 
   class DirSyncPool {
   public:
-    DirSyncPool(int num_threads, const std::string epath, const Peer &m_peer)
+    DirSyncPool(int num_threads, const std::string epath, const Peer &m_peer,
+                std::shared_ptr<SnapSyncStat> &sync_stat)
         : num_threads(num_threads), active(false), queued(0), qlimit(0),
-          epath(epath), m_peer(m_peer) {}
+          epath(epath), m_peer(m_peer), sync_stat(sync_stat) {}
     void activate();
     void deactivate();
     bool try_sync(SyncMechanism *task);
-    void sync_anyway(SyncMechanism *task);
-    void sync_direct(SyncMechanism *task);
+    void sync_anyway(SyncMechanism *task,
+                     LocalSyncStat *local_stat);
+    void sync_direct(SyncMechanism *task,
+                     LocalSyncStat *local_stat);
     void update_state(int thread_count);
     void dump_stats(Formatter *f) {
       std::scoped_lock lock(mtx);
@@ -479,6 +603,7 @@ private:
       bool stop_called = true;
       bool active = false;
       std::thread worker;
+      LocalSyncStat local_stat;
       void join() {
         if (worker.joinable()) {
           worker.join();
@@ -498,6 +623,7 @@ private:
     int qlimit;
     std::string epath;
     const Peer &m_peer; // just for using dout
+    std::shared_ptr<SnapSyncStat>& sync_stat;
     bool low_level = false;
   };
 
@@ -584,7 +710,6 @@ private:
   Filesystem m_filesystem;
   Peer m_peer;
   // probably need to be encapsulated when supporting cancelations
-  InodeSharedPtr local_root_inode = nullptr, remote_root_inode = nullptr; 
   std::map<std::string, DirRegistry*> m_registered;
   std::vector<std::string> m_directories, m_deleted_directories;
   std::map<std::string, std::shared_ptr<SnapSyncStat>> m_snap_sync_stats;
@@ -622,13 +747,14 @@ private:
       const std::string &dir_root,
       const std::map<uint64_t, std::pair<std::string, std::string>> &snaps);
   int propagate_deleted_entries(
-      const  std::string &epath, DirRegistry *registry,
+      const std::string &epath, DirRegistry *registry,
       std::shared_ptr<SnapSyncStat> &sync_stat, const FHandles &fh,
       std::unordered_map<std::string, unsigned int> &change_mask_map,
-      int &change_mask_map_size);
+      int &change_mask_map_size, LocalSyncStat *local_stat);
   int cleanup_remote_entry(const std::string &epath, DirRegistry *registry,
                            const FHandles &fh,
                            std::shared_ptr<SnapSyncStat> &sync_stat,
+                           LocalSyncStat *local_stat,
                            int not_dir = -1);
 
   int should_sync_entry(const std::string &epath, const struct ceph_statx &cstx,
@@ -676,12 +802,15 @@ private:
                       const FHandles &fh);
 
   int remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry, const FHandles &fh,
-                   std::shared_ptr<SnapSyncStat> &sync_stat);
+                   std::shared_ptr<SnapSyncStat> &sync_stat,
+                   LocalSyncStat *local_stat);
   int _remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry, const FHandles &fh,
-                    std::shared_ptr<SnapSyncStat> &sync_stat);
+                    std::shared_ptr<SnapSyncStat> &sync_stat,
+                    LocalSyncStat *local_stat);
   int remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
                      DirRegistry *registry,
                      std::shared_ptr<SnapSyncStat> &sync_stat,
+                     LocalSyncStat *local_stat,
                      const FHandles &fh);
   int copy_to_remote(std::shared_ptr<SyncEntry> &cur_entry,
                      DirRegistry *registry, const FHandles &fh,
@@ -729,6 +858,7 @@ public:
     return (registry->failed || registry->canceled);
   }
   friend class DirSyncMechanism;
+  LocalSyncStat* local_stat = nullptr;
 
 protected:
   MountRef m_local;

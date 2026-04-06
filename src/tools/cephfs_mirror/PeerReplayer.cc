@@ -286,6 +286,8 @@ PeerReplayer::PeerReplayer(
       "cephfs_mirror_use_at_statx_dont_sync");
   sync_flags =
       (use_at_statx_dont_sync ? AT_STATX_DONT_SYNC : 0) | AT_SYMLINK_NOFOLLOW;
+  stat_flush_counter_gap = g_ceph_context->_conf.get_val<uint64_t>(
+        "cephfs_mirror_stat_flush_counter_gap");
 }
 
 PeerReplayer::~PeerReplayer() {
@@ -428,6 +430,10 @@ void PeerReplayer::handle_conf_change(const ConfigProxy &conf,
     sync_flags =
         (use_at_statx_dont_sync ? AT_STATX_DONT_SYNC : 0) | AT_SYMLINK_NOFOLLOW;
   }
+  if (changed.count("cephfs_mirror_stat_flush_counter_gap")) {
+    stat_flush_counter_gap = g_ceph_context->_conf.get_val<uint64_t>(
+        "cephfs_mirror_stat_flush_counter_gap");
+  }
 
   m_cond.notify_all();
   dout(0)
@@ -464,6 +470,7 @@ void PeerReplayer::handle_conf_change(const ConfigProxy &conf,
       << ", cephfs_mirror_skip_error=" << skip_error
       << ", cephfs_mirror_use_low_level_api=" << use_low_level_api
       << ", cephfs_mirror_use_at_statx_dont_sync=" << use_at_statx_dont_sync
+      << ", cephfs_mirror_stat_flush_counter_gap=" << stat_flush_counter_gap
       << dendl;
 }
 
@@ -483,6 +490,7 @@ const char **PeerReplayer::get_tracked_conf_keys() const {
                                "cephfs_mirror_skip_error",
                                "cephfs_mirror_use_low_level_api",
                                "cephfs_mirror_use_at_statx_dont_sync",
+                               "cephfs_mirror_stat_flush_counter_gap",
                                NULL};
   return KEYS;
 }
@@ -582,40 +590,27 @@ int PeerReplayer::init() {
 }
 
 void PeerReplayer::shutdown() {
-  dout(20) << dendl;
-
   std::unique_lock locker(m_lock);
   ceph_assert(!m_stopping);
   m_stopping = true;
-  for (auto &[dir_root, registry] : m_registered) {
-    int sync_idx = registry->get_file_sync_queue_idx();
-    if (sync_idx >= 0) {
-      file_mirror_pool.drain_queue(sync_idx);
-    }
-    if (registry->sync_pool) {
-      registry->sync_pool->deactivate();
-    }
-    if (sync_idx >= 0) {
-      file_mirror_pool.sync_finish(sync_idx, dir_root);
-    }
-  }
-  dout(0) << ": Directory scanning thread pools deactivated" << dendl;
   locker.unlock();
-
+  file_mirror_pool.deactivate();
+  dout(20) << dendl;
   {
     std::scoped_lock thread_map_locker(thread_map_lock);
-    for (auto &[dir_root, thread_ptr] : thread_map) {
+    for (auto &[dir, thread_ptr] : thread_map) {
       thread_ptr->join();
     }
-    thread_map.clear();
+    dout(0) << ": All threads joined" << dendl;
   }
-
-  locker.lock();
   m_cond.notify_all();
-  locker.unlock();
 
   scanner_thread->join();
+  dout(0) << ": scanner threads joined" << dendl;
 
+  locker.lock();
+  m_local_root_inode = nullptr;
+  m_remote_root_inode = nullptr;
   ceph_unmount(m_remote_mount);
   ceph_release(m_remote_mount);
   m_remote_mount = nullptr;
@@ -683,6 +678,8 @@ void PeerReplayer::unregister_directory(const std::string &dir_root) {
   ceph_assert(it != m_registered.end());
 
   unlock_directory(it->first, it->second);
+  delete it->second;
+  it->second = nullptr;
   m_registered.erase(it);
   if (std::find(m_directories.begin(), m_directories.end(), dir_root) == m_directories.end()) {
     m_snap_sync_stats.erase(dir_root);
@@ -948,7 +945,8 @@ int PeerReplayer::sync_attributes(std::shared_ptr<SyncEntry> &cur_entry,
 
 int PeerReplayer::_remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry,
                                 const FHandles &fh,
-                                std::shared_ptr<SnapSyncStat> &sync_stat) {
+                                std::shared_ptr<SnapSyncStat> &sync_stat,
+                                LocalSyncStat *local_stat) {
   int r =
       ceph_mkdirat(m_remote_mount, fh.r_fd_dir_root, cur_entry->epath.c_str(),
                    cur_entry->stx.stx_mode & ~S_IFDIR);
@@ -958,7 +956,8 @@ int PeerReplayer::_remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry,
     return r;
   }
   if (r == 0) {
-    sync_stat->current_stat.inc_dir_created_count();
+    local_stat->inc_dir_created_count(sync_stat->current_stat,
+                                      stat_flush_counter_gap);
   }
   return 0;
 }
@@ -980,14 +979,16 @@ int SyncMechanism::ll_remote_mkdir() {
   ceph_assert(raw_inode != nullptr);
   cur_entry->fh.ll_info.r_inode =
       create_inode_shared_ptr(replayer->m_remote_mount, raw_inode);
-  sync_stat->current_stat.inc_dir_created_count();
+  local_stat->inc_dir_created_count(sync_stat->current_stat,
+                                    replayer->stat_flush_counter_gap);
   // dout(0) << ": --->" << cur_entry->epath << dendl;
   return 0;
 }
 
 int PeerReplayer::remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry,
                                const FHandles &fh,
-                               std::shared_ptr<SnapSyncStat> &sync_stat) {
+                               std::shared_ptr<SnapSyncStat> &sync_stat,
+                               LocalSyncStat* local_stat) {
   dout(10) << ": remote epath=" << cur_entry->epath << dendl;
   int r = 0;
   /*
@@ -996,7 +997,7 @@ int PeerReplayer::remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry,
     sync_attributes, thus saving a ceph_mkdirat call.
   */
   // if (cur_entry->create_fresh() || cur_entry->purge_remote()) {
-  r = _remote_mkdir(cur_entry, fh, sync_stat);
+  r = _remote_mkdir(cur_entry, fh, sync_stat, local_stat);
   if (r < 0) {
     return r;
   }
@@ -1138,7 +1139,6 @@ int FileSyncMechanism::ll_copy_to_remote() {
          << cpp_strerror(r) << dendl;
     goto free_ptr;
   }
-  sync_stat->current_stat.inc_file_data_synced_count(cur_entry->stx.stx_size);
 free_ptr:
   free(ptr);
   // dout(0) << ": 2--->" << cur_entry->epath << dendl;
@@ -1273,7 +1273,6 @@ close_local_fd:
 void PeerReplayer::enqueue_file_transfer(
     FileSyncMechanism *syncm, DirRegistry *registry,
     std::shared_ptr<SnapSyncStat> &sync_stat) {
-  sync_stat->current_stat.inc_file_in_flight_count();
   registry->inc_sync_indicator();
   file_mirror_pool.sync_file_data(syncm, registry->get_file_sync_queue_idx());
 }
@@ -1291,7 +1290,8 @@ int SyncMechanism::ll_unlink_cur_file_entry() {
   if (fh.p_mnt == replayer->m_remote_mount) {
     cur_entry->fh.ll_info.p_inode = nullptr;
   }
-  sync_stat->current_stat.inc_file_del_count();
+  local_stat->inc_files_deleted_count(sync_stat->current_stat,
+                                      replayer->stat_flush_counter_gap);
   // dout(0) << ": --->" << cur_entry->epath << dendl;
   return 0;
 }
@@ -1310,7 +1310,8 @@ int SyncMechanism::ll_unlink_cur_dir_entry() {
     cur_entry->fh.ll_info.p_inode = nullptr;
   }
   // dout(0) << ": --->" << cur_entry->epath << dendl;
-  sync_stat->current_stat.inc_dir_deleted_count();
+  local_stat->inc_dir_deleted_count(sync_stat->current_stat,
+                                    replayer->stat_flush_counter_gap);
   return 0;
 }
 
@@ -1380,7 +1381,7 @@ int SyncMechanism::ll_remote_file_op() {
             create_inode_shared_ptr(replayer->m_remote_mount, link_raw);
       }
       cur_entry->change_mask |= PeerReplayer::SyncEntry::CREATE_FRESH;
-      sync_stat->current_stat.inc_file_data_synced_count(cstx.stx_size);
+      sync_stat->current_stat.inc_symlink_synced_count();
     } else {
       dout(5) << ": skipping entry=" << cur_entry->epath
               << ": unsupported mode=" << cstx.stx_mode << dendl;
@@ -1401,6 +1402,7 @@ int SyncMechanism::ll_remote_file_op() {
 int PeerReplayer::remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
                                  DirRegistry *registry,
                                  std::shared_ptr<SnapSyncStat> &sync_stat,
+                                 LocalSyncStat* local_stat,
                                  const FHandles &fh) {
   bool need_data_sync = cur_entry->create_fresh() ||
                         cur_entry->purge_remote() ||
@@ -1463,9 +1465,11 @@ int PeerReplayer::remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
     return r;
   }
   if (cur_entry->change_mask & all_change) {
-    sync_stat->current_stat.inc_file_attr_synced_count();
+    local_stat->inc_files_attr_synced_count(sync_stat->current_stat,
+                                            stat_flush_counter_gap);
   } else {
-    sync_stat->current_stat.inc_file_skipped_count();
+    local_stat->inc_files_skipped_count(sync_stat->current_stat,
+                                        stat_flush_counter_gap);
   }
   
   return 0;
@@ -1564,7 +1568,7 @@ int SyncMechanism::ll_cleanup_remote_entry() {
     SyncMechanism *syncm =
         new LL_DeleteMechanism(replayer->m_local_mount, std::move(d_entry),
                                registry, sync_stat, fh, replayer);
-    registry->sync_pool->sync_direct(syncm);
+    registry->sync_pool->sync_direct(syncm, local_stat);
   }
 
   r = ll_unlink_cur_dir_entry();
@@ -1581,6 +1585,7 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
                                        DirRegistry *registry,
                                        const FHandles &fh,
                                        std::shared_ptr<SnapSyncStat> &sync_stat,
+                                       LocalSyncStat* local_stat,
                                        int not_dir) {
   dout(20) << ": dir_root=" << registry->dir_root << ", epath=" << epath
            << dendl;
@@ -1601,7 +1606,8 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
       return r;
     }
     if (r == 0) {
-      sync_stat->current_stat.inc_file_del_count();
+      local_stat->inc_files_deleted_count(sync_stat->current_stat,
+                                          stat_flush_counter_gap);
       return r;
     }
   }
@@ -1633,7 +1639,8 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
       derr << ": failed to remove remote entry=" << epath << ": "
            << cpp_strerror(r) << dendl;
     }
-    sync_stat->current_stat.inc_file_del_count();
+    local_stat->inc_files_deleted_count(sync_stat->current_stat,
+                                        stat_flush_counter_gap);
     return r;
   }
 
@@ -1688,7 +1695,8 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
               << cpp_strerror(r) << dendl;
           break;
         }
-        sync_stat->current_stat.inc_dir_deleted_count();
+        local_stat->inc_dir_deleted_count(sync_stat->current_stat,
+                                          stat_flush_counter_gap);
 
         dout(10) << ": done for remote directory=" << entry.epath << dendl;
         if (entry.dirp && ceph_closedir(m_remote_mount, entry.dirp) < 0) {
@@ -1724,7 +1732,8 @@ int PeerReplayer::cleanup_remote_entry(const std::string &epath,
         break;
       }
       dout(10) << ": done for remote file=" << entry.epath << dendl;
-      sync_stat->current_stat.inc_file_del_count();
+      local_stat->inc_files_deleted_count(sync_stat->current_stat,
+                                          stat_flush_counter_gap);
       rm_stack.pop();
     }
   }
@@ -1868,7 +1877,7 @@ int SyncMechanism::ll_propagate_deleted_entries(int &cache_size) {
       SyncMechanism *syncm =
           new LL_DeleteMechanism(replayer->m_local_mount, std::move(d_entry),
                                  registry, sync_stat, fh, replayer);
-      registry->sync_pool->sync_anyway(syncm);
+      registry->sync_pool->sync_anyway(syncm, local_stat);
     } else if (extra_flags) {
       cur_entry->cache_map[d_name] =
           PeerReplayer::CacheInfo(std::move(p_inode), pstx);
@@ -1882,7 +1891,7 @@ int PeerReplayer::propagate_deleted_entries(
     const std::string &epath, DirRegistry *registry,
     std::shared_ptr<SnapSyncStat> &sync_stat, const FHandles &fh,
     std::unordered_map<std::string, unsigned int> &change_mask_map,
-    int &change_mask_map_size) {
+    int &change_mask_map_size, LocalSyncStat *local_stat) {
   dout(10) << ": dir_root=" << registry->dir_root << ", epath=" << epath
            << dendl;
   ceph_dir_result *dirp;
@@ -1972,7 +1981,7 @@ int PeerReplayer::propagate_deleted_entries(
       SyncMechanism *syncm = new DeleteMechanism(
           m_local_mount, std::move(std::make_shared<SyncEntry>(dpath)),
           registry, sync_stat, fh, this, !S_ISDIR(pstx.stx_mode));
-      registry->sync_pool->sync_anyway(syncm);
+      registry->sync_pool->sync_anyway(syncm, local_stat);
     } else if (extra_flags) {
       unsigned int change_mask = 0;
       build_change_mask(pstx, cstx, false, purge_remote, change_mask);
@@ -2272,9 +2281,11 @@ void PeerReplayer::DirSyncPool::run(DirScanner *dir_scanner) {
       });
       if (dir_scanner->stop_called) {
         dir_scanner->active = false;
+        dir_scanner->local_stat.flush(sync_stat->current_stat);
         break;
       }
       task = sync_queue.front();
+      task->local_stat = &dir_scanner->local_stat;
       sync_queue.pop();
       queued--;
     }
@@ -2304,14 +2315,17 @@ bool PeerReplayer::DirSyncPool::try_sync(SyncMechanism *task) {
   return success;
 }
 
-void PeerReplayer::DirSyncPool::sync_anyway(SyncMechanism *task) {
+void PeerReplayer::DirSyncPool::sync_anyway(
+    SyncMechanism *task, LocalSyncStat *local_stat) {
   if (!try_sync(task)) {
-    sync_direct(task);
+    sync_direct(task, local_stat);
   }
 }
 
-void PeerReplayer::DirSyncPool::sync_direct(SyncMechanism *task) {
+void PeerReplayer::DirSyncPool::sync_direct(
+    SyncMechanism *task, LocalSyncStat *local_stat) {
   task->sync_in_flight();
+  task->local_stat = local_stat;
   task->complete(low_level);
 }
 
@@ -2445,11 +2459,13 @@ int SyncMechanism::ll_update_remote_stat() {
     }
   }
   if (S_ISDIR(cstx.stx_mode)) {
-    sync_stat->current_stat.inc_dir_scanned_count();
+    local_stat->inc_dir_scanned_count(sync_stat->current_stat,
+                                      replayer->stat_flush_counter_gap);
   }
   if (mask == 0) {
     if (!S_ISDIR(cstx.stx_mode)) {
-      sync_stat->current_stat.inc_file_skipped_count();
+      local_stat->inc_files_skipped_count(sync_stat->current_stat,
+                                          replayer->stat_flush_counter_gap);
     }
     return 0;
   }
@@ -2474,9 +2490,11 @@ int SyncMechanism::ll_update_remote_stat() {
     return r;
   }
   if (!S_ISDIR(cur_entry->stx.stx_mode)) {
-    sync_stat->current_stat.inc_file_attr_synced_count();
+    local_stat->inc_files_attr_synced_count(sync_stat->current_stat,
+                                            replayer->stat_flush_counter_gap);
   } else {
-    sync_stat->current_stat.inc_dir_attr_synced_count();
+    local_stat->inc_dir_attr_synced_count(sync_stat->current_stat,
+                                          replayer->stat_flush_counter_gap);
   }
   // dout(0) << ": --->" << cur_entry->epath << dendl;
   return 0;
@@ -2645,7 +2663,7 @@ void DeleteMechanism::finish(int r) {
     goto notify_finish;
   }
   r = replayer->cleanup_remote_entry(cur_entry->epath, registry, fh, sync_stat,
-                                     not_dir);
+                                     local_stat, not_dir);
   if (r < 0 && r != -ENOENT) {
     derr << ": failed to cleanup remote entry=" << cur_entry->epath << ": "
          << cpp_strerror(r) << dendl;
@@ -2665,7 +2683,6 @@ void FileSyncMechanism::finish(int r) {
     registry->set_failed(x);
   }
 notify_finish:
-  sync_stat->current_stat.dec_file_in_flight_count();
   registry->dec_sync_indicator();
 }
 
@@ -2690,8 +2707,8 @@ int FileSyncMechanism::sync_file() {
     return r;
   }
   r = replayer->sync_attributes(cur_entry, fh);
-  sync_stat->current_stat.inc_file_data_synced_count(cur_entry->stx.stx_size);
-  sync_stat->current_stat.inc_file_attr_synced_count();
+  local_stat->inc_files_attr_synced_count(sync_stat->current_stat,
+                                          replayer->stat_flush_counter_gap);
   return r;
 }
 
@@ -2893,7 +2910,7 @@ int DirSnapDiffSync::ll_go_next() {
         SyncMechanism *syncm = new LL_DeleteMechanism(
             replayer->m_local_mount, std::move(deleted_entry), registry,
             sync_stat, fh, replayer);
-        registry->sync_pool->sync_anyway(syncm);
+        registry->sync_pool->sync_anyway(syncm, local_stat);
         entry->deleted_sibling_exist = false;
       }
     }
@@ -2989,7 +3006,7 @@ int DirSnapDiffSync::go_next() {
         SyncMechanism *syncm = new DeleteMechanism(
             m_local, std::move(deleted_entry), registry, sync_stat, fh,
             replayer, (DT_DIR != entry->deleted_sibling.dir_entry.d_type));
-        registry->sync_pool->sync_anyway(syncm);
+        registry->sync_pool->sync_anyway(syncm, local_stat);
         entry->deleted_sibling_exist = false;
       }
     }
@@ -3082,7 +3099,7 @@ int DirSnapDiffSync::ll_sync_current_entry() {
     syncm = new DirBruteDiffSync(
         replayer->m_local_mount, std::move(cur_entry), registry, sync_stat,
         failed_prev ? registry->remotediff_fh : fh, replayer);
-    registry->sync_pool->sync_direct(syncm);
+    registry->sync_pool->sync_direct(syncm, local_stat);
     cur_entry = nullptr;
     return 0;
   }
@@ -3186,18 +3203,20 @@ int DirSnapDiffSync::sync_current_entry() {
     syncm = new DirBruteDiffSync(
         m_local, std::move(cur_entry), registry, sync_stat,
         failed_prev ? registry->remotediff_fh : fh, replayer);
-    registry->sync_pool->sync_direct(syncm);
+    registry->sync_pool->sync_direct(syncm, local_stat);
     return 0;
   }
 
   if (S_ISDIR(cur_entry->stx.stx_mode)) { // is a directory
-    r = replayer->remote_mkdir(cur_entry, fh, sync_stat);
+    r = replayer->remote_mkdir(cur_entry, fh, sync_stat, local_stat);
     if (r < 0) {
       return r;
     }
-    sync_stat->current_stat.inc_dir_scanned_count();
+    local_stat->inc_dir_scanned_count(sync_stat->current_stat,
+                                      replayer->stat_flush_counter_gap);
   } else {
-    r = replayer->remote_file_op(cur_entry, registry, sync_stat, fh);
+    r = replayer->remote_file_op(cur_entry, registry, sync_stat, local_stat,
+                                 fh);
     cur_entry = nullptr;
     return r;
   }
@@ -3311,7 +3330,8 @@ int DirBruteDiffSync::ll_go_next() {
             (S_ISDIR(d_entry->pstx.stx_mode) ? DT_DIR : DT_REG);
         entry->cache_map.erase(it);
         cache_size--;
-        sync_stat->current_stat.inc_cache_hit();
+        local_stat->inc_cache_hit(sync_stat->current_stat,
+                                  replayer->stat_flush_counter_gap);
       }
     } else {
       d_entry->change_mask |= PeerReplayer::SyncEntry::CREATE_FRESH;
@@ -3391,7 +3411,8 @@ int DirBruteDiffSync::go_next() {
         // insert more entry
         par_change_mask_map.erase(it);
         change_mask_map_size--;
-        sync_stat->current_stat.inc_cache_hit();
+        local_stat->inc_cache_hit(sync_stat->current_stat,
+                                  replayer->stat_flush_counter_gap);
       }
     } else {
       change_mask |= PeerReplayer::SyncEntry::CREATE_FRESH;
@@ -3462,7 +3483,7 @@ int DirBruteDiffSync::ll_sync_current_entry() {
     SyncMechanism *syncm = new DirBruteDiffSync(
         replayer->m_local_mount, std::move(cur_entry), registry, sync_stat,
         registry->remotediff_fh, replayer);
-    registry->sync_pool->sync_direct(syncm);
+    registry->sync_pool->sync_direct(syncm, local_stat);
     cur_entry = nullptr;
     return 0;
   }
@@ -3470,7 +3491,7 @@ int DirBruteDiffSync::ll_sync_current_entry() {
   if (cur_entry->purge_remote()) {
     SyncMechanism *syncm = new LL_DeleteMechanism(
         replayer->m_local_mount, cur_entry, registry, sync_stat, fh, replayer);
-    registry->sync_pool->sync_direct(syncm);
+    registry->sync_pool->sync_direct(syncm, local_stat);
     cur_entry->change_mask |= PeerReplayer::SyncEntry::CREATE_FRESH;
   }
 
@@ -3555,13 +3576,13 @@ int DirBruteDiffSync::sync_current_entry() {
     SyncMechanism *syncm =
         new DirBruteDiffSync(m_local, std::move(cur_entry), registry, sync_stat,
                              registry->remotediff_fh, replayer);
-    registry->sync_pool->sync_direct(syncm);
+    registry->sync_pool->sync_direct(syncm, local_stat);
     return 0;
   }
 
   if (cur_entry->purge_remote()) {
     rem_r = replayer->cleanup_remote_entry(
-        cur_entry->epath, registry, fh, sync_stat,
+        cur_entry->epath, registry, fh, sync_stat, local_stat,
         cur_entry->wasnt_dir_in_prev_snapshot());
     if (rem_r < 0 && rem_r != -ENOENT) {
       derr << ": failed to cleanup remote entry=" << cur_entry->epath << ": "
@@ -3571,13 +3592,15 @@ int DirBruteDiffSync::sync_current_entry() {
     }
   }
   if (S_ISDIR(cur_entry->stx.stx_mode)) {
-    r = replayer->remote_mkdir(cur_entry, fh, sync_stat);
+    r = replayer->remote_mkdir(cur_entry, fh, sync_stat, local_stat);
     if (r < 0) {
       return r;
     }
-    sync_stat->current_stat.inc_dir_scanned_count();
+    local_stat->inc_dir_scanned_count(sync_stat->current_stat,
+                                      replayer->stat_flush_counter_gap);
   } else {
-    r = replayer->remote_file_op(cur_entry, registry, sync_stat, fh);
+    r = replayer->remote_file_op(cur_entry, registry, sync_stat, local_stat,
+                                 fh);
     cur_entry = nullptr;
     return r;
   }
@@ -3599,7 +3622,7 @@ int DirBruteDiffSync::sync_current_entry() {
   if (!cur_entry->create_fresh() && !cur_entry->purge_remote()) {
     r = replayer->propagate_deleted_entries(cur_entry->epath, registry,
                                             sync_stat, fh, change_mask_map,
-                                            change_mask_map_size);
+                                            change_mask_map_size, local_stat);
     if (r < 0 && r != -ENOENT) {
       derr << ": failed to propagate missing dirs: " << cpp_strerror(r)
            << dendl;
@@ -3697,6 +3720,7 @@ int PeerReplayer::ll_do_synchronize(const std::string &dir_root,
       << ", cephfs_mirror_skip_error=" << skip_error
       << ", cephfs_mirror_use_low_level_api=" << use_low_level_api
       << ", cephfs_mirror_use_at_statx_dont_sync=" << use_at_statx_dont_sync
+      << ", cephfs_mirror_stat_flush_counter_gap=" << stat_flush_counter_gap
       << dendl;
   // ceph_assert(sync_flags == AT_SYMLINK_NOFOLLOW);
   // sync_flags = AT_SYMLINK_NOFOLLOW;
@@ -3729,12 +3753,12 @@ int PeerReplayer::ll_do_synchronize(const std::string &dir_root,
   uint64_t rfiles = 0, rbytes = 0;
   get_r_stats(cur_snap_path, rfiles, rbytes);
   lock.lock();
-  registry->sync_start(file_mirror_pool.sync_start(dir_root, true));
+  registry->sync_start(file_mirror_pool.sync_start(dir_root, sync_stat, true));
   sync_stat->current_stat.rfiles = rfiles;
   sync_stat->current_stat.rbytes = rbytes;
   sync_stat->current_stat.start_timer();
-  registry->sync_pool =
-      std::make_unique<DirSyncPool>(dir_scanning_thread, dir_root, m_peer);
+  registry->sync_pool = std::make_unique<DirSyncPool>(
+      dir_scanning_thread, dir_root, m_peer, sync_stat);
   registry->sync_pool->set_low_level(true);
   registry->sync_pool->activate();
   lock.unlock();
@@ -3774,7 +3798,8 @@ int PeerReplayer::ll_do_synchronize(const std::string &dir_root,
     syncm = new DirBruteDiffSync(m_local_mount, std::move(cur_entry), registry,
                                  sync_stat, registry->remotediff_fh, this);
   }
-  registry->sync_pool->sync_anyway(syncm);
+  LocalSyncStat local_stat;
+  registry->sync_pool->sync_anyway(syncm, &local_stat);
   registry->wait_for_sync_finish();
 
   should_backoff(registry, &r);
@@ -3825,6 +3850,7 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
       << ", cephfs_mirror_skip_error=" << skip_error
       << ", cephfs_mirror_use_low_level_api=" << use_low_level_api
       << ", cephfs_mirror_use_at_statx_dont_sync=" << use_at_statx_dont_sync
+      << ", cephfs_mirror_stat_flush_counter_gap=" << stat_flush_counter_gap
       << dendl;
 
   dout(0) << ": sync start-->" << dir_root << ",cur_snap= " << current.first
@@ -3914,12 +3940,12 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
   lock.lock();
   dout(0) << ": Number of dir scanning threads=" << dir_scanning_thread
           << dendl;
-  registry->sync_start(file_mirror_pool.sync_start(dir_root));
+  registry->sync_start(file_mirror_pool.sync_start(dir_root, sync_stat));
   sync_stat->current_stat.rfiles = std::stoull(rfiles);
   sync_stat->current_stat.rbytes = std::stoull(rbytes);
   sync_stat->current_stat.start_timer();
-  registry->sync_pool =
-      std::make_unique<DirSyncPool>(dir_scanning_thread, dir_root, m_peer);
+  registry->sync_pool = std::make_unique<DirSyncPool>(
+      dir_scanning_thread, dir_root, m_peer, sync_stat);
   registry->sync_pool->activate();
   lock.unlock();
 
@@ -3961,7 +3987,8 @@ int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &cu
     syncm = new DirBruteDiffSync(m_local_mount, std::move(cur_entry), registry,
                                  sync_stat, registry->remotediff_fh, this);
   }
-  registry->sync_pool->sync_anyway(syncm);
+  LocalSyncStat local_stat;
+  registry->sync_pool->sync_anyway(syncm, &local_stat);
   registry->wait_for_sync_finish();
   if (!prev || registry->snapdiff_fh.p_fd < 0 || !use_snapdiff_api) {
     if (root_entry->dirp &&
@@ -4478,6 +4505,10 @@ void PeerReplayer::run_scan() {
       m_cond.wait_for(locker, timeout,
                       [this] { return is_stopping(); });
     }
+    if (is_stopping()) {
+      dout(5) << ": exiting" << dendl;
+      break;
+    }
 
     if (!(start_syncing && nr_replayers > 0 &&
           m_directories.size() > m_registered.size() &&
@@ -4495,6 +4526,9 @@ void PeerReplayer::run_scan() {
 
     locker.lock();
 
+    // dout(0) << "start idx=" << idx << ", next_dir=" << next_dir
+    //         << ", registered=" << m_registered.size()
+    //         << ", total=" << m_directories.size() << dendl;
     if (idx >= m_directories.size() || m_directories[idx] != next_dir) {
       idx = std::find(m_directories.begin(), m_directories.end(), next_dir) -
             m_directories.begin();
@@ -4507,6 +4541,9 @@ void PeerReplayer::run_scan() {
                     m_directories.size() > m_registered.size();
          ++i, idx = (idx + 1) % m_directories.size()) {
       next_dir = m_directories[idx];
+      // dout(0) << "idx=" << idx << ", next_dir=" << next_dir
+      //         << ", registered=" << m_registered.size()
+      //         << ", total=" << m_directories.size() << dendl;
       auto &sync_stat = m_snap_sync_stats.at(next_dir);
       if (sync_stat->failed) {
         std::chrono::duration<double> d =

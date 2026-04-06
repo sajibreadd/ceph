@@ -106,8 +106,14 @@ void FileMirrorPool::run(FileWorker *file_worker) {
       task = sq->sync_queue.front();
       file_worker->current_syncing_file.file_name = std::move(task->get_file_name());
       file_worker->current_syncing_file.peer_uid = std::move(task->get_peer_uid());
-      file_worker->current_syncing_file.file_size = std::move(task->get_file_size());
+      file_worker->current_syncing_file.file_size = task->get_file_size();
       sq->sync_queue.pop();
+      if (sq->sync_stat) {
+        sq->sync_stat->current_stat.files_in_flight--;
+        sq->sync_stat->current_stat.files_data_synced++;
+        sq->sync_stat->current_stat.file_bytes_synced +=
+            file_worker->current_syncing_file.file_size;
+      }
       if (!sq->sync_queue.empty()) {
         sync_ring.emplace(sync_idx);
       }
@@ -117,6 +123,7 @@ void FileMirrorPool::run(FileWorker *file_worker) {
       task->set_worker_ref(file_worker);
     }
     sq->give_cv.notify_one();
+    task->local_stat = sq->local_stat;
     task->complete(sq->get_low_level());
   }
 }
@@ -125,10 +132,15 @@ void FileMirrorPool::sync_file_data(FileSyncMechanism *task, int sync_idx) {
   {
     std::unique_lock<std::mutex> lock(mtx);
     auto sq = sync_queues[sync_idx];
+    if (sq->sync_stat) {
+      sq->sync_stat->current_stat.files_in_flight++;
+    }
     sq->give_cv.wait(lock, [this, &sq] {
       return (!active || sq->sync_queue.size() < qlimit);
     });
     if (!active) {
+      task->complete(-1);
+      sq->give_cv.notify_one();
       return;
     }
     if (sq->sync_queue.empty()) {
@@ -139,19 +151,21 @@ void FileMirrorPool::sync_file_data(FileSyncMechanism *task, int sync_idx) {
   pick_cv.notify_one();
 }
 
-int FileMirrorPool::sync_start(const std::string &dir_root, bool low_level) {
+int FileMirrorPool::sync_start(const std::string &dir_root,
+                               const std::shared_ptr<SnapSyncStat> &sync_stat,
+                               bool low_level) {
   std::scoped_lock lock(mtx);
   int sync_idx = 0;
   if (!unassigned_sync_ids.empty()) {
     sync_idx = unassigned_sync_ids.back();
     delete sync_queues[sync_idx];
     sync_queues[sync_idx] = nullptr;
-    sync_queues[sync_idx] = new SyncQueue(dir_root);
+    sync_queues[sync_idx] = new SyncQueue(dir_root, sync_stat);
     sync_queues[sync_idx]->set_low_level(low_level);
     unassigned_sync_ids.pop_back();
   } else {
     sync_idx = sync_count++;
-    sync_queues.emplace_back(new SyncQueue(dir_root));
+    sync_queues.emplace_back(new SyncQueue(dir_root, sync_stat));
     sync_queues.back()->set_low_level(low_level);
   }
   return sync_idx;
@@ -163,6 +177,13 @@ void FileMirrorPool::sync_finish(int sync_idx, const std::string &dir_root) {
   ceph_assert(sync_queues[sync_idx]->dir_root == dir_root);
 
   sync_queues[sync_idx]->drain_queue();
+  if (sync_queues[sync_idx]->sync_stat) {
+    if (sync_queues[sync_idx]->local_stat) {
+      sync_queues[sync_idx]->local_stat->flush(
+          sync_queues[sync_idx]->sync_stat->current_stat);
+    }
+    sync_queues[sync_idx]->sync_stat = nullptr;
+  }
   unassigned_sync_ids.push_back(sync_idx);
 }
 
@@ -241,6 +262,12 @@ void FileMirrorPool::handle_conf_change(const ConfigProxy &conf,
 const char **FileMirrorPool::get_tracked_conf_keys() const {
   static const char *KEYS[] = {"cephfs_mirror_file_sync_thread", NULL};
   return KEYS;
+}
+
+FileMirrorPool::SyncQueue::SyncQueue(
+    const std::string &dir_root, const std::shared_ptr<SnapSyncStat> &sync_stat)
+    : dir_root(dir_root), sync_stat(sync_stat) {
+  local_stat = new LocalSyncStat();
 }
 
 void FileMirrorPool::SyncQueue::drain_queue() {
