@@ -965,21 +965,32 @@ int PeerReplayer::_remote_mkdir(std::shared_ptr<SyncEntry> &cur_entry,
 }
 
 int SyncMechanism::ll_remote_mkdir() {
-  ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
-  ceph_assert(cur_entry->fh.ll_info.r_inode == nullptr);
-  int r = 0;
+  int r = replayer->ll_reduce_gap(replayer->m_remote_mount,
+                                  cur_entry->fh.ll_info.r_info,
+                                  replayer->m_remote_perms);
+  if (r < 0) {
+    derr << ": failed to reduce gap for remote cur entry="
+         << abs_path(registry->dir_root, cur_entry->epath) << ": "
+         << cpp_strerror(r) << dendl;
+    return r;
+  }
+  ceph_assert(cur_entry->fh.ll_info.r_info.parent != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.r_info.parent->inode != nullptr);
+  ceph_assert(!cur_entry->fh.ll_info.r_info.gap);
+  ceph_assert(cur_entry->fh.ll_info.r_info.inode == nullptr);
+  r = 0;
   InodeRawPtr raw_inode = nullptr;
   struct ceph_statx rstx;
   r = ceph_ll_mkdir(replayer->m_remote_mount,
-                    cur_entry->fh.ll_info.r_parent_inode.back().get(),
-                    cur_entry->fh.ll_info.r_path.c_str(),
+                    cur_entry->fh.ll_info.r_info.parent->inode.get(),
+                    cur_entry->fh.ll_info.r_info.path.c_str(),
                     cur_entry->stx.stx_mode & ~S_IFDIR, &raw_inode, &rstx, 0,
                     replayer->sync_flags, replayer->m_remote_perms);
   if (r < 0) {
     return r;
   }
   ceph_assert(raw_inode != nullptr);
-  cur_entry->fh.ll_info.r_inode =
+  cur_entry->fh.ll_info.r_info.inode =
       create_inode_shared_ptr(replayer->m_remote_mount, raw_inode);
   local_stat->inc_dir_created_count(sync_stat->current_stat,
                                     replayer->stat_flush_counter_gap);
@@ -1021,10 +1032,12 @@ int FileSyncMechanism::ll_copy_to_remote() {
   }
   file_worker->state = FileMirrorPool::FileWorker::ThreadState::FILE_OPEN_LOCAL;
   FhRawPtr fh_raw = nullptr;
-  ceph_assert(cur_entry->fh.ll_info.c_inode != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.c_info.inode != nullptr);
+  ceph_assert(!cur_entry->fh.ll_info.c_info.gap);
   // dout(0) << ": --->" << cur_entry->epath
   //         << ", in=" << cur_entry->fh.ll_info.c_inode.get() << dendl;
-  r = ceph_ll_open(replayer->m_local_mount, cur_entry->fh.ll_info.c_inode.get(),
+  r = ceph_ll_open(replayer->m_local_mount,
+                   cur_entry->fh.ll_info.c_info.inode.get(),
                    O_RDONLY | O_NOFOLLOW, &fh_raw, replayer->m_local_perms);
   if (r < 0) {
     derr << ": failed to open cur snapshot's file path="
@@ -1039,15 +1052,26 @@ int FileSyncMechanism::ll_copy_to_remote() {
 
   struct ceph_statx rstx;
   fh_raw = nullptr;
-  if (cur_entry->fh.ll_info.r_inode == nullptr) {
+  if (cur_entry->fh.ll_info.r_info.inode == nullptr) {
     ll_populate_remote_inode_with_diff_base();
   }
-  if (cur_entry->fh.ll_info.r_inode == nullptr) {
-    ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
+  if (cur_entry->fh.ll_info.r_info.inode == nullptr) {
+    r = replayer->ll_reduce_gap(replayer->m_remote_mount,
+                                cur_entry->fh.ll_info.r_info,
+                                replayer->m_remote_perms);
+    if (r < 0) {
+      derr << ": failed to reduce gap for remote cur entry="
+           << abs_path(registry->dir_root, cur_entry->epath) << ": "
+           << cpp_strerror(r) << dendl;
+      return r;
+    }
+    ceph_assert(cur_entry->fh.ll_info.r_info.parent != nullptr);
+    ceph_assert(cur_entry->fh.ll_info.r_info.parent->inode != nullptr);
+    ceph_assert(!cur_entry->fh.ll_info.r_info.gap);
     InodeRawPtr inode_raw = nullptr;
     r = ceph_ll_create(replayer->m_remote_mount,
-                       cur_entry->fh.ll_info.r_parent_inode.back().get(),
-                       cur_entry->fh.ll_info.r_path.c_str(),
+                       cur_entry->fh.ll_info.r_info.parent->inode.get(),
+                       cur_entry->fh.ll_info.r_info.path.c_str(),
                        cur_entry->stx.stx_mode, O_CREAT | O_WRONLY | O_NOFOLLOW,
                        &inode_raw, &fh_raw, &rstx, 0, replayer->sync_flags,
                        replayer->m_remote_perms);
@@ -1058,12 +1082,12 @@ int FileSyncMechanism::ll_copy_to_remote() {
       return r;
     }
     ceph_assert(inode_raw != nullptr);
-    cur_entry->fh.ll_info.r_inode =
+    cur_entry->fh.ll_info.r_info.inode =
         create_inode_shared_ptr(replayer->m_remote_mount, inode_raw);
   } else {
     r = ceph_ll_open(replayer->m_remote_mount,
-                     cur_entry->fh.ll_info.r_inode.get(), O_WRONLY | O_NOFOLLOW,
-                     &fh_raw, replayer->m_remote_perms);
+                     cur_entry->fh.ll_info.r_info.inode.get(),
+                     O_WRONLY | O_NOFOLLOW, &fh_raw, replayer->m_remote_perms);
     if (r < 0) {
       derr << ": failed to open remote file path="
            << abs_path(registry->dir_root, cur_entry->epath) << ": "
@@ -1280,17 +1304,28 @@ void PeerReplayer::enqueue_file_transfer(
 }
 
 int SyncMechanism::ll_unlink_cur_file_entry() {
-  ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
-  int r = ceph_ll_unlink(replayer->m_remote_mount,
-                         cur_entry->fh.ll_info.r_parent_inode.back().get(),
-                         cur_entry->fh.ll_info.r_path.c_str(),
-                         replayer->m_remote_perms);
+  int r = replayer->ll_reduce_gap(replayer->m_remote_mount,
+                                  cur_entry->fh.ll_info.r_info,
+                                  replayer->m_remote_perms);
+  if (r < 0) {
+    derr << ": failed to reduce gap for remote cur entry="
+         << abs_path(registry->dir_root, cur_entry->epath) << ": "
+         << cpp_strerror(r) << dendl;
+    return r;
+  }
+  ceph_assert(cur_entry->fh.ll_info.r_info.parent != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.r_info.parent->inode != nullptr);
+  ceph_assert(!cur_entry->fh.ll_info.r_info.gap);
+  r = ceph_ll_unlink(replayer->m_remote_mount,
+                     cur_entry->fh.ll_info.r_info.parent->inode.get(),
+                     cur_entry->fh.ll_info.r_info.path.c_str(),
+                     replayer->m_remote_perms);
   if (r < 0 && r != -ENOENT) {
     return r;
   }
-  cur_entry->fh.ll_info.r_inode = nullptr;
+  cur_entry->fh.ll_info.r_info.inode = nullptr;
   if (fh.p_mnt == replayer->m_remote_mount) {
-    cur_entry->fh.ll_info.p_inode = nullptr;
+    cur_entry->fh.ll_info.p_info.inode = nullptr;
   }
   local_stat->inc_files_deleted_count(sync_stat->current_stat,
                                       replayer->stat_flush_counter_gap);
@@ -1299,17 +1334,28 @@ int SyncMechanism::ll_unlink_cur_file_entry() {
 }
 
 int SyncMechanism::ll_unlink_cur_dir_entry() {
-  ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
-  int r = ceph_ll_rmdir(replayer->m_remote_mount,
-                        cur_entry->fh.ll_info.r_parent_inode.back().get(),
-                        cur_entry->fh.ll_info.r_path.c_str(),
+  int r = replayer->ll_reduce_gap(replayer->m_remote_mount,
+                                  cur_entry->fh.ll_info.r_info,
+                                  replayer->m_remote_perms);
+  if (r < 0) {
+    derr << ": failed to reduce gap for remote cur entry="
+         << abs_path(registry->dir_root, cur_entry->epath) << ": "
+         << cpp_strerror(r) << dendl;
+    return r;
+  }
+  ceph_assert(cur_entry->fh.ll_info.r_info.parent != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.r_info.parent->inode != nullptr);
+  ceph_assert(!cur_entry->fh.ll_info.r_info.gap);
+  r = ceph_ll_rmdir(replayer->m_remote_mount,
+                        cur_entry->fh.ll_info.r_info.parent->inode.get(),
+                        cur_entry->fh.ll_info.r_info.path.c_str(),
                         replayer->m_remote_perms);
   if (r < 0 && r != -ENOENT) {
     return r;
   }
-  cur_entry->fh.ll_info.r_inode = nullptr;
+  cur_entry->fh.ll_info.r_info.inode = nullptr;
   if (fh.p_mnt == replayer->m_remote_mount) {
-    cur_entry->fh.ll_info.p_inode = nullptr;
+    cur_entry->fh.ll_info.p_info.inode = nullptr;
   }
   // dout(0) << ": --->" << cur_entry->epath << dendl;
   local_stat->inc_dir_deleted_count(sync_stat->current_stat,
@@ -1349,9 +1395,9 @@ int SyncMechanism::ll_remote_file_op() {
         return r;
       }
       char *target = (char *)alloca(cstx.stx_size + 1);
-      ceph_assert(cur_entry->fh.ll_info.c_inode != nullptr);
+      ceph_assert(cur_entry->fh.ll_info.c_info.inode != nullptr);
       r = ceph_ll_readlink(replayer->m_local_mount,
-                           cur_entry->fh.ll_info.c_inode.get(), target,
+                           cur_entry->fh.ll_info.c_info.inode.get(), target,
                            cstx.stx_size, replayer->m_local_perms);
       if (r < 0) {
         derr << "failed to do low level readlink of local current snapshot's "
@@ -1361,12 +1407,15 @@ int SyncMechanism::ll_remote_file_op() {
              << ": " << cpp_strerror(r) << dendl;
         return r;
       }
+      ceph_assert(cur_entry->fh.ll_info.r_info.parent != nullptr);
+      ceph_assert(cur_entry->fh.ll_info.r_info.parent->inode != nullptr);
+      ceph_assert(!cur_entry->fh.ll_info.r_info.gap);
       struct ceph_statx rstx;
       InodeRawPtr link_raw = nullptr;
       target[cstx.stx_size] = '\0';
       r = ceph_ll_symlink(replayer->m_remote_mount,
-                          cur_entry->fh.ll_info.r_parent_inode.back().get(),
-                          cur_entry->fh.ll_info.r_path.c_str(), target,
+                          cur_entry->fh.ll_info.r_info.parent->inode.get(),
+                          cur_entry->fh.ll_info.r_info.path.c_str(), target,
                           &link_raw, &rstx, 0, replayer->sync_flags,
                           replayer->m_remote_perms);
 
@@ -1376,10 +1425,10 @@ int SyncMechanism::ll_remote_file_op() {
              << cpp_strerror(r) << dendl;
         return r;
       } else if (r == -EEXIST) {
-        cur_entry->fh.ll_info.r_inode = nullptr;
+        cur_entry->fh.ll_info.r_info.inode = nullptr; // need to check
       } else {
         ceph_assert(link_raw != nullptr);
-        cur_entry->fh.ll_info.r_inode =
+        cur_entry->fh.ll_info.r_info.inode =
             create_inode_shared_ptr(replayer->m_remote_mount, link_raw);
       }
       cur_entry->change_mask |= PeerReplayer::SyncEntry::CREATE_FRESH;
@@ -1479,8 +1528,9 @@ int PeerReplayer::remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
 
 int SyncMechanism::ll_cleanup_remote_entry() {
   // dout(0) << ": --->" << cur_entry->epath << dendl;
+  ceph_assert(cur_entry->fh.ll_info.r_info.parent != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.r_info.parent->inode != nullptr);
   int r = 0;
-  ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
   if (cur_entry->prev_d_type != DT_DIR) {
     r = ll_unlink_cur_file_entry();
     if (r == 0) {
@@ -1495,10 +1545,11 @@ int SyncMechanism::ll_cleanup_remote_entry() {
     } else if (r == -ENOENT) {
       return 0;
     }
-    ceph_assert(cur_entry->fh.ll_info.r_inode != nullptr);
+    ceph_assert(cur_entry->fh.ll_info.r_info.inode != nullptr);
+    ceph_assert(!cur_entry->fh.ll_info.r_info.gap);
     r = replayer->ll_open_dirp(replayer->m_remote_mount,
-                               cur_entry->fh.ll_info.r_inode, cur_entry->udirp,
-                               replayer->m_remote_perms);
+                               cur_entry->fh.ll_info.r_info.inode,
+                               cur_entry->udirp, replayer->m_remote_perms);
     if (r < 0 && r != -ENOENT) {
       derr << ": failed to open low level inode of remote cur entry="
            << abs_path(registry->dir_root, cur_entry->epath) << ": "
@@ -1521,10 +1572,11 @@ int SyncMechanism::ll_cleanup_remote_entry() {
       }
       return 0;
     }
-    ceph_assert(cur_entry->fh.ll_info.r_inode != nullptr);
+    ceph_assert(cur_entry->fh.ll_info.r_info.inode != nullptr);
+    ceph_assert(!cur_entry->fh.ll_info.r_info.gap);
     r = replayer->ll_open_dirp(replayer->m_remote_mount,
-                               cur_entry->fh.ll_info.r_inode, cur_entry->udirp,
-                               replayer->m_remote_perms);
+                               cur_entry->fh.ll_info.r_info.inode,
+                               cur_entry->udirp, replayer->m_remote_perms);
     if (r == -ENOENT) {
       return 0;
     } else if (r < 0) {
@@ -1565,7 +1617,7 @@ int SyncMechanism::ll_cleanup_remote_entry() {
     d_entry->rollout(cur_entry->fh, d_name);
     d_entry->prev_d_type = (int)de.d_type;
     ceph_assert(r_inode_raw != nullptr);
-    d_entry->fh.ll_info.r_inode =
+    d_entry->fh.ll_info.r_info.inode =
         create_inode_shared_ptr(replayer->m_remote_mount, r_inode_raw);
     SyncMechanism *syncm =
         new LL_DeleteMechanism(replayer->m_local_mount, std::move(d_entry),
@@ -1801,12 +1853,14 @@ int PeerReplayer::should_sync_entry(const std::string &epath, const struct ceph_
 
 int SyncMechanism::ll_propagate_deleted_entries(int &cache_size) {
   // dout(0) << ": --->" << cur_entry->epath << dendl;
-  ceph_assert(cur_entry->fh.ll_info.p_inode != nullptr);
-  ceph_assert(cur_entry->fh.ll_info.c_inode != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.p_info.inode != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.c_info.inode != nullptr);
+  ceph_assert(!cur_entry->fh.ll_info.p_info.gap);
+  ceph_assert(!cur_entry->fh.ll_info.c_info.gap);
   int r = 0;
   DirUniquePtr udirp;
-  r = replayer->ll_open_dirp(fh.p_mnt, cur_entry->fh.ll_info.p_inode, udirp,
-                             fh.ll_info.p_perms);
+  r = replayer->ll_open_dirp(fh.p_mnt, cur_entry->fh.ll_info.p_info.inode,
+                             udirp, fh.ll_info.p_perms);
   if (r < 0) {
     if (r == -ELOOP || r == -ENOTDIR || r == -ENOENT) {
       return 0;
@@ -1817,6 +1871,9 @@ int SyncMechanism::ll_propagate_deleted_entries(int &cache_size) {
   struct dirent de;
   struct ceph_statx pstx, cstx;
   while (true) {
+    if (replayer->should_backoff(registry, &r)) {
+      return r;
+    }
     unsigned int extra_flags =
         (cache_size < replayer->max_element_in_cache_per_thread)
             ? (CEPH_STATX_UID | CEPH_STATX_GID | CEPH_STATX_SIZE |
@@ -1847,8 +1904,8 @@ int SyncMechanism::ll_propagate_deleted_entries(int &cache_size) {
     std::string epath = std::move(entry_path(cur_entry->epath, d_name));
     InodeSharedPtr c_inode = nullptr;
     r = replayer->ll_open_inode(
-        replayer->m_local_mount, cur_entry->fh.ll_info.c_inode, d_name, c_inode,
-        cstx, extra_flags | CEPH_STATX_MODE, replayer->m_local_perms);
+        replayer->m_local_mount, cur_entry->fh.ll_info.c_info.inode, d_name,
+        c_inode, cstx, extra_flags | CEPH_STATX_MODE, replayer->m_local_perms);
     if (r < 0 && r != -ENOENT) {
       derr << ": failed to do low level openning of cur snapshot's cur entry="
            << abs_path(registry->dir_root, epath, fh.m_current.first,
@@ -1875,7 +1932,7 @@ int SyncMechanism::ll_propagate_deleted_entries(int &cache_size) {
           std::make_shared<PeerReplayer::SyncEntry>(std::move(epath));
       d_entry->rollout(cur_entry->fh, d_name);
       d_entry->prev_d_type = (int)de.d_type;
-      d_entry->fh.ll_info.p_inode = std::move(p_inode);
+      d_entry->fh.ll_info.p_info.inode = std::move(p_inode);
       SyncMechanism *syncm =
           new LL_DeleteMechanism(replayer->m_local_mount, std::move(d_entry),
                                  registry, sync_stat, fh, replayer);
@@ -2003,7 +2060,7 @@ int PeerReplayer::propagate_deleted_entries(
   return r;
 }
 
-int PeerReplayer::ll_open_inode(MountRef mnt, InodeSharedPtr &parent_inode,
+int PeerReplayer::ll_open_inode(MountRef mnt, InodeSharedPtr &parent,
                                 const std::string &dir_path,
                                 InodeSharedPtr &inode_shared,
                                 struct ceph_statx &stx, unsigned int want,
@@ -2011,16 +2068,71 @@ int PeerReplayer::ll_open_inode(MountRef mnt, InodeSharedPtr &parent_inode,
   dout(20) << ": dir_path=" << dir_path << dendl;
 
   InodeRawPtr inode = nullptr;
-  int r =
-      ceph_ll_lookup(mnt, parent_inode.get(), dir_path.c_str(), &inode, &stx,
-                     want, sync_flags, perms);
+  int r = ceph_ll_lookup(mnt, parent.get(), dir_path.c_str(), &inode, &stx,
+                         want, sync_flags, perms);
   if (r < 0) {
     inode = nullptr;
-  } else {
-    ceph_assert(inode != nullptr);
+    inode_shared = nullptr;
+    return r;
   }
+  ceph_assert(inode != nullptr);
   inode_shared = create_inode_shared_ptr(mnt, inode);
-  return (r < 0 ? r : 0);
+  return 0;
+}
+
+int PeerReplayer::ll_reduce_gap(MountRef mnt,
+                                FHandles::LL_Fhandle_Info::InodeInfo &info,
+                                UserPermRef perms) {
+  ceph_assert(info.parent != nullptr);
+  ceph_assert(info.parent->inode != nullptr);
+  if (!info.gap) {
+    return 0;
+  }
+  std::string& dir_path = info.path;
+  struct ceph_statx stx;
+  int i, j;
+  for(j = 0; j < dir_path.size() && dir_path[j] == '/'; ++j);
+  for (i = j; i < dir_path.size(); i = j) {
+    std::string dir_name = "";
+    for (; j < dir_path.size() && dir_path[j] != '/'; ++j) {
+      dir_name += dir_path[j];
+    }
+    for(; j < dir_path.size() && dir_path[j] == '/'; ++j);
+    if (j == dir_path.size()) {
+      info.path = std::move(dir_name);
+      break;
+    }
+    InodeRawPtr inode = nullptr;
+    int r = ceph_ll_lookup(mnt, info.parent->inode.get(), dir_name.c_str(),
+                           &inode, &stx, 0, sync_flags, perms);
+    if (r < 0) {
+      inode = nullptr;
+      return r;
+    }
+    ceph_assert(inode != nullptr);
+    info.parent = std::make_shared<AncestorsLink>(
+        std::move(info.parent), std::move(create_inode_shared_ptr(mnt, inode)));
+  }
+  info.gap = false;
+  return 0;
+}
+
+int PeerReplayer::ll_open_inode(MountRef mnt,
+                                FHandles::LL_Fhandle_Info::InodeInfo &info,
+                                struct ceph_statx &stx, unsigned int want,
+                                UserPermRef perms) {
+  int r = ll_reduce_gap(mnt, info, perms);
+  if (r < 0) {
+    info.inode = nullptr;
+    derr << ": failed to reduce gap for " << info.path << dendl;
+    return r;
+  }
+  r = ll_open_inode(mnt, info.parent->inode, info.path, info.inode, stx, want,
+                    perms);
+  if (r < 0) {
+    return r;
+  }
+  return 0;
 }
 
 int PeerReplayer::ll_open_dirp(MountRef mnt, InodeSharedPtr &inode,
@@ -2029,11 +2141,12 @@ int PeerReplayer::ll_open_dirp(MountRef mnt, InodeSharedPtr &inode,
   int r = ceph_ll_opendir(mnt, inode.get(), &rdirp, perms);
   if (r < 0) {
     rdirp = nullptr;
-  } else {
-    ceph_assert(rdirp != nullptr);
+    udirp = nullptr;
+    return r;
   }
+  ceph_assert(rdirp != nullptr);
   udirp = create_dirp_unique_ptr(mnt, rdirp);
-  return (r < 0 ? r : 0);
+  return 0;
 }
 
 int PeerReplayer::open_dir(MountRef mnt, const std::string &dir_path,
@@ -2085,9 +2198,12 @@ int PeerReplayer::ll_pre_sync_check_and_open_registry_inodes(
   auto cur_snap_path = snapshot_path(m_cct, cur_path, current.first);
 
   struct ceph_statx stx;
-
-  int r = ll_open_inode(m_local_mount, m_local_root_inode, cur_snap_path,
-                        registry->remotediff_fh.ll_info.c_parent_inode.back(),
+  registry->remotediff_fh.ll_info.c_info.parent =
+      std::make_shared<AncestorsLink>(nullptr, m_local_root_inode);
+  registry->remotediff_fh.ll_info.c_info.path = cur_snap_path;
+  registry->remotediff_fh.ll_info.c_info.inode = nullptr;
+  registry->remotediff_fh.ll_info.c_info.gap = true;
+  int r = ll_open_inode(m_local_mount, registry->remotediff_fh.ll_info.c_info,
                         stx, 0, m_local_perms);
 
   if (r < 0) {
@@ -2096,16 +2212,19 @@ int PeerReplayer::ll_pre_sync_check_and_open_registry_inodes(
          << cur_snap_path << ": " << cpp_strerror(r) << dendl;
     return r;
   }
-  registry->snapdiff_fh.ll_info.c_parent_inode =
-      registry->remotediff_fh.ll_info.c_parent_inode;
+  registry->snapdiff_fh.ll_info.c_info = registry->remotediff_fh.ll_info.c_info;
   registry->snapdiff_fh.m_current = current;
   registry->remotediff_fh.m_current = current;
   registry->snapdiff_fh.m_prev = prev;
 
   if (prev) {
     auto prev_snap_path = snapshot_path(m_cct, cur_path, (*prev).first);
-    r = ll_open_inode(m_local_mount, m_local_root_inode, prev_snap_path,
-                      registry->snapdiff_fh.ll_info.p_parent_inode.back(), stx,
+    registry->snapdiff_fh.ll_info.p_info.parent =
+        std::make_shared<AncestorsLink>(nullptr, m_local_root_inode);
+    registry->snapdiff_fh.ll_info.p_info.path = prev_snap_path;
+    registry->snapdiff_fh.ll_info.p_info.inode = nullptr;
+    registry->snapdiff_fh.ll_info.p_info.gap = true;
+    r = ll_open_inode(m_local_mount, registry->snapdiff_fh.ll_info.p_info, stx,
                       0, m_local_perms);
     if (r < 0) {
       derr << ": error occurred while doing low level opening of local inode "
@@ -2115,8 +2234,12 @@ int PeerReplayer::ll_pre_sync_check_and_open_registry_inodes(
     registry->snapdiff_fh.p_mnt = m_local_mount;
     registry->snapdiff_fh.ll_info.p_perms = m_local_perms;
   }
-  r = ll_open_inode(m_remote_mount, m_remote_root_inode, cur_path,
-                    registry->remotediff_fh.ll_info.r_parent_inode.back(), stx,
+  registry->remotediff_fh.ll_info.r_info.parent =
+      std::make_shared<AncestorsLink>(nullptr, m_remote_root_inode);
+  registry->remotediff_fh.ll_info.r_info.path = cur_path;
+  registry->remotediff_fh.ll_info.r_info.inode = nullptr;
+  registry->remotediff_fh.ll_info.r_info.gap = true;
+  r = ll_open_inode(m_remote_mount, registry->remotediff_fh.ll_info.r_info, stx,
                     0, m_remote_perms);
   if (r < 0) {
     derr << ": error occurred while opening remote low level inode of dir="
@@ -2124,24 +2247,50 @@ int PeerReplayer::ll_pre_sync_check_and_open_registry_inodes(
     return r;
   }
   registry->remotediff_fh.p_mnt = m_remote_mount;
-  registry->snapdiff_fh.ll_info.r_parent_inode =
-      registry->remotediff_fh.ll_info.p_parent_inode =
-          registry->remotediff_fh.ll_info.r_parent_inode;
+  registry->snapdiff_fh.ll_info.r_info =
+      registry->remotediff_fh.ll_info.p_info =
+          registry->remotediff_fh.ll_info.r_info;
 
   registry->remotediff_fh.ll_info.p_perms = m_remote_perms;
 
-  registry->snapdiff_fh.ll_info.c_inode =
-      registry->snapdiff_fh.ll_info.c_parent_inode.back();
-  registry->snapdiff_fh.ll_info.p_inode =
-      registry->snapdiff_fh.ll_info.p_parent_inode.back();
-  registry->snapdiff_fh.ll_info.r_inode =
-      registry->snapdiff_fh.ll_info.r_parent_inode.back();
-  registry->remotediff_fh.ll_info.c_inode =
-      registry->remotediff_fh.ll_info.c_parent_inode.back();
-  registry->remotediff_fh.ll_info.p_inode =
-      registry->remotediff_fh.ll_info.p_parent_inode.back();
-  registry->remotediff_fh.ll_info.r_inode =
-      registry->remotediff_fh.ll_info.r_parent_inode.back();
+  registry->snapdiff_fh.ll_info.c_info.parent = std::make_shared<AncestorsLink>(
+      registry->snapdiff_fh.ll_info.c_info.parent,
+      registry->snapdiff_fh.ll_info.c_info.inode);
+  registry->snapdiff_fh.ll_info.c_info.path = "";
+  registry->snapdiff_fh.ll_info.c_info.gap = false;
+
+  registry->snapdiff_fh.ll_info.p_info.parent = std::make_shared<AncestorsLink>(
+      registry->snapdiff_fh.ll_info.p_info.parent,
+      registry->snapdiff_fh.ll_info.p_info.inode);
+  registry->snapdiff_fh.ll_info.p_info.path = "";
+  registry->snapdiff_fh.ll_info.p_info.gap = false;
+
+  registry->snapdiff_fh.ll_info.r_info.parent = std::make_shared<AncestorsLink>(
+      registry->snapdiff_fh.ll_info.r_info.parent,
+      registry->snapdiff_fh.ll_info.r_info.inode);
+  registry->snapdiff_fh.ll_info.r_info.path = "";
+  registry->snapdiff_fh.ll_info.r_info.gap = false;
+
+  registry->remotediff_fh.ll_info.c_info.parent =
+      std::make_shared<AncestorsLink>(
+          registry->remotediff_fh.ll_info.c_info.parent,
+          registry->remotediff_fh.ll_info.c_info.inode);
+  registry->remotediff_fh.ll_info.c_info.path = "";
+  registry->remotediff_fh.ll_info.c_info.gap = false;
+
+  registry->remotediff_fh.ll_info.p_info.parent =
+      std::make_shared<AncestorsLink>(
+          registry->remotediff_fh.ll_info.p_info.parent,
+          registry->remotediff_fh.ll_info.p_info.inode);
+  registry->remotediff_fh.ll_info.p_info.path = "";
+  registry->remotediff_fh.ll_info.p_info.gap = false;
+
+  registry->remotediff_fh.ll_info.r_info.parent =
+      std::make_shared<AncestorsLink>(
+          registry->remotediff_fh.ll_info.r_info.parent,
+          registry->remotediff_fh.ll_info.r_info.inode);
+  registry->remotediff_fh.ll_info.r_info.path = "";
+  registry->remotediff_fh.ll_info.r_info.gap = false;
   return 0;
 }
 
@@ -2403,11 +2552,12 @@ void PeerReplayer::DirSyncPool::update_qlimit(int _qlimit) {
 
 bool SyncMechanism::ll_populate_remote_inode_with_diff_base() {
   if (fh.p_mnt == replayer->m_remote_mount &&
-      cur_entry->fh.ll_info.p_inode != nullptr) {
-    ceph_assert(cur_entry->fh.ll_info.p_parent_inode.back() != nullptr);
-    cur_entry->fh.ll_info.r_parent_inode = cur_entry->fh.ll_info.p_parent_inode;
-    cur_entry->fh.ll_info.r_inode = cur_entry->fh.ll_info.p_inode;
-    cur_entry->fh.ll_info.r_path = cur_entry->fh.ll_info.p_path;
+      cur_entry->fh.ll_info.r_info.inode == nullptr &&
+      cur_entry->fh.ll_info.p_info.inode != nullptr &&
+      !cur_entry->fh.ll_info.p_info.gap && cur_entry->fh.ll_info.r_info.gap) {
+    ceph_assert(cur_entry->fh.ll_info.p_info.parent != nullptr);
+    ceph_assert(cur_entry->fh.ll_info.p_info.parent->inode != nullptr);
+    cur_entry->fh.ll_info.r_info = cur_entry->fh.ll_info.p_info;
     return true;
   }
   return false;
@@ -2415,17 +2565,17 @@ bool SyncMechanism::ll_populate_remote_inode_with_diff_base() {
 
 int SyncMechanism::ll_populate_remote_inode() {
   int r = 0;
-  if (cur_entry->fh.ll_info.r_inode != nullptr) {
-    ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.r_info.parent != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.r_info.parent->inode != nullptr);
+  if (cur_entry->fh.ll_info.r_info.inode != nullptr) {
+    ceph_assert(!cur_entry->fh.ll_info.r_info.gap);
     return 0;
   }
   if (!ll_populate_remote_inode_with_diff_base()) {
-    ceph_assert(cur_entry->fh.ll_info.r_parent_inode.back() != nullptr);
     struct ceph_statx rstx;
-    r = replayer->ll_open_inode(
-        replayer->m_remote_mount, cur_entry->fh.ll_info.r_parent_inode.back(),
-        cur_entry->fh.ll_info.r_path, cur_entry->fh.ll_info.r_inode, rstx, 0,
-        replayer->m_remote_perms);
+    r = replayer->ll_open_inode(replayer->m_remote_mount,
+                                cur_entry->fh.ll_info.r_info, rstx, 0,
+                                replayer->m_remote_perms);
     if (r < 0) {
       return r;
     }
@@ -2480,9 +2630,10 @@ int SyncMechanism::ll_update_remote_stat() {
     return r;
   }
 
-  ceph_assert(cur_entry->fh.ll_info.r_inode != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.r_info.inode != nullptr);
+  ceph_assert(!cur_entry->fh.ll_info.r_info.gap);
   r = ceph_ll_setattr(replayer->m_remote_mount,
-                      cur_entry->fh.ll_info.r_inode.get(), &cstx, mask,
+                      cur_entry->fh.ll_info.r_info.inode.get(), &cstx, mask,
                       replayer->m_remote_perms);
 
   if (r < 0) {
@@ -2507,13 +2658,13 @@ int SyncMechanism::ll_populate_cur_stat_and_cur_inode() {
   int r = 0;
   int mask = CEPH_STATX_MODE | CEPH_STATX_UID | CEPH_STATX_GID |
              CEPH_STATX_SIZE | CEPH_STATX_MTIME;
-  if (cur_entry->fh.ll_info.c_inode == nullptr) {
-    ceph_assert(cur_entry->fh.ll_info.c_parent_inode.back() != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.c_info.parent != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.c_info.parent->inode != nullptr);
+  ceph_assert(!cur_entry->fh.ll_info.c_info.gap);
+  if (cur_entry->fh.ll_info.c_info.inode == nullptr) {
     r = replayer->ll_open_inode(
-        replayer->m_local_mount, cur_entry->fh.ll_info.c_parent_inode.back(),
-        cur_entry->fh.ll_info.c_path, cur_entry->fh.ll_info.c_inode,
-        cur_entry->stx, (cur_entry->stat_known ? 0 : mask),
-        replayer->m_local_perms);
+        replayer->m_local_mount, cur_entry->fh.ll_info.c_info, cur_entry->stx,
+        (cur_entry->stat_known ? 0 : mask), replayer->m_local_perms);
     if (r < 0) {
       derr << ": failed to do low level opening of cur snapshot's cur entry= "
            << abs_path(registry->dir_root, cur_entry->epath, fh.m_current.first,
@@ -2522,10 +2673,9 @@ int SyncMechanism::ll_populate_cur_stat_and_cur_inode() {
       return r;
     }
   } else if (!cur_entry->stat_known) {
-    r = ceph_ll_getattr(replayer->m_local_mount,
-                        cur_entry->fh.ll_info.c_inode.get(), &cur_entry->stx,
-                        mask, replayer->sync_flags,
-                        replayer->m_local_perms);
+    r = ceph_ll_getattr(
+        replayer->m_local_mount, cur_entry->fh.ll_info.c_info.inode.get(),
+        &cur_entry->stx, mask, replayer->sync_flags, replayer->m_local_perms);
     if (r < 0) {
       derr << ": failed to gather low level stat of cur snapshot's cur entry= "
            << abs_path(registry->dir_root, cur_entry->epath, fh.m_current.first,
@@ -2572,13 +2722,13 @@ int SyncMechanism::ll_populate_prev_stat_and_prev_inode() {
   if (create_fresh || (purge_remote && cur_entry->prev_d_type != -1)) {
     return 0;
   }
-  if (cur_entry->fh.ll_info.p_inode == nullptr) {
-    ceph_assert(cur_entry->fh.ll_info.p_parent_inode.back() != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.p_info.parent != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.p_info.parent->inode != nullptr);
+  if (cur_entry->fh.ll_info.p_info.inode == nullptr) {
     r = replayer->ll_open_inode(
-        fh.p_mnt, cur_entry->fh.ll_info.p_parent_inode.back(),
-        cur_entry->fh.ll_info.p_path, cur_entry->fh.ll_info.p_inode,
-        cur_entry->pstx, (cur_entry->pstat_known ? 0 : mask),
-        fh.ll_info.p_perms);
+        fh.p_mnt, cur_entry->fh.ll_info.p_info, cur_entry->pstx,
+        (cur_entry->pstat_known ? 0 : mask), fh.ll_info.p_perms);
+    ceph_assert(!cur_entry->fh.ll_info.p_info.gap);
     if (r < 0 && r != -ENOENT) {
       derr << ": failed to do low level openning of diff base's cur entry= "
            << (fh.p_mnt == replayer->m_local_mount
@@ -2589,9 +2739,10 @@ int SyncMechanism::ll_populate_prev_stat_and_prev_inode() {
       return r;
     }
   } else if (!cur_entry->pstat_known) {
-    r = ceph_ll_getattr(
-        fh.p_mnt, cur_entry->fh.ll_info.p_inode.get(), &cur_entry->pstx, mask,
-        replayer->sync_flags, fh.ll_info.p_perms);
+    ceph_assert(!cur_entry->fh.ll_info.p_info.gap);
+    r = ceph_ll_getattr(fh.p_mnt, cur_entry->fh.ll_info.p_info.inode.get(),
+                        &cur_entry->pstx, mask, replayer->sync_flags,
+                        fh.ll_info.p_perms);
     if (r < 0 && r != -ENOENT) {
       derr << ": failed to gather low level stat of diff base's cur entry= "
            << (fh.p_mnt == replayer->m_local_mount
@@ -2656,6 +2807,9 @@ void LL_DeleteMechanism::finish(int r) {
     goto notify_finish;
   }
   r = ll_cleanup_remote_entry();
+  if (r < 0) {
+    registry->set_failed(r);
+  }
 notify_finish:
   registry->dec_sync_indicator();
 }
@@ -2825,32 +2979,47 @@ bool DirSyncMechanism::try_spawning(SyncMechanism *syncm) {
 
 void PeerReplayer::SyncEntry::rollout(FHandles &parent_fh,
                                       const std::string &ename) {
-  if (parent_fh.ll_info.c_inode != nullptr) {
-    fh.ll_info.c_parent_inode = parent_fh.ll_info.c_parent_inode;
-    fh.ll_info.c_parent_inode.push_back(parent_fh.ll_info.c_inode);
-    fh.ll_info.c_path = ename;
+  ceph_assert(parent_fh.ll_info.c_info.parent != nullptr);
+  ceph_assert(parent_fh.ll_info.c_info.parent->inode != nullptr);
+  ceph_assert(parent_fh.ll_info.p_info.parent != nullptr);
+  ceph_assert(parent_fh.ll_info.p_info.parent->inode != nullptr);
+  ceph_assert(parent_fh.ll_info.r_info.parent != nullptr);
+  ceph_assert(parent_fh.ll_info.r_info.parent->inode != nullptr);
+  if (parent_fh.ll_info.c_info.inode != nullptr) {
+    ceph_assert(!parent_fh.ll_info.c_info.gap);
+    fh.ll_info.c_info.parent = std::make_shared<AncestorsLink>(
+        parent_fh.ll_info.c_info.parent, parent_fh.ll_info.c_info.inode);
+    fh.ll_info.c_info.gap = false;
+    fh.ll_info.c_info.path = ename;
   } else {
-    ceph_assert(parent_fh.ll_info.c_parent_inode.back() != nullptr);
-    fh.ll_info.c_parent_inode = parent_fh.ll_info.c_parent_inode;
-    fh.ll_info.c_path = std::move(entry_path(parent_fh.ll_info.c_path, ename));
+    fh.ll_info.c_info.parent = parent_fh.ll_info.c_info.parent;
+    fh.ll_info.c_info.gap = true;
+    fh.ll_info.c_info.path =
+        std::move(entry_path(parent_fh.ll_info.c_info.path, ename));
   }
-  if (parent_fh.ll_info.p_inode != nullptr) {
-    fh.ll_info.p_parent_inode = parent_fh.ll_info.p_parent_inode;
-    fh.ll_info.p_parent_inode.push_back(parent_fh.ll_info.p_inode);
-    fh.ll_info.p_path = ename;
+  if (parent_fh.ll_info.p_info.inode != nullptr) {
+    ceph_assert(!parent_fh.ll_info.p_info.gap);
+    fh.ll_info.p_info.parent = std::make_shared<AncestorsLink>(
+        parent_fh.ll_info.p_info.parent, parent_fh.ll_info.p_info.inode);
+    fh.ll_info.p_info.gap = false;
+    fh.ll_info.p_info.path = ename;
   } else {
-    ceph_assert(parent_fh.ll_info.p_parent_inode.back() != nullptr);
-    fh.ll_info.p_parent_inode = parent_fh.ll_info.p_parent_inode;
-    fh.ll_info.p_path = std::move(entry_path(parent_fh.ll_info.p_path, ename));
+    fh.ll_info.p_info.parent = parent_fh.ll_info.p_info.parent;
+    fh.ll_info.p_info.gap = true;
+    fh.ll_info.p_info.path =
+        std::move(entry_path(parent_fh.ll_info.p_info.path, ename));
   }
-  if (parent_fh.ll_info.r_inode != nullptr) {
-    fh.ll_info.r_parent_inode = parent_fh.ll_info.r_parent_inode;
-    fh.ll_info.r_parent_inode.push_back(parent_fh.ll_info.r_inode);
-    fh.ll_info.r_path = ename;
+  if (parent_fh.ll_info.r_info.inode != nullptr) {
+    ceph_assert(!parent_fh.ll_info.r_info.gap);
+    fh.ll_info.r_info.parent = std::make_shared<AncestorsLink>(
+        parent_fh.ll_info.r_info.parent, parent_fh.ll_info.r_info.inode);
+    fh.ll_info.r_info.gap = false;
+    fh.ll_info.r_info.path = ename;
   } else {
-    ceph_assert(parent_fh.ll_info.r_parent_inode.back() != nullptr);
-    fh.ll_info.r_parent_inode = parent_fh.ll_info.r_parent_inode;
-    fh.ll_info.r_path = std::move(entry_path(parent_fh.ll_info.r_path, ename));
+    fh.ll_info.r_info.parent = parent_fh.ll_info.r_info.parent;
+    fh.ll_info.r_info.gap = true;
+    fh.ll_info.r_info.path =
+        std::move(entry_path(parent_fh.ll_info.r_info.path, ename));
   }
 }
 
@@ -3090,10 +3259,7 @@ int DirSnapDiffSync::ll_sync_current_entry() {
       cur_entry->purge_remote() || (need_data_sync && failed_prev)) {
     SyncMechanism *syncm = nullptr;
     if (failed_prev) {
-      cur_entry->fh.ll_info.p_parent_inode =
-          cur_entry->fh.ll_info.r_parent_inode;
-      cur_entry->fh.ll_info.p_inode = cur_entry->fh.ll_info.r_inode;
-      cur_entry->fh.ll_info.p_path = cur_entry->fh.ll_info.r_path;
+      cur_entry->fh.ll_info.p_info = cur_entry->fh.ll_info.r_info;
       cur_entry->change_mask = 0;     // we need to re-calculate for remote
       cur_entry->pstat_known = false; // we need to re-calculate for remote
       cur_entry->prev_d_type = -1;    // we need to re-calculate for remote
@@ -3127,11 +3293,11 @@ int DirSnapDiffSync::ll_sync_current_entry() {
     cur_entry = nullptr;
     return 0;
   }
-  ceph_assert(cur_entry->fh.ll_info.p_inode != nullptr);
-  ceph_assert(cur_entry->fh.ll_info.c_inode != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.p_info.inode != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.c_info.inode != nullptr);
   r = ceph_ll_open_snapdiff(replayer->m_local_mount,
-                            cur_entry->fh.ll_info.p_inode.get(),
-                            cur_entry->fh.ll_info.c_inode.get(),
+                            cur_entry->fh.ll_info.p_info.inode.get(),
+                            cur_entry->fh.ll_info.c_info.inode.get(),
                             &cur_entry->info, replayer->m_local_perms);
 
   if (r != 0) {
@@ -3322,12 +3488,12 @@ int DirBruteDiffSync::ll_go_next() {
     d_entry->stat_known = true;
     d_entry->rollout(entry->fh, e_name);
     ceph_assert(c_inode_raw != nullptr);
-    d_entry->fh.ll_info.c_inode =
+    d_entry->fh.ll_info.c_info.inode =
         create_inode_shared_ptr(replayer->m_local_mount, c_inode_raw);
     if (!entry->create_fresh() && !entry->purge_remote()) {
       auto it = entry->cache_map.find(e_name);
       if (it != entry->cache_map.end()) {
-        d_entry->fh.ll_info.p_inode = std::move(it->second.p_inode);
+        d_entry->fh.ll_info.p_info.inode = std::move(it->second.p_inode);
         d_entry->pstx = it->second.pstx;
         d_entry->pstat_known = true;
         d_entry->prev_d_type =
@@ -3478,9 +3644,7 @@ int DirBruteDiffSync::ll_sync_current_entry() {
   if (failed_prev && fh.p_mnt == replayer->m_local_mount &&
       (cur_entry->create_fresh() || cur_entry->purge_remote() ||
        need_data_sync)) {
-    cur_entry->fh.ll_info.p_parent_inode = cur_entry->fh.ll_info.r_parent_inode;
-    cur_entry->fh.ll_info.p_inode = cur_entry->fh.ll_info.r_inode;
-    cur_entry->fh.ll_info.p_path = cur_entry->fh.ll_info.r_path;
+    cur_entry->fh.ll_info.p_info = cur_entry->fh.ll_info.r_info;
     cur_entry->change_mask = 0;     // we need to re-calculate for remote
     cur_entry->pstat_known = false; // we need to re-calculate for remote
     cur_entry->prev_d_type = -1;    // we need to re-calculate for remote
@@ -3492,11 +3656,14 @@ int DirBruteDiffSync::ll_sync_current_entry() {
     return 0;
   }
 
+  ll_populate_remote_inode_with_diff_base();
+
   if (cur_entry->purge_remote()) {
     SyncMechanism *syncm = new LL_DeleteMechanism(
         replayer->m_local_mount, cur_entry, registry, sync_stat, fh, replayer);
     registry->sync_pool->sync_direct(syncm, local_stat);
     cur_entry->change_mask |= PeerReplayer::SyncEntry::CREATE_FRESH;
+    cur_entry->fh.ll_info.r_info.inode = nullptr;
   }
 
   if (cur_entry->create_fresh()) {
@@ -3532,10 +3699,10 @@ int DirBruteDiffSync::ll_sync_current_entry() {
     cur_entry = nullptr;
     return 0;
   }
-  ceph_assert(cur_entry->fh.ll_info.c_inode != nullptr);
+  ceph_assert(cur_entry->fh.ll_info.c_info.inode != nullptr);
   r = replayer->ll_open_dirp(replayer->m_local_mount,
-                             cur_entry->fh.ll_info.c_inode, cur_entry->udirp,
-                             replayer->m_local_perms);
+                             cur_entry->fh.ll_info.c_info.inode,
+                             cur_entry->udirp, replayer->m_local_perms);
   if (r < 0) {
     derr << ": failed to do low level opendir of cur snapshot's cur entry="
          << abs_path(registry->dir_root, cur_entry->epath, fh.m_current.first,
@@ -3695,7 +3862,7 @@ int PeerReplayer::ll_do_synchronize(const std::string &dir_root,
                                     const Snapshot &current,
                                     boost::optional<Snapshot> prev) {
   dout(0)
-      << "cephfs_mirror_file_sync_thread="
+      << ": cephfs_mirror_file_sync_thread="
       << g_ceph_context->_conf.get_val<uint64_t>(
              "cephfs_mirror_file_sync_thread")
       << ", cephfs_mirror_dir_scanning_thread=" << dir_scanning_thread
@@ -3746,7 +3913,7 @@ int PeerReplayer::ll_do_synchronize(const std::string &dir_root,
          << ": " << cpp_strerror(r) << dendl;
     return r;
   }
-  if (registry->snapdiff_fh.ll_info.p_parent_inode.back() == nullptr) {
+  if (registry->snapdiff_fh.ll_info.p_info.inode == nullptr) {
     r = set_snap_id_attr(dir_root, "ceph.mirror.diff_base", 0);
     if (r < 0) {
       return r;
@@ -3771,14 +3938,13 @@ int PeerReplayer::ll_do_synchronize(const std::string &dir_root,
   SyncMechanism *syncm = nullptr;
   std::shared_ptr<SyncEntry> cur_entry =
       std::make_shared<SyncEntry>("");
-  cur_entry->fh =
-      (registry->snapdiff_fh.ll_info.p_parent_inode.back() == nullptr)
-          ? registry->remotediff_fh
-          : registry->snapdiff_fh;
+  cur_entry->fh = (registry->snapdiff_fh.ll_info.p_info.inode == nullptr)
+                      ? registry->remotediff_fh
+                      : registry->snapdiff_fh;
 
   std::shared_ptr <SyncEntry> root_entry = cur_entry;
 
-  if (registry->snapdiff_fh.ll_info.p_parent_inode.back() != nullptr) {
+  if (registry->snapdiff_fh.ll_info.p_info.inode != nullptr) {
     if (use_snapdiff_api) {
       sync_stat->current_stat.set_diff_base("ll_local_snapdiff_diff_base_" +
                                             (*prev).first);
@@ -3825,7 +3991,7 @@ int PeerReplayer::ll_do_synchronize(const std::string &dir_root,
 int PeerReplayer::do_synchronize(const std::string &dir_root, const Snapshot &current,
                                  boost::optional<Snapshot> prev) {
   dout(0)
-      << "cephfs_mirror_file_sync_thread="
+      << ":cephfs_mirror_file_sync_thread="
       << g_ceph_context->_conf.get_val<uint64_t>(
              "cephfs_mirror_file_sync_thread")
       << ", cephfs_mirror_dir_scanning_thread=" << dir_scanning_thread

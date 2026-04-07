@@ -420,15 +420,25 @@ private:
   using Snapshot = std::pair<std::string, uint64_t>;
   using SnapshotPair = std::pair<Snapshot, Snapshot>;
   class DirSyncPool;
+  struct AncestorsLink {
+    std::shared_ptr <AncestorsLink> link = nullptr;
+    InodeSharedPtr inode = nullptr;
+    AncestorsLink() {}
+    AncestorsLink(std::shared_ptr<AncestorsLink> &&_link,
+                  InodeSharedPtr &&_inode)
+        : link(std::move(_link)), inode(std::move(_inode)) {}
+    AncestorsLink(const std::shared_ptr<AncestorsLink> &_link,
+                  const InodeSharedPtr &_inode)
+        : link(_link), inode(_inode) {}
+  };
   struct FHandles {
     struct LL_Fhandle_Info {
-      std::vector<InodeSharedPtr> c_parent_inode = {nullptr};
-      InodeSharedPtr c_inode = nullptr;
-      std::vector<InodeSharedPtr> p_parent_inode = {nullptr};
-      InodeSharedPtr p_inode = nullptr;
-      std::vector<InodeSharedPtr> r_parent_inode = {nullptr};
-      InodeSharedPtr r_inode = nullptr;
-      std::string c_path = "", p_path = "", r_path = "";
+      struct InodeInfo{
+        std::shared_ptr <AncestorsLink> parent = nullptr;
+        InodeSharedPtr inode = nullptr;
+        std::string path = "";
+        bool gap = false;  
+      }c_info, p_info, r_info;
       UserPermRef p_perms;
     }ll_info;
     // open file descriptor on the snap directory for snapshot
@@ -760,9 +770,14 @@ private:
   int should_sync_entry(const std::string &epath, const struct ceph_statx &cstx,
                         const FHandles &fh, bool *need_data_sync, bool *need_attr_sync);
 
-  int ll_open_inode(MountRef mnt, InodeSharedPtr &parent_inode,
+  int ll_open_inode(MountRef mnt, FHandles::LL_Fhandle_Info::InodeInfo &info,
+                    struct ceph_statx &stx, unsigned int want,
+                    UserPermRef perms);
+  int ll_open_inode(MountRef mnt, InodeSharedPtr &parent,
                     const std::string &dir_path, InodeSharedPtr &inode_shared,
                     struct ceph_statx &stx, unsigned int want,
+                    UserPermRef perms);
+  int ll_reduce_gap(MountRef mnt, FHandles::LL_Fhandle_Info::InodeInfo &info,
                     UserPermRef perms);
   int ll_open_dirp(MountRef mnt, InodeSharedPtr &inode, DirUniquePtr &udirp,
                    UserPermRef perms);
