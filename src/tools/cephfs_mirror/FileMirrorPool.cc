@@ -140,7 +140,7 @@ void FileMirrorPool::sync_file_data(FileSyncMechanism *task, int sync_idx) {
     });
     if (!active) {
       task->complete(-1);
-      sq->give_cv.notify_one();
+      sq->give_cv.notify_all();
       return;
     }
     if (sq->sync_queue.empty()) {

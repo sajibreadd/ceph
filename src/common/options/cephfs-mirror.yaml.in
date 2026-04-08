@@ -260,3 +260,27 @@ options:
   services:
   - cephfs-mirror
   min: 0
+- name: cephfs_mirror_turn_off_assert
+  type: bool
+  level: advanced
+  desc: if this true, asserts in PeerReplayer will be turned off
+  long_desc: if this true, asserts in PeerReplayer will be turned off
+  default: false
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_snap_prefix
+  type: str
+  level: advanced
+  desc: this allows snapshots having specific prefix
+  long_desc: this allows snapshots having specific prefix
+  default: 
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_sync_from_remote
+  type: bool
+  level: advanced
+  desc: if this true, diff base will be remote
+  long_desc: if this true, diff base will be remote
+  default: false
+  services:
+  - cephfs-mirror

@@ -414,7 +414,9 @@ private:
   bool use_at_statx_dont_sync = true;
   unsigned int sync_flags = AT_SYMLINK_NOFOLLOW | AT_STATX_DONT_SYNC;
   uint64_t stat_flush_counter_gap = 100;
-
+  bool turn_off_assert = false;
+  std::string snap_prefix = "";
+  bool sync_from_remote = false;
       // file descriptor "triplet" for synchronizing a snapshot
   // w/ an added MountRef for accessing "previous" snapshot.
   using Snapshot = std::pair<std::string, uint64_t>;
@@ -582,7 +584,8 @@ private:
       return (change_mask & WASNT_DIR_IN_PREV_SNAPSHOT);
     }
 
-    void rollout(FHandles &parent_fh, const std::string &ename);
+    void rollout(FHandles &parent_fh, const std::string &ename,
+                 PeerReplayer *replayer);
   };
 
   class DirSyncPool {
