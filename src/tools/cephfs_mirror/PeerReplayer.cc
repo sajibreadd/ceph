@@ -1104,7 +1104,7 @@ int FileSyncMechanism::ll_copy_to_remote() {
     r = ceph_ll_create(replayer->m_remote_mount,
                        cur_entry->fh.ll_info.r_info.parent->inode.get(),
                        cur_entry->fh.ll_info.r_info.path.c_str(),
-                       cur_entry->stx.stx_mode, O_CREAT | O_WRONLY | O_NOFOLLOW,
+                       cur_entry->stx.stx_mode, O_CREAT | O_WRONLY | O_NOFOLLOW | O_TRUNC,
                        &inode_raw, &fh_raw, &rstx, 0, replayer->sync_flags,
                        replayer->m_remote_perms);
     if (r < 0) {
@@ -1121,7 +1121,8 @@ int FileSyncMechanism::ll_copy_to_remote() {
   } else {
     r = ceph_ll_open(replayer->m_remote_mount,
                      cur_entry->fh.ll_info.r_info.inode.get(),
-                     O_WRONLY | O_NOFOLLOW, &fh_raw, replayer->m_remote_perms);
+                     O_WRONLY | O_NOFOLLOW | O_TRUNC,
+                     &fh_raw, replayer->m_remote_perms);
     if (r < 0) {
       derr << ": failed to open remote file path="
            << abs_path(registry->dir_root, cur_entry->epath) << ": "
@@ -1183,15 +1184,6 @@ int FileSyncMechanism::ll_copy_to_remote() {
   if (r < 0) {
     goto free_ptr;
   }
-  file_worker->state = FileMirrorPool::FileWorker::ThreadState::FILE_FTRUNC;
-  r = ll_update_remote_stat();
-  if (r < 0) {
-    derr << ": failed to populate low level stat of remote cur entry"
-            "entry= "
-         << abs_path(registry->dir_root, cur_entry->epath) << ": "
-         << cpp_strerror(r) << dendl;
-    goto free_ptr;
-  }
 
   file_worker->state = FileMirrorPool::FileWorker::ThreadState::FILE_FSYNC;
   r = ceph_ll_fsync(replayer->m_remote_mount, r_fh.get(), 0);
@@ -1201,6 +1193,30 @@ int FileSyncMechanism::ll_copy_to_remote() {
          << cpp_strerror(r) << dendl;
     goto free_ptr;
   }
+  file_worker->state = FileMirrorPool::FileWorker::ThreadState::FILE_FTRUNC;
+  r = ll_update_remote_stat();
+  if (r < 0) {
+    derr << ": failed to populate low level stat of remote cur entry"
+            "entry= "
+         << abs_path(registry->dir_root, cur_entry->epath) << ": "
+         << cpp_strerror(r) << dendl;
+    goto free_ptr;
+  }
+  // if (fh.p_mnt == replayer->m_remote_mount) {
+  //   dout(0) << ": --->" << cur_entry->epath
+  //          << ", p_inode=" << cur_entry->fh.ll_info.p_info.inode
+  //          << ", c_inode=" << cur_entry->fh.ll_info.c_info.inode
+  //          << ", r_inode=" << cur_entry->fh.ll_info.r_info.inode
+  //          << ", S_ISDIR(cur_entry->stx.stx_mode)=" << S_ISDIR(cur_entry->stx.stx_mode)
+  //          << ", create_fresh=" << cur_entry->create_fresh()
+  //          << ", purge_remote=" << cur_entry->purge_remote()
+  //          << ", cur_entry->stx.stx_mtime=" << cur_entry->stx.stx_mtime
+  //          << ", cur_entry->pstx.stx_mtime=" << cur_entry->pstx.stx_mtime
+  //          << ", cur_entry->stx.stx_size=" << cur_entry->stx.stx_size
+  //          << ", cur_entry->pstx.stx_size=" << cur_entry->pstx.stx_size
+  //          << ", total_wrote=" << total_wrote
+  //          << dendl;
+  // }
 free_ptr:
   free(ptr);
   // dout(0) << ": 2--->" << cur_entry->epath << dendl;
@@ -2664,9 +2680,9 @@ int SyncMechanism::ll_update_remote_stat() {
     if ((cstx.stx_mode & ~S_IFMT) != (pstx.stx_mode & ~S_IFMT)) {
       mask = mask | CEPH_SETATTR_MODE;
     }
-    if (cstx.stx_size != pstx.stx_size && !S_ISDIR(cstx.stx_mode)) {
-      mask = mask | CEPH_SETATTR_SIZE;
-    }
+    // if (cstx.stx_size != pstx.stx_size && !S_ISDIR(cstx.stx_mode)) {
+    //   mask = mask | CEPH_SETATTR_SIZE;
+    // }
     if (cstx.stx_uid != pstx.stx_uid) {
       mask = mask | CEPH_SETATTR_UID;
     }
@@ -2679,7 +2695,8 @@ int SyncMechanism::ll_update_remote_stat() {
   } else {
     mask = CEPH_SETATTR_MODE | CEPH_SETATTR_UID | CEPH_SETATTR_GID;
     if (!S_ISDIR(cstx.stx_mode)) {
-      mask |= (CEPH_SETATTR_MTIME | CEPH_SETATTR_SIZE);
+      // mask |= (CEPH_SETATTR_MTIME | CEPH_SETATTR_SIZE);
+      mask |= (CEPH_SETATTR_MTIME);
     }
   }
   if (S_ISDIR(cstx.stx_mode)) {
@@ -3702,9 +3719,6 @@ int DirBruteDiffSync::go_next() {
 }
 
 int DirBruteDiffSync::ll_sync_current_entry() {
-  // dout(0) << ": --->" << cur_entry->epath << ", "
-  //         << ((fh.p_mnt == replayer->m_remote_mount) ? "remote" : "local")
-  //         << dendl;
   int r = 0;
   bool failed_prev =
       (sync_stat->synced_snap_count == 0 || sync_stat->nr_failures > 0);
@@ -3753,6 +3767,21 @@ int DirBruteDiffSync::ll_sync_current_entry() {
   }
 
   ll_populate_remote_inode_with_diff_base();
+  // if (fh.p_mnt == replayer->m_remote_mount) {
+  //   dout(0) << ": --->" << cur_entry->epath
+  //          << ", p_inode=" << cur_entry->fh.ll_info.p_info.inode
+  //          << ", c_inode=" << cur_entry->fh.ll_info.c_info.inode
+  //          << ", r_inode=" << cur_entry->fh.ll_info.r_info.inode
+  //          << ", S_ISDIR(cur_entry->stx.stx_mode)=" << S_ISDIR(cur_entry->stx.stx_mode)
+  //          << ", create_fresh=" << cur_entry->create_fresh()
+  //          << ", purge_remote=" << cur_entry->purge_remote()
+  //          << ", cur_entry->stx.stx_mtime=" << cur_entry->stx.stx_mtime
+  //          << ", cur_entry->pstx.stx_mtime=" << cur_entry->pstx.stx_mtime
+  //          << ", cur_entry->stx.stx_size=" << cur_entry->stx.stx_size
+  //          << ", cur_entry->pstx.stx_size=" << cur_entry->pstx.stx_size
+  //          << ", need_data_sync=" << need_data_sync
+  //          << dendl;
+  // }
 
   if (cur_entry->purge_remote()) {
     SyncMechanism *syncm = new LL_DeleteMechanism(
