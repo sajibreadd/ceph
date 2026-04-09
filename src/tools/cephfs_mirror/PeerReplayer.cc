@@ -1202,7 +1202,7 @@ int FileSyncMechanism::ll_copy_to_remote() {
          << cpp_strerror(r) << dendl;
     goto free_ptr;
   }
-  // if (fh.p_mnt == replayer->m_remote_mount) {
+  // if (fh.p_mnt == replayer->m_local_mount && fh.m_current.first == "snap_9") {
   //   dout(0) << ": --->" << cur_entry->epath
   //          << ", p_inode=" << cur_entry->fh.ll_info.p_info.inode
   //          << ", c_inode=" << cur_entry->fh.ll_info.c_info.inode
@@ -3379,6 +3379,22 @@ int DirSnapDiffSync::ll_sync_current_entry() {
     return 0;
   }
 
+  // if (fh.p_mnt == replayer->m_local_mount && fh.m_current.first == "snap_9") {
+  //   dout(0) << ": --->" << cur_entry->epath
+  //          << ", p_inode=" << cur_entry->fh.ll_info.p_info.inode
+  //          << ", c_inode=" << cur_entry->fh.ll_info.c_info.inode
+  //          << ", r_inode=" << cur_entry->fh.ll_info.r_info.inode
+  //          << ", S_ISDIR(cur_entry->stx.stx_mode)=" << S_ISDIR(cur_entry->stx.stx_mode)
+  //          << ", create_fresh=" << cur_entry->create_fresh()
+  //          << ", purge_remote=" << cur_entry->purge_remote()
+  //          << ", cur_entry->stx.stx_mtime=" << cur_entry->stx.stx_mtime
+  //          << ", cur_entry->pstx.stx_mtime=" << cur_entry->pstx.stx_mtime
+  //          << ", cur_entry->stx.stx_size=" << cur_entry->stx.stx_size
+  //          << ", cur_entry->pstx.stx_size=" << cur_entry->pstx.stx_size
+  //          << ", need_data_sync=" << need_data_sync
+  //          << dendl;
+  // }
+
   if (S_ISDIR(cur_entry->stx.stx_mode)) {
     r = ll_update_remote_stat();
     if (r < 0) {
@@ -3767,7 +3783,7 @@ int DirBruteDiffSync::ll_sync_current_entry() {
   }
 
   ll_populate_remote_inode_with_diff_base();
-  // if (fh.p_mnt == replayer->m_remote_mount) {
+  // if (fh.p_mnt == replayer->m_local_mount && fh.m_current.first == "snap_9") {
   //   dout(0) << ": --->" << cur_entry->epath
   //          << ", p_inode=" << cur_entry->fh.ll_info.p_info.inode
   //          << ", c_inode=" << cur_entry->fh.ll_info.c_info.inode
