@@ -417,6 +417,10 @@ private:
   bool turn_off_assert = false;
   std::string snap_prefix = "";
   bool sync_from_remote = false;
+  bool enable_local_batching = true;
+  uint64_t local_batch_size = 10000;
+  bool reset_inode_before_submission = false;
+
       // file descriptor "triplet" for synchronizing a snapshot
   // w/ an added MountRef for accessing "previous" snapshot.
   using Snapshot = std::pair<std::string, uint64_t>;
@@ -590,17 +594,19 @@ private:
 
   class DirSyncPool {
   public:
-    DirSyncPool(int num_threads, const std::string epath, const Peer &m_peer,
-                std::shared_ptr<SnapSyncStat> &sync_stat)
-        : num_threads(num_threads), active(false), queued(0), qlimit(0),
-          epath(epath), m_peer(m_peer), sync_stat(sync_stat) {}
+    DirSyncPool(int num_threads, int qlimit, const std::string epath,
+                const Peer &m_peer, std::shared_ptr<SnapSyncStat> &sync_stat,
+                PeerReplayer *replayer, DirRegistry *registry)
+        : num_threads(num_threads), active(false), queued(0), qlimit(qlimit),
+          epath(epath), m_peer(m_peer), sync_stat(sync_stat),
+          replayer(replayer), registry(registry) {}
     void activate();
     void deactivate();
     bool try_sync(SyncMechanism *task);
-    void sync_anyway(SyncMechanism *task,
-                     LocalSyncStat *local_stat);
-    void sync_direct(SyncMechanism *task,
-                     LocalSyncStat *local_stat);
+    void sync_anyway(SyncMechanism *task, LocalSyncStat *local_stat,
+                     std::queue<FileSyncMechanism *> *local_batch);
+    void sync_direct(SyncMechanism *task, LocalSyncStat *local_stat,
+                     std::queue<FileSyncMechanism *> *local_batch);
     void update_state(int thread_count);
     void dump_stats(Formatter *f) {
       std::scoped_lock lock(mtx);
@@ -609,6 +615,7 @@ private:
     void update_qlimit(int _qlimit);
     void set_low_level(bool _low_level) { low_level = _low_level; }
     bool get_low_level() { return low_level; }
+    void sync_finish();
     friend class PeerReplayer;
 
   private:
@@ -617,6 +624,7 @@ private:
       bool active = false;
       std::thread worker;
       LocalSyncStat local_stat;
+      std::queue <FileSyncMechanism *> local_batch;
       void join() {
         if (worker.joinable()) {
           worker.join();
@@ -638,6 +646,8 @@ private:
     const Peer &m_peer; // just for using dout
     std::shared_ptr<SnapSyncStat>& sync_stat;
     bool low_level = false;
+    PeerReplayer *replayer = nullptr;
+    DirRegistry *registry = nullptr;
   };
 
   bool is_stopping() {
@@ -763,7 +773,8 @@ private:
       const std::string &epath, DirRegistry *registry,
       std::shared_ptr<SnapSyncStat> &sync_stat, const FHandles &fh,
       std::unordered_map<std::string, unsigned int> &change_mask_map,
-      int &change_mask_map_size, LocalSyncStat *local_stat);
+      int &change_mask_map_size, LocalSyncStat *local_stat,
+      std::queue<FileSyncMechanism *> *local_batch);
   int cleanup_remote_entry(const std::string &epath, DirRegistry *registry,
                            const FHandles &fh,
                            std::shared_ptr<SnapSyncStat> &sync_stat,
@@ -828,8 +839,8 @@ private:
   int remote_file_op(std::shared_ptr<SyncEntry> &cur_entry,
                      DirRegistry *registry,
                      std::shared_ptr<SnapSyncStat> &sync_stat,
-                     LocalSyncStat *local_stat,
-                     const FHandles &fh);
+                     LocalSyncStat *local_stat, const FHandles &fh,
+                     std::queue<FileSyncMechanism *> *local_batch);
   int copy_to_remote(std::shared_ptr<SyncEntry> &cur_entry,
                      DirRegistry *registry, const FHandles &fh,
                      FileMirrorPool::FileWorker *_file_worker);
@@ -840,8 +851,10 @@ private:
   void _inc_failed_count(const std::string &dir_root);
   void _reset_failed_count(const std::string &dir_root);
   bool should_backoff(DirRegistry* registry, int *retval);
-  void enqueue_file_transfer(FileSyncMechanism *syncm, DirRegistry *registry,
-                             std::shared_ptr<SnapSyncStat> &sync_stat);
+  void
+  enqueue_file_transfer(FileSyncMechanism *syncm, DirRegistry *registry,
+                        std::shared_ptr<SnapSyncStat> &sync_stat,
+                        std::queue<FileSyncMechanism *> *local_batch);
   int64_t get_snap_id_attr(const std::string &dir_root,
                            const std::string &attr);
   int set_snap_id_attr(const std::string &dir_root, const std::string &attr,
@@ -875,8 +888,11 @@ public:
   bool sync_failed_or_canceled() {
     return (registry->failed || registry->canceled);
   }
+  void reset_inode();
   friend class DirSyncMechanism;
+  friend class PeerReplayer;
   LocalSyncStat* local_stat = nullptr;
+  std::queue<FileSyncMechanism *> *local_batch = nullptr;
 
 protected:
   MountRef m_local;
@@ -886,6 +902,7 @@ protected:
   std::shared_ptr<SnapSyncStat> &sync_stat;
   const PeerReplayer::FHandles &fh;
   PeerReplayer *replayer;
+  bool has_reset_inode = false;
   int populate_change_mask(const PeerReplayer::FHandles &fh);
   int populate_current_stat(const PeerReplayer::FHandles &fh);
   int ll_populate_cur_stat_and_cur_inode();

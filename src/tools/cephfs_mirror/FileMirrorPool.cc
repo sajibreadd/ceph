@@ -26,9 +26,10 @@ std::string FileMirrorPool::FileWorker::state_name[] = {
     "FILE_CLOSE_LOCAL"};
 
 FileMirrorPool::FileMirrorPool(int num_threads)
-    : num_threads(num_threads), qlimit(std::max(10 * num_threads, 5000)),
-      sync_count(0), active(false) {
+    : num_threads(num_threads), sync_count(0), active(false) {
   g_conf().add_observer(this);
+  qlimit =
+      g_ceph_context->_conf.get_val<uint64_t>("cephfs_mirror_file_queue_size");
 }
 
 void FileMirrorPool::activate() {
@@ -63,6 +64,15 @@ void FileMirrorPool::deactivate() {
   }
 }
 
+void FileMirrorPool::deactivate_queue(int sync_idx) {
+  std::scoped_lock lock(mtx);
+  ceph_assert(sync_idx >= 0 && sync_idx < sync_queues.size());
+  auto sq = sync_queues[sync_idx];
+  sq->active = false;
+  sq->drain_queue();
+  pick_cv.notify_all();
+}
+
 void FileMirrorPool::drain_queue(int idx) {
   {
     std::scoped_lock lock(mtx);
@@ -78,13 +88,19 @@ void FileMirrorPool::drain_queue(int idx) {
 }
 
 void FileMirrorPool::run(FileWorker *file_worker) {
+  int sync_idx = -1;
+  FileSyncMechanism *task;
+  SyncQueue *sq = nullptr;
+  bool sq_active = true;
+  bool mirror_active = true;
+  bool found_task = false;
   while (true) {
     file_worker->state = FileWorker::ThreadState::LOCKCONTEST;
-    int sync_idx = -1;
-    FileSyncMechanism *task;
-    SyncQueue* sq = nullptr;
     {
       std::unique_lock<std::mutex> lock(mtx);
+      if (sq && found_task) {
+        sq->dec_in_flight();
+      }
       file_worker->state = FileWorker::ThreadState::IDLE;
       pick_cv.wait(lock, [this, file_worker] {
         return (file_worker->stop_called || !sync_ring.empty());
@@ -100,16 +116,16 @@ void FileMirrorPool::run(FileWorker *file_worker) {
       sq = sync_queues[sync_idx];
 
       if (sq->sync_queue.empty()) {
+        found_task = false;
         continue;
       }
 
       task = sq->sync_queue.front();
-      file_worker->current_syncing_file.file_name = std::move(task->get_file_name());
-      file_worker->current_syncing_file.peer_uid = std::move(task->get_peer_uid());
+      file_worker->current_syncing_file.file_name = task->get_file_name();
+      file_worker->current_syncing_file.peer_uid = task->get_peer_uid();
       file_worker->current_syncing_file.file_size = task->get_file_size();
       sq->sync_queue.pop();
       if (sq->sync_stat) {
-        sq->sync_stat->current_stat.files_in_flight--;
         sq->sync_stat->current_stat.files_data_synced++;
         sq->sync_stat->current_stat.file_bytes_synced +=
             file_worker->current_syncing_file.file_size;
@@ -121,10 +137,15 @@ void FileMirrorPool::run(FileWorker *file_worker) {
       file_worker->file_transferred++;
       file_worker->bytes_synced = 0;
       task->set_worker_ref(file_worker);
+      if (sq->sync_queue.size() < qlimit) {
+        sq->give_cv.notify_one();
+      }
+      sq_active = sq->active;
+      mirror_active = active;
+      found_task = true;
     }
-    sq->give_cv.notify_one();
     task->local_stat = sq->local_stat;
-    task->complete(sq->get_low_level());
+    task->complete((sq_active && mirror_active) ? sq->get_low_level() : -1);
   }
 }
 
@@ -136,10 +157,11 @@ void FileMirrorPool::sync_file_data(FileSyncMechanism *task, int sync_idx) {
       sq->sync_stat->current_stat.files_in_flight++;
     }
     sq->give_cv.wait(lock, [this, &sq] {
-      return (!active || sq->sync_queue.size() < qlimit);
+      return (!active || !sq->active || sq->sync_queue.size() < qlimit);
     });
-    if (!active) {
+    if (!active || !sq->active) {
       task->complete(-1);
+      sq->dec_in_flight();
       sq->give_cv.notify_all();
       return;
     }
@@ -149,6 +171,39 @@ void FileMirrorPool::sync_file_data(FileSyncMechanism *task, int sync_idx) {
     sq->sync_queue.emplace(task);
   }
   pick_cv.notify_one();
+}
+
+void FileMirrorPool::sync_file_data(std::queue<FileSyncMechanism *> *batch,
+                                    int sync_idx) {
+  {
+    std::unique_lock<std::mutex> lock(mtx);
+    auto sq = sync_queues[sync_idx];
+    if (sq->sync_stat) {
+      sq->sync_stat->current_stat.files_in_flight += batch->size();
+    }
+    sq->give_cv.wait(lock, [this, &sq] {
+      return (!active || !sq->active || sq->sync_queue.size() < qlimit);
+    });
+    if (!active || !sq->active) {
+      while (!batch->empty()) {
+        auto task = batch->front();
+        task->complete(-1);
+        sq->dec_in_flight();
+        batch->pop();
+      }
+      sq->give_cv.notify_all();
+      return;
+    }
+    if (sq->sync_queue.empty() && !batch->empty()) {
+      sync_ring.emplace(sync_idx);
+    }
+    while (!batch->empty()) {
+      auto task = batch->front();
+      sq->sync_queue.emplace(task);
+      batch->pop();
+    }
+  }
+  pick_cv.notify_all();
 }
 
 int FileMirrorPool::sync_start(const std::string &dir_root,
@@ -171,11 +226,8 @@ int FileMirrorPool::sync_start(const std::string &dir_root,
   return sync_idx;
 }
 
-void FileMirrorPool::sync_finish(int sync_idx, const std::string &dir_root) {
-  std::scoped_lock lock(mtx);
+void FileMirrorPool::sync_cleanup(int sync_idx) {
   ceph_assert(sync_idx >= 0 && sync_idx < sync_queues.size());
-  ceph_assert(sync_queues[sync_idx]->dir_root == dir_root);
-
   sync_queues[sync_idx]->drain_queue();
   if (sync_queues[sync_idx]->sync_stat) {
     if (sync_queues[sync_idx]->local_stat) {
@@ -185,6 +237,24 @@ void FileMirrorPool::sync_finish(int sync_idx, const std::string &dir_root) {
     sync_queues[sync_idx]->sync_stat = nullptr;
   }
   unassigned_sync_ids.push_back(sync_idx);
+}
+
+void FileMirrorPool::sync_finish(int sync_idx, const std::string &dir_root) {
+  std::unique_lock<std::mutex> lock(mtx);
+  ceph_assert(sync_idx >= 0 && sync_idx < sync_queues.size());
+  auto sq = sync_queues[sync_idx];
+  ceph_assert(sq->dir_root == dir_root);
+  sq->done = true;
+  pick_cv.notify_all();
+  if (sq->sync_stat && sq->sync_stat->current_stat.files_in_flight == 0) {
+    sq->sync_finish_cond->complete(0);
+  }
+  else {
+    lock.unlock();
+    sq->sync_finish_cond->wait();
+    lock.lock();
+  }
+  sync_cleanup(sync_idx);
 }
 
 void FileMirrorPool::update_state(int thread_count) {
@@ -256,11 +326,18 @@ void FileMirrorPool::handle_conf_change(const ConfigProxy &conf,
     update_state(g_ceph_context->_conf.get_val<uint64_t>(
         "cephfs_mirror_file_sync_thread"));
   }
-  dout(0) << ": cephfs_mirror_file_sync_thread=" << num_threads << dendl;
+  if (changed.count("cephfs_mirror_file_queue_size")) {
+    std::scoped_lock lock(mtx);
+    qlimit = g_ceph_context->_conf.get_val<uint64_t>(
+        "cephfs_mirror_file_queue_size");
+  }
+  dout(0) << ": cephfs_mirror_file_sync_thread=" << num_threads
+          << ", cephfs_mirror_file_queue_size=" << qlimit << dendl;
 }
 
 const char **FileMirrorPool::get_tracked_conf_keys() const {
-  static const char *KEYS[] = {"cephfs_mirror_file_sync_thread", NULL};
+  static const char *KEYS[] = {"cephfs_mirror_file_sync_thread",
+                               "cephfs_mirror_file_queue_size", NULL};
   return KEYS;
 }
 
@@ -268,6 +345,26 @@ FileMirrorPool::SyncQueue::SyncQueue(
     const std::string &dir_root, const std::shared_ptr<SnapSyncStat> &sync_stat)
     : dir_root(dir_root), sync_stat(sync_stat) {
   local_stat = new LocalSyncStat();
+  sync_finish_cond = std::make_unique<C_SaferCond>();
+  done = false;
+  active = true;
+}
+
+FileMirrorPool::SyncQueue::~SyncQueue() {
+  if (local_stat) {
+    delete local_stat;
+    local_stat = nullptr;
+  }
+}
+
+void FileMirrorPool::SyncQueue::dec_in_flight() {
+  if (sync_stat) {
+    sync_stat->current_stat.files_in_flight--;
+    if (done && sync_queue.empty() &&
+        sync_stat->current_stat.files_in_flight == 0) {
+      sync_finish_cond->complete(0);
+    }
+  }
 }
 
 void FileMirrorPool::SyncQueue::drain_queue() {
@@ -275,6 +372,7 @@ void FileMirrorPool::SyncQueue::drain_queue() {
     auto &task = sync_queue.front();
     task->complete(-1);
     sync_queue.pop();
+    dec_in_flight();
   }
   give_cv.notify_all();
 }

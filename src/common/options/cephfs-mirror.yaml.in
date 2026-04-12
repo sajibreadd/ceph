@@ -284,3 +284,37 @@ options:
   default: false
   services:
   - cephfs-mirror
+- name: cephfs_mirror_enable_local_batching
+  type: bool
+  level: advanced
+  desc: if this true, directory scanning thread will do local batching
+  long_desc: if this true, directory scanning thread will do local batching
+  default: true
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_local_batch_size
+  type: uint
+  level: advanced
+  desc: local batch size in single thread
+  long_desc: local batch size in single thread
+  default: 10000
+  services:
+  - cephfs-mirror
+  min: 1
+- name: cephfs_mirror_file_queue_size
+  type: uint
+  level: advanced
+  desc: number of file transfer request in a queue
+  long_desc: number of file transfer request in a queue
+  default: 100000
+  services:
+  - cephfs-mirror
+  min: 1
+- name: cephfs_mirror_reset_inode_before_submission
+  type: bool
+  level: advanced
+  desc: if this true, file inode will be reset before submission
+  long_desc: if this true, file inode will be reset before submission
+  default: false
+  services:
+  - cephfs-mirror

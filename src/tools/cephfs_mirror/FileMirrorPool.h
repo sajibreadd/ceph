@@ -9,6 +9,7 @@
 #include "common/Formatter.h"
 #include "common/Thread.h"
 #include "common/config_obs.h"
+#include "common/Cond.h"
 
 
 namespace cephfs {
@@ -26,13 +27,16 @@ class FileMirrorPool : public md_config_obs_t{
                             const std::set<std::string> &changed) override;
     void activate();
     void deactivate();
+    void deactivate_queue(int sync_idx);
     void sync_file_data(FileSyncMechanism *task, int sync_idx);
+    void sync_file_data(std::queue<FileSyncMechanism *> *batch, int sync_idx);
     int sync_start(const std::string &dir_root,
                    const std::shared_ptr<SnapSyncStat> &sync_stat,
                    bool low_level = false);
     void sync_finish(int idx, const std::string &dir_root);
     void update_state(int thread_count);
     void drain_queue(int idx = -1);
+    void sync_cleanup(int sync_idx);
     void dump_stats(Formatter *f);
     struct FileWorker {
       struct FileInfo {
@@ -91,28 +95,36 @@ class FileMirrorPool : public md_config_obs_t{
       bool low_level = false;
       std::shared_ptr<SnapSyncStat> sync_stat = nullptr;
       LocalSyncStat* local_stat = nullptr;
+      bool done = false;
+      bool active = true;
+      std::unique_ptr<C_SaferCond> sync_finish_cond;
       SyncQueue(const std::string &dir_root,
                 const std::shared_ptr<SnapSyncStat> &sync_stat);
-      ~SyncQueue() {
-        if (local_stat) {
-          delete local_stat;
-          local_stat = nullptr;
-        }
-      }
+      ~SyncQueue();
       SyncQueue(const SyncQueue &other)
           : dir_root(other.dir_root), sync_queue(other.sync_queue),
-            sync_stat(other.sync_stat), local_stat(local_stat) {}
+            low_level(other.low_level), sync_stat(other.sync_stat),
+            local_stat(local_stat), done(other.done), active(other.active) {
+        sync_finish_cond = std::make_unique<C_SaferCond>();
+      }
 
       SyncQueue& operator=(const SyncQueue& other) {
         if (this != &other) {
           dir_root = other.dir_root;
           sync_queue = other.sync_queue;
+          low_level = other.low_level;
+          sync_stat = other.sync_stat;
+          local_stat = other.local_stat;
+          done = other.done;
+          active = other.active;
+          sync_finish_cond = std::make_unique<C_SaferCond>();
         }
         return *this;
       }
       void drain_queue();
       void set_low_level(bool _low_level) { low_level = _low_level; }
       bool get_low_level() { return low_level; }
+      void dec_in_flight();
     };
 
     void run(FileWorker* file_worker);
