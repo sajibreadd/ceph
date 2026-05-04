@@ -518,6 +518,7 @@ private:
     bool pstat_known = false;
     DirUniquePtr udirp = nullptr;
     std::unordered_map<std::string, PeerReplayer::CacheInfo> cache_map;
+    std::unordered_map<std::string, std::pair<int, int>> snapdiff_map;
     int prev_d_type = -1;
     // ll_info
 
@@ -1006,7 +1007,6 @@ private:
   virtual int ll_go_next() = 0;
   virtual int sync_current_entry() = 0;
   virtual int ll_sync_current_entry() = 0;
-  virtual void ll_finish_sync() = 0;
 };
 
 class DirBruteDiffSync : public DirSyncMechanism {
@@ -1029,7 +1029,6 @@ private:
   int ll_go_next() override;
   int sync_current_entry() override;
   int ll_sync_current_entry() override;
-  void ll_finish_sync() override {}
 };
 
 class DirSnapDiffSync : public DirSyncMechanism {
@@ -1049,7 +1048,6 @@ private:
   int sync_current_entry() override;
   int ll_sync_current_entry() override;
   bool should_delete_current_entry(int not_dir = -1);
-  void ll_finish_sync() override;
 };
 
 } // namespace mirror

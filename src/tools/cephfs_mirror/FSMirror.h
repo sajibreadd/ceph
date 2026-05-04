@@ -95,6 +95,7 @@ public:
 
   // admin socket helpers
   void mirror_status(Formatter *f);
+  void client_status(Formatter *f);
 
   void reopen_logs();
 

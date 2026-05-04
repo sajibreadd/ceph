@@ -1772,6 +1772,7 @@ int SyncMechanism::ll_cleanup_remote_entry() {
     }
     auto d_name = std::string(de.d_name);
     if (d_name == "." || d_name == "..") {
+      ceph_ll_forget(replayer->m_remote_mount, r_inode_raw, 1);
       continue;
     }
     std::shared_ptr<PeerReplayer::SyncEntry> d_entry =
@@ -2064,6 +2065,7 @@ int SyncMechanism::ll_propagate_deleted_entries(int &cache_size) {
     }
     std::string d_name = de.d_name;
     if (d_name == "." || d_name == "..") {
+      ceph_ll_forget(fh.p_mnt, p_inode_raw, 1);
       continue;
     }
     if (!replayer->turn_off_assert) {
@@ -2549,6 +2551,10 @@ int PeerReplayer::sync_perms(const std::string& path) {
 }
 
 void PeerReplayer::DirSyncPool::activate() {
+  {
+    std::scoped_lock lock(mtx);
+    active = true;
+  }
   for (int i = 0; i < num_threads; ++i) {
     dir_scanners.emplace_back(new DirScanner());
     dir_scanners[i]->stop_called = false;
@@ -2932,7 +2938,7 @@ int SyncMechanism::ll_populate_prev_stat_and_prev_inode() {
     r = replayer->ll_open_inode(
         fh.p_mnt, cur_entry->fh.ll_info.p_info, cur_entry->pstx,
         (cur_entry->pstat_known ? 0 : mask), fh.ll_info.p_perms);
-    if (!replayer->turn_off_assert) {
+    if (!replayer->turn_off_assert && r == 0) {
       ceph_assert(!cur_entry->fh.ll_info.p_info.gap);
     }
     if (r < 0 && r != -ENOENT) {
@@ -3137,14 +3143,13 @@ int DirSyncMechanism::ll_sync_tree() {
         break;
       }
     }
+    cur_entry = nullptr;
     r = ll_go_next();
     if (r < 0) {
       r1 = r;
       break;
     }
   }
-finish:
-  ll_finish_sync();
   return r1;
 }
 
@@ -3248,94 +3253,39 @@ int DirSnapDiffSync::ll_go_next() {
     std::shared_ptr<PeerReplayer::SyncEntry> &entry = m_sync_stack.top();
     dout(20) << ": top of stack path=" << entry->epath << dendl;
     std::string e_name;
-    ceph_snapdiff_entry_t sd_entry;
-    bool failed = false;
-    while (true) {
-      r = 0;
-      if (replayer->should_backoff(registry, &r)) {
-        return r;
-      }
-      r = ceph_readdir_snapdiff(&entry->info, &sd_entry);
-      if (r < 0) {
-        derr << ": failed to read snapdiff entry between snapdiff of local "
-                "snapshot's cur entry="
-             << abs_path(registry->dir_root, entry->epath, fh.m_current.first,
-                         replayer->m_cct)
-             << "and diff base's cur entry="
-             << abs_path(registry->dir_root, entry->epath, (*fh.m_prev).first,
-                         replayer->m_cct)
-             << ": " << cpp_strerror(r) << dendl;
-        if (replayer->skip_error) {
-          registry->set_failed(r);
-          failed = true;
-          r = 0; break;
-        }
-        return r;
-      }
-      if (r == 0) {
-        break;
-      }
-      std::string d_name = sd_entry.dir_entry.d_name;
-      if (d_name == "." || d_name == "..") {
-        continue;
-      }
-      e_name = d_name;
-      break;
+    int d_status, d_type;
+    r = 0;
+    if (replayer->should_backoff(registry, &r)) {
+      return r;
     }
-    std::string epath = std::move(entry_path(entry->epath, e_name));
-
-    if (entry->deleted_sibling_exist && !failed) {
-      ceph_assert(entry->deleted_sibling.snapid == (*fh.m_prev).second);
-      std::string deleted_sibling_d_name =
-          entry->deleted_sibling.dir_entry.d_name;
-      if (r == 0 || sd_entry.snapid == (*fh.m_prev).second ||
-          e_name != deleted_sibling_d_name) {
-        std::shared_ptr<PeerReplayer::SyncEntry> deleted_entry =
-            std::make_shared<PeerReplayer::SyncEntry>(
-                std::move(entry_path(entry->epath, deleted_sibling_d_name)));
-        deleted_entry->rollout(entry->fh, deleted_sibling_d_name, replayer);
-        deleted_entry->prev_d_type =
-            (int)deleted_entry->deleted_sibling.dir_entry.d_type;
-        SyncMechanism *syncm = new LL_DeleteMechanism(
-            replayer->m_local_mount, std::move(deleted_entry), registry,
-            sync_stat, fh, replayer);
-        registry->sync_pool->sync_anyway(syncm, local_stat, local_batch);
-        entry->deleted_sibling_exist = false;
-      }
-    }
-    if (r == 0) {
-      dout(10) << ": done for directory=" << entry->epath << dendl;
-      r = ceph_close_snapdiff(&entry->info);
-      if (r < 0) {
-        derr << ": failed to close snapdiff info between snapdiff of local "
-                "snapshot's cur entry="
-             << abs_path(registry->dir_root, entry->epath, fh.m_current.first,
-                         replayer->m_cct)
-             << "and diff base's cur entry="
-             << abs_path(registry->dir_root, entry->epath, (*fh.m_prev).first,
-                         replayer->m_cct)
-             << ": " << cpp_strerror(r) << dendl;
-      }
-      r = 0;
+    if (entry->snapdiff_map.empty()) {
       m_sync_stack.pop();
       continue;
     }
-
-    if (sd_entry.snapid == (*fh.m_prev).second) {
-      entry->deleted_sibling = sd_entry;
-      entry->deleted_sibling_exist = true;
+    auto it = entry->snapdiff_map.begin();
+    e_name = it->first;
+    d_status = it->second.first;
+    d_type = it->second.second;
+    entry->snapdiff_map.erase(it);
+    if (d_status == -1) {
+      std::shared_ptr<PeerReplayer::SyncEntry> deleted_entry =
+          std::make_shared<PeerReplayer::SyncEntry>(
+              std::move(entry_path(entry->epath, e_name)));
+      deleted_entry->rollout(entry->fh, e_name, replayer);
+      deleted_entry->prev_d_type = d_type;
+      SyncMechanism *syncm = new LL_DeleteMechanism(
+          replayer->m_local_mount, std::move(deleted_entry), registry,
+          sync_stat, fh, replayer);
+      registry->sync_pool->sync_anyway(syncm, local_stat, local_batch);
       continue;
     }
     std::shared_ptr<PeerReplayer::SyncEntry> d_entry =
-        std::make_shared<PeerReplayer::SyncEntry>(std::move(epath));
+        std::make_shared<PeerReplayer::SyncEntry>(
+            std::move(entry_path(entry->epath, e_name)));
     d_entry->rollout(entry->fh, e_name, replayer);
-    if (entry->deleted_sibling_exist &&
-        sd_entry.snapid == fh.m_current.second &&
-        e_name == entry->deleted_sibling.dir_entry.d_name) {
-      ceph_assert(entry->deleted_sibling.snapid == (*fh.m_prev).second);
+    if (d_status == 0) {
       d_entry->change_mask |= PeerReplayer::SyncEntry::PURGE_REMOTE;
-      d_entry->prev_d_type = (int)entry->deleted_sibling.dir_entry.d_type;
-      entry->deleted_sibling_exist = false;
+      d_entry->prev_d_type = d_type;
     }
     SyncMechanism *syncm =
         new DirSnapDiffSync(replayer->m_local_mount, std::move(d_entry),
@@ -3549,11 +3499,65 @@ int DirSnapDiffSync::ll_sync_current_entry() {
          << ": " << cpp_strerror(r) << dendl;
     return r;
   }
-  cur_entry->is_snapdiff = true;
-  cur_entry->set_remote_synced();
-  m_sync_stack.emplace(std::move(cur_entry));
+  ceph_snapdiff_entry_t sd_entry;
+  auto& snapdiff_map = cur_entry->snapdiff_map;
+  while (true) {
+    r = 0;
+    if (replayer->should_backoff(registry, &r)) {
+      break;
+    }
+    r = ceph_readdir_snapdiff(&cur_entry->info, &sd_entry);
+    if (r < 0) {
+      derr << ": failed to read snapdiff entry between snapdiff of local "
+              "snapshot's cur entry="
+           << abs_path(registry->dir_root, cur_entry->epath, fh.m_current.first,
+                       replayer->m_cct)
+           << "and diff base's cur entry="
+           << abs_path(registry->dir_root, cur_entry->epath, (*fh.m_prev).first,
+                       replayer->m_cct)
+           << ": " << cpp_strerror(r) << dendl;
+      break;
+    }
+    if (r == 0) {
+      break;
+    }
+    std::string d_name = sd_entry.dir_entry.d_name;
+    if (d_name == "." || d_name == "..") {
+      continue;
+    }
+    auto it = snapdiff_map.find(d_name);
+    if (it == snapdiff_map.end()) {
+      snapdiff_map[d_name] = {
+          ((sd_entry.snapid == (*fh.m_prev).second) ? -1 : +1),
+          ((sd_entry.snapid == (*fh.m_prev).second)
+               ? (int)sd_entry.dir_entry.d_type
+               : -1)};
+    } else {
+      if (it->second.first == 0 ||
+          (it->second.first == -1 && sd_entry.snapid == (*fh.m_prev).second) ||
+          (it->second.first == +1 && sd_entry.snapid == fh.m_current.second)) {
+        continue;
+      }
+      it->second.first = 0;
+      if (sd_entry.snapid == (*fh.m_prev).second) {
+        it->second.second = (int)sd_entry.dir_entry.d_type;
+      }
+    }
+  }
+  int close_err = ceph_close_snapdiff(&cur_entry->info);
+  if (close_err < 0) {
+    derr << ": failed to close snapdiff for directory="
+         << abs_path(registry->dir_root, cur_entry->epath, fh.m_current.first,
+                     replayer->m_cct)
+         << ": " << cpp_strerror(close_err) << dendl;
+  }
+  if (r == 0) {
+    cur_entry->is_snapdiff = true;
+    cur_entry->set_remote_synced();
+    m_sync_stack.emplace(std::move(cur_entry));
+  }
   cur_entry = nullptr;
-  return 0;
+  return r < 0 ? r : 0;
 }
 
 int DirSnapDiffSync::sync_current_entry() {
@@ -3642,22 +3646,6 @@ int DirSnapDiffSync::sync_current_entry() {
   return 0;
 }
 
-void DirSnapDiffSync::ll_finish_sync() {
-  while (!m_sync_stack.empty()) {
-    auto &entry = m_sync_stack.top();
-    if (entry->is_snapdiff) {
-      int r = ceph_close_snapdiff(&(entry->info));
-      if (r < 0) {
-        derr << ": failed to close snapdiff for directory="
-             << abs_path(registry->dir_root, entry->epath, fh.m_current.first,
-                         replayer->m_cct)
-             << ": " << cpp_strerror(r) << dendl;
-      }
-    }
-    m_sync_stack.pop();
-  }
-}
-
 void DirSnapDiffSync::finish_sync() {
 
   while (!m_sync_stack.empty()) {
@@ -3709,6 +3697,7 @@ int DirBruteDiffSync::ll_go_next() {
       }
       auto d_name = std::string(de.d_name);
       if (d_name == "." || d_name == "..") {
+        ceph_ll_forget(replayer->m_local_mount, c_inode_raw, 1);
         continue;
       }
       e_name = d_name;
@@ -4587,11 +4576,12 @@ void PeerReplayer::sync_directory(
   if (last_snap.second != cur_snap.second) {
     dout(10) << ": synchronizing snap-id=" << cur_snap.second
              << "of directory=" << dir_root << dendl;
-    dout(0) << ": cur_snap.first=" << cur_snap.first << ", "
+    dout(0) << ": dir_root=" << dir_root
+            << ", cur_snap.first=" << cur_snap.first << ", "
             << "cur_snap.second=" << cur_snap.second
             << ", last_snap.first=" << last_snap.first
             << ", last_snap.second=" << last_snap.second << dendl;
-    r = _do_sync_snaps(dir_root, cur_snap, last_snap);    
+    r = _do_sync_snaps(dir_root, cur_snap, last_snap);
   }
 
 

@@ -1,6 +1,6 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
-
+#include "common/ceph_json.h"
 #include "common/admin_socket.h"
 #include "common/ceph_argparse.h"
 #include "common/ceph_context.h"
@@ -65,6 +65,19 @@ private:
   FSMirror *fs_mirror;
 };
 
+class ClientStatusCommand : public MirrorAdminSocketCommand {
+public:
+  explicit ClientStatusCommand(FSMirror *fs_mirror) : fs_mirror(fs_mirror) {}
+
+  int call(Formatter *f) override {
+    fs_mirror->client_status(f);
+    return 0;
+  }
+
+private:
+  FSMirror *fs_mirror;
+};
+
 } // anonymous namespace
 
 class MirrorAdminSocketHook : public AdminSocketHook {
@@ -81,6 +94,12 @@ public:
     if (r == 0) {
       commands[cmd] = new StatusCommand(fs_mirror);
     }
+    cmd = "client status";
+    r = admin_socket->register_command(cmd, this,
+                                       "provide the source client's status");
+    if (r == 0) {
+      commands[cmd] = new ClientStatusCommand(fs_mirror);
+    }
   }
 
   ~MirrorAdminSocketHook() override {
@@ -94,6 +113,7 @@ public:
            const bufferlist&,
            Formatter *f, std::ostream &errss, bufferlist &out) override {
     auto p = commands.at(std::string(command));
+    std::cout << "--->" << command << std::endl;
     return p->call(f);
   }
 
@@ -453,6 +473,20 @@ void FSMirror::remove_peer(const Peer &peer) {
   }
   if (m_perf_counters) {
     m_perf_counters->dec(l_cephfs_mirror_fs_mirror_peers);
+  }
+}
+
+void FSMirror::client_status(Formatter *f) {
+  char* buf;
+  if (m_mount) {
+    int r = ceph_client_status(m_mount, &buf);
+    if (r == 0) {
+      JSONParser parser;
+      parser.parse(buf, std::strlen(buf));
+      JSONFormattable jf;
+      jf.decode_json(&parser);
+      jf.encode_json("", f);
+    }
   }
 }
 
