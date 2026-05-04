@@ -2201,6 +2201,8 @@ int ceph_get_snap_info(struct ceph_mount_info *cmount,
  * @param snap_info snapshot info struct (fetched via call to ceph_get_snap_info()).
  */
 void ceph_free_snap_info_buffer(struct snap_info *snap_info);
+
+int ceph_client_status(struct ceph_mount_info *cmount, char** buf);
 #ifdef __cplusplus
 }
 #endif

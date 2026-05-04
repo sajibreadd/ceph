@@ -239,6 +239,11 @@ int Client::CommandHook::call(
       m_client->_kick_stale_sessions();
     else if (command == "status")
       m_client->dump_status(f);
+    else if (command == "sync_fs") {
+      m_client->_sync_fs();
+    } else if (command == "trim_cache") {
+      m_client->trim_cache();
+    }
     else
       ceph_abort_msg("bad command registered");
   }
@@ -396,6 +401,11 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
 
   caps_release_delay = cct->_conf.get_val<std::chrono::seconds>(
     "client_caps_release_delay");
+
+  enable_readdir_cache =
+        cct->_conf.get_val<bool>("client_enable_readdir_cache");
+  ldout(cct, 0) << __func__ << ": enable_readdir_cache=" << enable_readdir_cache
+                << dendl;
 
   if (cct->_conf->client_acl_type == "posix_acl")
     acl_type = POSIX_ACL;
@@ -568,6 +578,22 @@ void Client::dump_cache(Formatter *f)
     f->close_section();
 }
 
+void Client::dump_status(char** buf) {
+  std::scoped_lock l{client_lock};
+  JSONFormatter f;
+  f.open_object_section("result");
+  dump_status(&f);
+  f.close_section();
+  std::stringstream ss;
+  f.flush(ss);
+  std::string data = ss.str();
+  *buf = static_cast<char*>(std::malloc(data.size() + 1));
+  if (*buf == nullptr) {
+    return;
+  }
+  std::memcpy(*buf, data.c_str(), data.size() + 1);
+}
+
 void Client::dump_status(Formatter *f)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
@@ -592,6 +618,8 @@ void Client::dump_status(Formatter *f)
     f->dump_stream("inst_str") << inst.name << " " << inst.addr.get_legacy_str();
     f->dump_string("addr_str", inst.addr.get_legacy_str());
     f->dump_int("inode_count", inode_map.size());
+    f->dump_unsigned("inode_ref_openned", inode_ref_openned);
+    f->dump_unsigned("inode_ref_closed", inode_ref_closed);
     f->dump_int("mds_epoch", mdsmap->get_epoch());
     f->dump_int("osd_epoch", osd_epoch);
     f->dump_int("osd_epoch_barrier", cap_epoch_barrier);
@@ -685,6 +713,18 @@ void Client::_finish_init()
   ret = admin_socket->register_command("status",
 				       &m_command_hook,
 				       "show overall client status");
+  if (ret < 0) {
+    lderr(cct) << "error registering admin socket command: "
+	       << cpp_strerror(-ret) << dendl;
+  }
+  ret =
+      admin_socket->register_command("sync_fs", &m_command_hook, "sync the fs");
+  if (ret < 0) {
+    lderr(cct) << "error registering admin socket command: "
+               << cpp_strerror(-ret) << dendl;
+  }
+  ret = admin_socket->register_command("trim_cache", &m_command_hook,
+                                       "trim cache");
   if (ret < 0) {
     lderr(cct) << "error registering admin socket command: "
 	       << cpp_strerror(-ret) << dendl;
@@ -9270,7 +9310,7 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
     return 0;
   }
 
-  vector<DentryRef>::iterator pd = std::lower_bound(dir->readdir_cache.begin(),
+  vector<Dentry*>::iterator pd = std::lower_bound(dir->readdir_cache.begin(),
 						  dir->readdir_cache.end(),
 						  dirp->offset, dentry_off_lt());
 
@@ -9281,7 +9321,7 @@ int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
       return -CEPHFS_EAGAIN;
     if (pd == dir->readdir_cache.end())
       break;
-    Dentry *dn = pd->get();
+    Dentry *dn = *pd;
     if (dn->inode == NULL) {
       ldout(cct, 15) << " skipping null '" << dn->name << "'" << dendl;
       ++pd;
@@ -9390,7 +9430,7 @@ int Client::readdir_r_cb(dir_result_t* d,
     want,
     flags,
     getref,
-    false);
+    !enable_readdir_cache);
 }
 
 //
@@ -12490,6 +12530,7 @@ void Client::_ll_get(Inode *in)
 {
   if (in->ll_ref == 0) {
     in->iget();
+    inode_ref_openned++;
     if (in->is_dir() && !in->dentries.empty()) {
       ceph_assert(in->dentries.size() == 1); // dirs can't be hard-linked
       in->get_first_parent()->get(); // pin dentry
@@ -12507,20 +12548,18 @@ int Client::_ll_put(Inode *in, uint64_t num)
   in->ll_put(num);
   ldout(cct, 20) << __func__ << " " << in << " " << in->ino << " " << num << " -> " << in->ll_ref << dendl;
   if (in->ll_ref == 0) {
+    inode_ref_closed++;
+    in->move_to_unpinned();
     if (in->is_dir() && !in->dentries.empty()) {
       ceph_assert(in->dentries.size() == 1); // dirs can't be hard-linked
       in->get_first_parent()->put(); // unpin dentry
     }
-    in->move_to_unpinned();
     if (in->snapid != CEPH_NOSNAP) {
       auto p = ll_snap_ref.find(in->snapid);
       ceph_assert(p != ll_snap_ref.end());
       ceph_assert(p->second > 0);
       if (--p->second == 0)
 	ll_snap_ref.erase(p);
-    }
-    if (in->dir) {
-      in->dir->readdir_cache.clear();
     }
     put_inode(in);
     return 0;
@@ -16386,6 +16425,7 @@ const char** Client::get_tracked_conf_keys() const
     "client_caps_release_delay", \
     "client_deleg_break_on_open", \
     "client_deleg_timeout", \
+    "client_enable_readdir_cache", \
     "client_mount_timeout", \
     "client_oc_max_dirty", \
     "client_oc_max_dirty_age", \
@@ -16458,6 +16498,12 @@ void Client::handle_conf_change(const ConfigProxy& conf,
   if (changed.count("client_mount_timeout")) {
     mount_timeout = cct->_conf.get_val<std::chrono::seconds>(
       "client_mount_timeout");
+  }
+  if (changed.count("client_enable_readdir_cache")) {
+    enable_readdir_cache =
+        cct->_conf.get_val<bool>("client_enable_readdir_cache");
+    ldout(cct, 0) << __func__
+                  << ": enable_readdir_cache=" << enable_readdir_cache << dendl;
   }
 }
 

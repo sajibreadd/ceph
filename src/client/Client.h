@@ -313,6 +313,7 @@ public:
     gid_t gid = group_id >= 0 ? group_id : -1;
     return UserPerm(uid, gid);
   }
+  void dump_status(char** buf);
 
   int mount(const std::string &mount_root, const UserPerm& perms,
 	    bool require_mds=false, const std::string &fs_name="");
@@ -939,6 +940,8 @@ public:
   std::unique_ptr<MDSMap> mdsmap;
 
   bool _collect_and_send_global_metrics;
+  uint64_t inode_ref_openned = 0;
+  uint64_t inode_ref_closed = 0;
 
 protected:
   struct walk_dentry_result {
@@ -1646,6 +1649,7 @@ private:
 
   ceph::coarse_mono_time last_auto_reconnect;
   std::chrono::seconds caps_release_delay, mount_timeout;
+  bool enable_readdir_cache = true;
   // trace generation
   std::ofstream traceout;
 

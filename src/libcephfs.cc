@@ -2385,3 +2385,12 @@ extern "C" void ceph_free_snap_info_buffer(struct snap_info *snap_info) {
   }
   free(snap_info->snap_metadata);
 }
+
+extern "C" int ceph_client_status(struct ceph_mount_info *cmount, char** buf) {
+  if (!cmount->is_mounted()) {
+    /* we set errno to signal errors. */
+    return -ENOTCONN;
+  }
+  cmount->get_client()->dump_status(buf);
+  return 0;
+}
