@@ -510,6 +510,16 @@ private:
     uint32_t offset_hash,
     unsigned req_flags,
     bufferlist& dirbl);
+  struct SnapdiffEntryInfo {
+    CDentry* dn = nullptr;
+    CInode* in = nullptr;
+    bool exists = false;
+    utime_t mtime;
+
+    void reset() {
+      *this = SnapdiffEntryInfo();
+    }
+  };
   bool build_snap_diff(
     MDRequestRef& mdr,
     CDir* dir,
@@ -518,7 +528,9 @@ private:
     snapid_t snapid_before,
     snapid_t snapid,
     const bufferlist& dnbl,
-    std::function<bool(CDentry*, CInode*, bool)> add_result_cb);
+    bool *retry,
+    std::function<bool(const std::vector<SnapdiffEntryInfo> &)>
+        add_result_cb);
 
   MDSRank *mds;
   MDCache *mdcache;
