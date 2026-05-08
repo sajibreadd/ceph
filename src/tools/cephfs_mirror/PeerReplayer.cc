@@ -4670,7 +4670,7 @@ int PeerReplayer::get_candidate_snap(
   }
 
   if (sync_latest_snapshot) {
-    if (it == local_snap_map.end()) {
+    if (!local_snap_map.empty() && it == local_snap_map.end()) {
       it = prev(local_snap_map.end());
       for (;; it--) {
         if (it->second.starts_with(snap_prefix)) {
@@ -4707,7 +4707,13 @@ int PeerReplayer::get_candidate_snap(
   }
 
   if (last_snap.second != cur_snap.second) {
-    dout(0) << ": diff_base=" << diff_base
+    dout(0) << ": dir=" << dir_root << ", diff_base=" << diff_base
+            << ", last_snap_id=" << last_snap.second
+            << ", dirty_snap_id=" << dirty_snap_id
+            << ", cur_snap_id=" << cur_snap.second << dendl;
+  }
+  else {
+    dout(2) << ": dir=" << dir_root << ", diff_base=" << diff_base
             << ", last_snap_id=" << last_snap.second
             << ", dirty_snap_id=" << dirty_snap_id
             << ", cur_snap_id=" << cur_snap.second << dendl;
@@ -4936,6 +4942,11 @@ void PeerReplayer::run_scan() {
                                m_directories.size() > m_registered.size() &&
                                !m_directories.empty());
     });
+    dout(2) << ": 1-->start_syncing=" << start_syncing
+            << ", nr_replayers=" << nr_replayers
+            << ", total_directories=" << m_directories.size()
+            << ", registered_directories=" << m_registered.size()
+            << ", idx=" << idx << dendl;
     if (is_stopping()) {
       dout(5) << ": exiting" << dendl;
       break;
@@ -4959,6 +4970,11 @@ void PeerReplayer::run_scan() {
       dout(5) << ": exiting" << dendl;
       break;
     }
+    dout(2) << ": 2-->start_syncing=" << start_syncing
+            << ", nr_replayers=" << nr_replayers
+            << ", total_directories=" << m_directories.size()
+            << ", registered_directories=" << m_registered.size()
+            << ", idx=" << idx << dendl;
 
     if (!(start_syncing && nr_replayers > 0 &&
           m_directories.size() > m_registered.size() &&
@@ -4986,11 +5002,21 @@ void PeerReplayer::run_scan() {
         idx = (int)m_directories.size() - 1;
       }
     }
+    dout(2) << ": 3-->start_syncing=" << start_syncing
+            << ", nr_replayers=" << nr_replayers
+            << ", total_directories=" << m_directories.size()
+            << ", registered_directories=" << m_registered.size()
+            << ", idx=" << idx << dendl;
 
     for (int i = 0; i < (int)m_directories.size() && nr_replayers > 0 &&
                     m_directories.size() > m_registered.size();
          ++i, idx = (idx + 1) % m_directories.size()) {
       next_dir = m_directories[idx];
+      dout(2) << ": 4-->start_syncing=" << start_syncing
+              << ", nr_replayers=" << nr_replayers
+              << ", total_directories=" << m_directories.size()
+              << ", registered_directories=" << m_registered.size()
+              << ", idx=" << idx << ", next_dir=" << next_dir << dendl;
       // dout(0) << "idx=" << idx << ", next_dir=" << next_dir
       //         << ", registered=" << m_registered.size()
       //         << ", total=" << m_directories.size() << dendl;
@@ -5039,6 +5065,11 @@ void PeerReplayer::run_scan() {
       }
     }
     next_dir = m_directories[idx];
+    dout(2) << ": 5-->start_syncing=" << start_syncing
+            << ", nr_replayers=" << nr_replayers
+            << ", total_directories=" << m_directories.size()
+            << ", registered_directories=" << m_registered.size()
+            << ", idx=" << idx << ", next_dir=" << next_dir << dendl;
     last_scan = clock::now();
   }
 }
