@@ -94,7 +94,7 @@ public:
     if (r == 0) {
       commands[cmd] = new StatusCommand(fs_mirror);
     }
-    cmd = "client status";
+    cmd = "client status " + stringify(filesystem.fs_name) + "@" + stringify(filesystem.fscid);
     r = admin_socket->register_command(cmd, this,
                                        "provide the source client's status");
     if (r == 0) {
@@ -113,7 +113,6 @@ public:
            const bufferlist&,
            Formatter *f, std::ostream &errss, bufferlist &out) override {
     auto p = commands.at(std::string(command));
-    std::cout << "--->" << command << std::endl;
     return p->call(f);
   }
 
