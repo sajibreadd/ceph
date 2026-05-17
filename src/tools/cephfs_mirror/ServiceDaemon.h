@@ -34,7 +34,10 @@ public:
   void add_or_update_peer_attribute(fs_cluster_id_t fscid, const Peer &peer,
                                     std::string_view key, AttributeValue value);
   void update_peer_info(fs_cluster_id_t fscid, const Peer &peer,
-                          const SnapSyncStatMap &status_map);
+                           const SnapSyncStatMap &status_map);
+  std::string get_instance_id() const {
+    return m_instance_id;
+  }
   const char **get_tracked_conf_keys() const override;
   void handle_conf_change(const ConfigProxy &conf,
                           const std::set<std::string> &changed) override;
@@ -62,6 +65,7 @@ private:
   std::map<fs_cluster_id_t, Filesystem> m_filesystems;
   int status_update_period = 2;
   std::string host_name = "none";
+  std::string m_instance_id;
   std::mutex config_lock;
 
   void start_update_job();
