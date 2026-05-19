@@ -318,3 +318,28 @@ options:
   default: false
   services:
   - cephfs-mirror
+- name: cephfs_mirror_round_robin_cost_window
+  type: uint
+  level: advanced
+  desc: this is cost window
+  long_desc: this is cost window 
+  default: 4_M
+  services:
+  - cephfs-mirror
+  min: 1
+- name: cephfs_mirror_round_robin_io_cost
+  type: uint
+  level: advanced
+  desc: this is cost window
+  long_desc: this is cost window 
+  default: 0
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_apply_drr_balance
+  type: bool
+  level: advanced
+  desc: if this true, drr balance will be applied
+  long_desc: if this true, drr balance will be applied
+  default: false
+  services:
+  - cephfs-mirror
