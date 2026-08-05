@@ -246,7 +246,11 @@ int Client::CommandHook::call(
       m_client->_kick_stale_sessions();
     else if (command == "status")
       m_client->dump_status(f);
-    else
+    else if (command == "sync_fs") {
+      m_client->_sync_fs();
+    } else if (command == "trim_cache") {
+      m_client->trim_cache();
+    } else
       ceph_abort_msg("bad command registered");
   }
   f->close_section();
@@ -424,6 +428,11 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
   caps_release_delay = cct->_conf.get_val<std::chrono::seconds>(
     "client_caps_release_delay");
 
+  enable_readdir_cache =
+        cct->_conf.get_val<bool>("client_enable_readdir_cache");
+  ldout(cct, 0) << __func__ << ": enable_readdir_cache=" << enable_readdir_cache
+                << dendl;
+
   if (cct->_conf->client_acl_type == "posix_acl")
     acl_type = POSIX_ACL;
 
@@ -593,6 +602,22 @@ void Client::dump_cache(Formatter *f)
     f->close_section();
 }
 
+void Client::dump_status(char** buf) {
+  std::scoped_lock l{client_lock};
+  JSONFormatter f;
+  f.open_object_section("result");
+  dump_status(&f);
+  f.close_section();
+  std::stringstream ss;
+  f.flush(ss);
+  std::string data = ss.str();
+  *buf = static_cast<char*>(std::malloc(data.size() + 1));
+  if (*buf == nullptr) {
+    return;
+  }
+  std::memcpy(*buf, data.c_str(), data.size() + 1);
+}
+
 void Client::dump_status(Formatter *f)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
@@ -617,6 +642,8 @@ void Client::dump_status(Formatter *f)
     f->dump_stream("inst_str") << inst.name << " " << inst.addr.get_legacy_str();
     f->dump_string("addr_str", inst.addr.get_legacy_str());
     f->dump_int("inode_count", inode_map.size());
+    f->dump_unsigned("inode_ref_openned", inode_ref_openned);
+    f->dump_unsigned("inode_ref_closed", inode_ref_closed);
     f->dump_int("mds_epoch", mdsmap->get_epoch());
     f->dump_int("osd_epoch", osd_epoch);
     f->dump_int("osd_epoch_barrier", cap_epoch_barrier);
@@ -710,6 +737,18 @@ void Client::_finish_init()
   ret = admin_socket->register_command("status",
 				       &m_command_hook,
 				       "show overall client status");
+  if (ret < 0) {
+    lderr(cct) << "error registering admin socket command: "
+	       << cpp_strerror(-ret) << dendl;
+  }
+  ret =
+      admin_socket->register_command("sync_fs", &m_command_hook, "sync the fs");
+  if (ret < 0) {
+    lderr(cct) << "error registering admin socket command: "
+               << cpp_strerror(-ret) << dendl;
+  }
+  ret = admin_socket->register_command("trim_cache", &m_command_hook,
+                                       "trim cache");
   if (ret < 0) {
     lderr(cct) << "error registering admin socket command: "
 	       << cpp_strerror(-ret) << dendl;
@@ -1623,7 +1662,8 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
 	dirp->cache_index++;
       }
       // add to cached result list
-      dirp->buffer.push_back(dir_result_t::dentry(dn->offset, dname, dn->alternate_name, in));
+      dirp->buffer.push_back(
+          dir_result_t::dentry(dn->offset, dname, dn->alternate_name, in, dn));
       ldout(cct, 15) << __func__ << "  " << hex << dn->offset << dec << ": '" << dname << "' -> " << in->ino << dendl;
     }
 
@@ -6258,6 +6298,7 @@ out:
 
 int Client::may_open(const InodeRef& in, int flags, const UserPerm& perms)
 {
+  std::string str_path;
   ldout(cct, 20) << __func__ << " " << *in << "; " << perms << dendl;
   unsigned want = 0;
 
@@ -6292,6 +6333,12 @@ int Client::may_open(const InodeRef& in, int flags, const UserPerm& perms)
     goto out;
 
   r = inode_permission(in, perms, want);
+  if (r == -ENOENT || r == ENOENT) {
+    in->make_path_string(str_path);
+    ldout(cct, 0) << __func__ << "-->inode_permission, "
+                  << "r=" << r << ", str_path=" << str_path << ", "
+                  << cpp_strerror(r) << dendl;
+  }
 out:
   ldout(cct, 3) << __func__ << " " << in << " = " << r <<  dendl;
   return r;
@@ -8057,6 +8104,7 @@ int Client::_getattr(const InodeRef& in, int mask, const UserPerm& perms, bool f
     return 0;
 
   MetaRequest *req = new MetaRequest(CEPH_MDS_OP_GETATTR);
+  std::string str_path;
   filepath path;
   in->make_nosnap_relative_path(path);
   req->set_filepath(path);
@@ -8064,6 +8112,13 @@ int Client::_getattr(const InodeRef& in, int mask, const UserPerm& perms, bool f
   req->head.args.getattr.mask = mask;
   
   int res = make_request(req, perms);
+  if (res == -ENOENT || res == ENOENT) {
+    in->make_path_string(str_path);
+    ldout(cct, 0) << __func__ << "-->"
+                  << "r=" << res << ", path=" << path
+                  << ", str_path=" << str_path << ", " << cpp_strerror(res)
+                  << dendl;
+  }
   ldout(cct, 10) << __func__ << " result=" << res << dendl;
   return res;
 }
@@ -9620,7 +9675,7 @@ int Client::readdir_r_cb(dir_result_t* d,
     want,
     flags,
     getref,
-    false);
+    !enable_readdir_cache);
 }
 
 //
@@ -10561,6 +10616,7 @@ void Client::_put_fh(Fh *f)
 int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
 		  const UserPerm& perms)
 {
+  std::string str_path;
   if (in->snapid != CEPH_NOSNAP &&
       (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND))) {
     return -EROFS;
@@ -10590,6 +10646,11 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
       ldout(cct, 20) << __func__ << " absolute path: " << path << dendl;
       result = mds_check_access(path, perms, mask);
       if (result) {
+        if (result == -ENOENT || result == ENOENT) {
+          ldout(cct, 0) << __func__ << "-->1, "
+                        << "r=" << result << ", path=" << path << ", "
+                        << cpp_strerror(result) << dendl;
+        }
         return result;
       }
       // update wanted?
@@ -10613,6 +10674,13 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
     req->head.args.open.old_size = in->size;   // for O_TRUNC
     req->set_inode(in);
     result = make_request(req, perms);
+    if (result == -ENOENT || result == ENOENT) {
+      in->make_path_string(str_path);
+      ldout(cct, 0) << __func__ << "-->2, "
+                    << "r=" << result << ", path=" << path
+                    << ", str_path=" << str_path << ", " << cpp_strerror(result)
+                    << dendl;
+    }
 
     /*
      * NFS expects that delegations will be broken on a conflicting open,
@@ -10637,6 +10705,13 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
 	ldout(cct, 8) << "Unable to get caps after open of inode " << *in <<
 			  " . Denying open: " <<
 			  cpp_strerror(result) << dendl;
+        if (result == -ENOENT || result == ENOENT) {
+          in->make_path_string(str_path);
+          ldout(cct, 0) << __func__ << "-->3, "
+                        << "r=" << result << ", path=" << path
+                        << ", str_path=" << str_path << ", "
+                        << cpp_strerror(result) << dendl;
+        }
       } else {
 	put_cap_ref(in.get(), need);
       }
@@ -13549,6 +13624,7 @@ void Client::_ll_get(Inode *in)
 {
   if (in->ll_ref == 0) {
     in->iget();
+    inode_ref_openned++;
     if (in->is_dir() && !in->dentries.empty()) {
       ceph_assert(in->dentries.size() == 1); // dirs can't be hard-linked
       in->get_first_parent()->get(); // pin dentry
@@ -13556,6 +13632,7 @@ void Client::_ll_get(Inode *in)
     if (in->snapid != CEPH_NOSNAP)
       ll_snap_ref[in->snapid]++;
   }
+  in->move_to_pinnned();
   in->ll_get();
   ldout(cct, 20) << __func__ << " " << in << " " << in->ino << " -> " << in->ll_ref << dendl;
 }
@@ -13565,6 +13642,8 @@ int Client::_ll_put(Inode *in, uint64_t num)
   in->ll_put(num);
   ldout(cct, 20) << __func__ << " " << in << " " << in->ino << " " << num << " -> " << in->ll_ref << dendl;
   if (in->ll_ref == 0) {
+    inode_ref_closed++;
+    in->move_to_unpinned();
     if (in->is_dir() && !in->dentries.empty()) {
       ceph_assert(in->dentries.size() == 1); // dirs can't be hard-linked
       in->get_first_parent()->put(); // unpin dentry
@@ -17580,6 +17659,7 @@ std::vector<std::string> Client::get_tracked_keys() const noexcept
     "client_caps_release_delay",
     "client_deleg_break_on_open",
     "client_deleg_timeout",
+    "client_enable_readdir_cache",
     "client_mount_timeout",
     "client_oc_max_dirty",
     "client_oc_max_dirty_age",
@@ -17640,6 +17720,12 @@ void Client::handle_conf_change(const ConfigProxy& conf,
   if (changed.count("client_mount_timeout")) {
     mount_timeout = cct->_conf.get_val<std::chrono::seconds>(
       "client_mount_timeout");
+  }
+  if (changed.count("client_enable_readdir_cache")) {
+    enable_readdir_cache =
+        cct->_conf.get_val<bool>("client_enable_readdir_cache");
+    ldout(cct, 0) << __func__
+                  << ": enable_readdir_cache=" << enable_readdir_cache << dendl;
   }
 }
 

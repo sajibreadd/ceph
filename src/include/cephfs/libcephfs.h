@@ -2146,6 +2146,13 @@ int ceph_ll_setlk(struct ceph_mount_info *cmount,
 
 int ceph_ll_lazyio(struct ceph_mount_info *cmount, Fh *fh, int enable);
 
+int ceph_ll_open_snapdiff(
+    struct ceph_mount_info* cmount,
+    Inode* in1,
+    Inode* in2,
+    struct ceph_snapdiff_info* out,
+    const UserPerm* perms);
+
 /*
  * Delegation support
  *
@@ -2327,6 +2334,8 @@ void ceph_free_snap_info_buffer(struct snap_info *snap_info);
  * @perf_dump buffer using free().
  */
 int ceph_get_perf_counters(struct ceph_mount_info *cmount, char **perf_dump);
+
+int ceph_client_status(struct ceph_mount_info *cmount, char** buf);
 
 #ifdef __cplusplus
 }
