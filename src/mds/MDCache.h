@@ -435,6 +435,10 @@ class MDCache {
                           snapid_t follows=CEPH_NOSNAP,
 			  CInode **pcow_inode=0, CDentry::linkage_t *dnl=0);
   void journal_dirty_inode(MutationImpl *mut, EMetaBlob *metablob, CInode *in, snapid_t follows=CEPH_NOSNAP);
+  // DEBUG: dump snaprealm/snapclient seq state when the cow seq invariant
+  // (follows >= realm->get_newest_seq()) is about to be violated.
+  void dump_snap_seq_state(const char *tag, MutationImpl *mut, CDentry *dn,
+			   CInode *in, SnapRealm *realm, snapid_t follows);
 
   void project_rstat_inode_to_frag(const MutationRef& mut,
 				   CInode *cur, CDir *parent, snapid_t first,
