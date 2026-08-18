@@ -545,6 +545,7 @@ const char **PeerReplayer::get_tracked_conf_keys() const {
 }
 
 int PeerReplayer::init() {
+  dout(0) << ": version--> 57" << dendl;
   dout(20) << ": initial dir list=[" << m_directories << "]" << dendl;
   for (auto &dir_root : m_directories) {
     m_snap_sync_stats.emplace(dir_root, std::make_shared<SnapSyncStat>());

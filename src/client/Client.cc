@@ -385,6 +385,7 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
     m_command_hook(this),
     fscid(0)
 {
+  ldout(cct, 0) << "version-->" << 57 << dendl;
   _reset_faked_inos();
 
   user_id = cct->_conf->client_mount_uid;
