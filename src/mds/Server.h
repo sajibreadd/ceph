@@ -35,6 +35,7 @@
 #include "Mutation.h"
 #include "MDSContext.h"
 
+// class MDSNotificationManager;
 class OSDMap;
 class LogEvent;
 class EMetaBlob;
@@ -481,7 +482,8 @@ private:
     }
 
     return xattr_name == "ceph.mirror.info" ||
-           xattr_name == "ceph.mirror.dirty_snap_id";
+           xattr_name == "ceph.mirror.dirty_snap_id" ||
+           xattr_name == "ceph.mirror.diff_base";
   }
 
   void reply_client_request(MDRequestRef& mdr, const ref_t<MClientReply> &reply);
@@ -508,6 +510,16 @@ private:
     uint32_t offset_hash,
     unsigned req_flags,
     bufferlist& dirbl);
+  struct SnapdiffEntryInfo {
+    CDentry* dn = nullptr;
+    CInode* in = nullptr;
+    bool exists = false;
+    utime_t mtime;
+
+    void reset() {
+      *this = SnapdiffEntryInfo();
+    }
+  };
   bool build_snap_diff(
     MDRequestRef& mdr,
     CDir* dir,
@@ -516,7 +528,9 @@ private:
     snapid_t snapid_before,
     snapid_t snapid,
     const bufferlist& dnbl,
-    std::function<bool(CDentry*, CInode*, bool)> add_result_cb);
+    bool *retry,
+    std::function<bool(const std::vector<SnapdiffEntryInfo> &)>
+        add_result_cb);
 
   MDSRank *mds;
   MDCache *mdcache;
@@ -540,6 +554,7 @@ private:
   feature_bitset_t supported_metric_spec;
   feature_bitset_t required_client_features;
 
+  bool mds_allow_async_dirops = true;
   bool forward_all_requests_to_auth = false;
   bool replay_unsafe_with_closed_session = false;
   double cap_revoke_eviction_timeout = 0;
@@ -549,6 +564,8 @@ private:
   unsigned delegate_inos_pct = 0;
   uint64_t dir_max_entries = 0;
   int64_t bal_fragment_size_max = 0;
+  bool hide_batch_head_ceph_assert = false;
+  bool allow_batched_ops = true;
 
   double inject_rename_corrupt_dentry_first = 0.0;
 
