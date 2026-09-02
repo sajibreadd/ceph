@@ -2236,6 +2236,39 @@ extern "C" uint64_t ceph_ll_get_internal_offset(class ceph_mount_info *cmount,
   return (cmount->get_client()->ll_get_internal_offset(in, blockno));
 }
 
+extern "C" int
+ceph_ll_open_snapdiff(
+    struct ceph_mount_info* cmount,
+    Inode* in1,
+    Inode* in2,
+    struct ceph_snapdiff_info* out,
+    const UserPerm* perms)
+{
+  if (!cmount->is_mounted()) {
+    errno = ENOTCONN;
+    return -errno;
+  }
+  if (!out || !in1 || !in2 || in1->snapid == CEPH_NOSNAP ||
+      in2->snapid == CEPH_NOSNAP) {
+    errno = EINVAL;
+    return -errno;
+  }
+  out->cmount = cmount;
+  out->dir1 = out->dir_aux = nullptr;
+  int r = ceph_ll_opendir(cmount, in1, &(out->dir1), perms);
+  if (r != 0) {
+    errno = ENOENT;
+    return -errno;
+  }
+  r = ceph_ll_opendir(cmount, in2, &(out->dir_aux), perms);
+  if (r != 0) {
+    ceph_close_snapdiff(out);
+    errno = ENOENT;
+    return -errno;
+  }
+  return 0;
+}
+
 extern "C" void ceph_buffer_free(char *buf)
 {
   if (buf) {
@@ -2351,4 +2384,13 @@ extern "C" void ceph_free_snap_info_buffer(struct snap_info *snap_info) {
     free((void *)snap_info->snap_metadata[i].key); // malloc'd memory is key+value composite
   }
   free(snap_info->snap_metadata);
+}
+
+extern "C" int ceph_client_status(struct ceph_mount_info *cmount, char** buf) {
+  if (!cmount->is_mounted()) {
+    /* we set errno to signal errors. */
+    return -ENOTCONN;
+  }
+  cmount->get_client()->dump_status(buf);
+  return 0;
 }
