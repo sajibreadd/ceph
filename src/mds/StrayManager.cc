@@ -37,6 +37,30 @@ static ostream& _prefix(std::ostream *_dout, MDSRank *mds) {
   return *_dout << "mds." << mds->get_nodeid() << ".cache.strays ";
 }
 
+static void dump_purge_ref_mismatch(MDSRank *mds, const char *phase, CInode *in,
+                                    int expected_in_refs, CDentry *dn,
+                                    int expected_dn_refs) {
+  int in_refs = in->get_num_ref();
+  int dn_refs = dn->get_num_ref();
+  const char *side =
+      in_refs != expected_in_refs
+          ? (dn_refs != expected_dn_refs ? "inode+dentry" : "inode")
+          : "dentry";
+
+  derr << __func__ << ": stray purge reference mismatch"
+       << ", phase=" << phase << ", side=" << side << ", inode_refs=" << in_refs
+       << "/" << expected_in_refs << ", dentry_refs=" << dn_refs << "/"
+       << expected_dn_refs << dendl;
+  derr << __func__ << ": phase=" << phase
+       << ", inode (named pins and state): " << *in << dendl;
+  derr << __func__ << ": phase=" << phase
+       << ", dentry (named pins and state): " << *dn << dendl;
+  derr << __func__ << ": phase=" << phase
+       << ", expected dentry refs: dirty=" << !!dn->is_dirty()
+       << ", fragmenting=" << !!dn->state_test(CDentry::STATE_FRAGMENTING)
+       << ", inodepin=" << !!in_refs << ", purging=1" << dendl;
+}
+
 class StrayManagerIOContext : public virtual MDSIOContextBase {
 protected:
   StrayManager *sm;
@@ -219,6 +243,12 @@ void StrayManager::_purge_stray_purged(
       // is being purged (aside from it were 
 
       derr << "Rogue reference after purge to " << *dn << dendl;
+      int expected_in_refs = (int)in->is_dirty();
+      int expected_dn_refs = (int)dn->is_dirty() +
+                             !!dn->state_test(CDentry::STATE_FRAGMENTING) +
+                             !!in->get_num_ref() + 1; /* PIN_PURGING */
+      dump_purge_ref_mismatch(mds, "purge-queue-callback", in, expected_in_refs,
+                              dn, expected_dn_refs);
       ceph_abort_msg("rogue reference to purging inode");
     }
 
@@ -261,6 +291,15 @@ void StrayManager::_purge_stray_logged(CDentry *dn, version_t pdv, MutationRef& 
   ceph_assert(!dir->is_frozen_dir());
 
   bool new_dn = dn->is_new();
+
+  int expected_in_refs = (int)in->is_dirty();
+  if (in->get_num_ref() != expected_in_refs) {
+    int expected_dn_refs = (int)dn->is_dirty() +
+                           !!dn->state_test(CDentry::STATE_FRAGMENTING) +
+                           !!in->get_num_ref() + 1; /* PIN_PURGING */
+    dump_purge_ref_mismatch(mds, "purge-log-callback", in, expected_in_refs, dn,
+                            expected_dn_refs);
+  }
 
   // unlink
   ceph_assert(dn->get_projected_linkage()->is_null());
@@ -791,4 +830,3 @@ void StrayManager::_truncate_stray_logged(CDentry *dn, MutationRef& mut)
   if (!dn->state_test(CDentry::STATE_PURGING) &&  mds->is_stopping())
     mds->mdcache->shutdown_export_stray_finish(in->ino());
 }
-
