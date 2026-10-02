@@ -264,6 +264,7 @@ Server::Server(MDSRank *m, MetricsHandler *metrics_handler) :
 {
   forward_all_requests_to_auth = g_conf().get_val<bool>("mds_forward_all_requests_to_auth");
   replay_unsafe_with_closed_session = g_conf().get_val<bool>("mds_replay_unsafe_with_closed_session");
+  allow_batched_ops = g_conf().get_val<bool>("mds_allow_batched_ops");
   cap_revoke_eviction_timeout = g_conf().get_val<double>("mds_cap_revoke_eviction_timeout");
   max_snaps_per_dir = g_conf().get_val<uint64_t>("mds_max_snaps_per_dir");
   delegate_inos_pct = g_conf().get_val<uint64_t>("mds_client_delegate_inos_pct");
@@ -275,6 +276,20 @@ Server::Server(MDSRank *m, MetricsHandler *metrics_handler) :
   bal_fragment_size_max = g_conf().get_val<int64_t>("mds_bal_fragment_size_max");
   supported_features = feature_bitset_t(CEPHFS_FEATURES_MDS_SUPPORTED);
   supported_metric_spec = feature_bitset_t(CEPHFS_METRIC_FEATURES_ALL);
+  hide_batch_head_ceph_assert = g_conf().get_val<bool>("mds_hide_batch_head_ceph_assert");
+  // connection_t conn("localhost:9093", true, "admin", "admin-secret",
+  //                std::nullopt, std::nullopt);
+  // MDSAsyncNotificationManager::create(mds->cct);
+  // MDSSyncNotificationManager::create(mds->cct);
+  // notification_manager = std::make_unique<MDSNotificationManager>(mds);
+  // topic_ptr = MDSKafkaTopic::create(
+  //   "my-topic", mds->cct,
+  //   connection_t("localhost:9093", true, "admin", "admin-secret",
+  //                std::optional<std::string>(
+  //                    "/home/sajibreadd/croit/certs-kafka/ca-cert"),
+  //                std::optional<std::string>("PLAIN")));
+  // udp_sender =
+  //   MDSUDPNotificationSender::create("udp", mds->cct, "127.0.0.1", 8080);
 }
 
 void Server::dispatch(const cref_t<Message> &m)
@@ -1319,8 +1334,14 @@ void Server::evict_cap_revoke_non_responders() {
 }
 
 void Server::handle_conf_change(const std::set<std::string>& changed) {
+  if (changed.count("mds_allow_async_dirops")){
+    mds_allow_async_dirops = g_conf().get_val<bool>("mds_allow_async_dirops");
+  }
   if (changed.count("mds_forward_all_requests_to_auth")){
     forward_all_requests_to_auth = g_conf().get_val<bool>("mds_forward_all_requests_to_auth");
+  }
+  if (changed.count("mds_allow_batched_ops")) {
+    allow_batched_ops = g_conf().get_val<bool>("mds_allow_batched_ops");
   }
   if (changed.count("mds_cap_revoke_eviction_timeout")) {
     cap_revoke_eviction_timeout = g_conf().get_val<double>("mds_cap_revoke_eviction_timeout");
@@ -1368,6 +1389,11 @@ void Server::handle_conf_change(const std::set<std::string>& changed) {
   }
   if (changed.count("mds_inject_rename_corrupt_dentry_first")) {
     inject_rename_corrupt_dentry_first = g_conf().get_val<double>("mds_inject_rename_corrupt_dentry_first");
+  }
+  if (changed.count("mds_hide_batch_head_ceph_assert")) {
+    hide_batch_head_ceph_assert = g_conf().get_val<bool>("mds_hide_batch_head_ceph_assert");
+    dout(0) << ": mds_hide_batch_head_ceph_assert changed to-->"
+            << hide_batch_head_ceph_assert << dendl;
   }
 }
 
@@ -2045,7 +2071,7 @@ void Server::journal_and_reply(MDRequestRef& mdr, CInode *in, CDentry *dn, LogEv
     mdr->set_queued_next_replay_op();
     mds->queue_one_replay();
   } else if (mdr->did_early_reply)
-    mds->locker->drop_rdlocks_for_early_reply(mdr.get());
+    mds->locker->handle_locks_for_early_reply(mdr.get());
   else
     mdlog->flush();
 }
@@ -2479,7 +2505,7 @@ void Server::set_reply_extra_bl(const cref_t<MClientRequest> &req, inodeno_t ino
 {
   Session *session = mds->get_session(req);
 
-  if (session->info.has_feature(CEPHFS_FEATURE_DELEG_INO)) {
+  if (mds_allow_async_dirops && session->info.has_feature(CEPHFS_FEATURE_DELEG_INO)) {
     openc_response_t ocresp;
 
     dout(10) << "adding created_ino and delegated_inos" << dendl;
@@ -2656,6 +2682,9 @@ void Server::dispatch_client_request(MDRequestRef& mdr)
 
   if (mdr->killed) {
     // Should already be reset in request_cleanup().
+    if (hide_batch_head_ceph_assert) {
+      return;
+    }
     ceph_assert(!mdr->is_batch_head());
     return;
   } else if (mdr->aborted) {
@@ -4085,7 +4114,7 @@ void Server::handle_client_getattr(MDRequestRef& mdr, bool is_lookup)
   if (mask & CEPH_STAT_RSTAT)
     want_auth = true; // set want_auth for CEPH_STAT_RSTAT mask
 
-  if (!mdr->is_batch_head() && mdr->can_batch()) {
+  if (!mdr->is_batch_head() && allow_batched_ops && mdr->can_batch()) {
     CF_MDS_RetryRequestFactory cf(mdcache, mdr, false);
     int r = mdcache->path_traverse(mdr, cf, mdr->get_filepath(),
 				   (want_auth ? MDS_TRAVERSE_WANT_AUTH : 0),
@@ -4594,6 +4623,9 @@ void Server::handle_client_open(MDRequestRef& mdr)
     mds->locker->check_inode_max_size(cur);
 
   // make sure this inode gets into the journal
+  mds->notification_manager->push_notification(
+    mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_OPEN | CEPH_MDS_NOTIFY_ACCESS,
+    true, cur->is_dir());
   if (cur->is_auth() && cur->last == CEPH_NOSNAP &&
       mdcache->open_file_table.should_log_open(cur)) {
     EOpen *le = new EOpen(mds->mdlog);
@@ -4755,7 +4787,7 @@ void Server::handle_client_openc(MDRequestRef& mdr)
   if (!check_dir_max_entries(mdr, dir))
     return;
 
-  if (mdr->dn[0].size() == 1)
+  if (mds_allow_async_dirops && mdr->dn[0].size() == 1)
     mds->locker->create_lock_cache(mdr, diri, &mdr->dir_layout);
 
   // create inode.
@@ -4809,6 +4841,10 @@ void Server::handle_client_openc(MDRequestRef& mdr)
   C_MDS_openc_finish *fin = new C_MDS_openc_finish(this, mdr, dn, newi);
 
   set_reply_extra_bl(req, _inode->ino, mdr->reply_extra_bl);
+
+  mds->notification_manager->push_notification(
+    mds->get_nodeid(), newi, CEPH_MDS_NOTIFY_CREATE | CEPH_MDS_NOTIFY_OPEN,
+    true, newi->is_dir());
 
   journal_and_reply(mdr, newi, dn, le, fin);
 
@@ -5487,7 +5523,11 @@ void Server::handle_client_setattr(MDRequestRef& mdr)
   le->metablob.add_client_req(req->get_reqid(), req->get_oldest_client_tid());
   mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
-  
+
+  mds->notification_manager->push_notification(
+    mds->get_nodeid(), cur,
+    CEPH_MDS_NOTIFY_SET_ATTRIB | CEPH_MDS_NOTIFY_ACCESS, true, cur->is_dir());
+
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur,
 								   truncating_smaller, changed_ranges));
 
@@ -5552,6 +5592,11 @@ void Server::do_open_truncate(MDRequestRef& mdr, int cmode)
     ceph_assert(mdr->dn[0].size());
     dn = mdr->dn[0].back();
   }
+
+  mds->notification_manager->push_notification(mds->get_nodeid(), in,
+                                        CEPH_MDS_NOTIFY_MODIFY |
+                                            CEPH_MDS_NOTIFY_ACCESS |
+                                            CEPH_MDS_NOTIFY_OPEN, true, in->is_dir());
 
   journal_and_reply(mdr, in, dn, le, new C_MDS_inode_update_finish(this, mdr, in, old_size > 0,
 								   changed_ranges));
@@ -5642,6 +5687,9 @@ void Server::handle_client_setlayout(MDRequestRef& mdr)
   le->metablob.add_client_req(req->get_reqid(), req->get_oldest_client_tid());
   mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
+
+  mds->notification_manager->push_notification(
+    mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_SET_LAYOUT, true, cur->is_dir());
   
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
@@ -5760,6 +5808,10 @@ void Server::handle_client_setdirlayout(MDRequestRef& mdr)
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
   mdr->no_early_reply = true;
+
+  mds->notification_manager->push_notification(
+    mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_SET_LAYOUT, true, cur->is_dir());
+
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
 
@@ -6414,6 +6466,9 @@ void Server::handle_client_setvxattr(MDRequestRef& mdr, CInode *cur)
   mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
+  mds->notification_manager->push_notification(
+    mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_SET_XATTRIB, true, cur->is_dir());
+
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur,
 								   false, false, adjust_realm));
   return;
@@ -6697,6 +6752,9 @@ void Server::handle_client_setxattr(MDRequestRef& mdr)
   mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
+  mds->notification_manager->push_notification(
+    mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_SET_XATTRIB, true, cur->is_dir());
+
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
 
@@ -6766,6 +6824,9 @@ void Server::handle_client_removexattr(MDRequestRef& mdr)
   le->metablob.add_client_req(req->get_reqid(), req->get_oldest_client_tid());
   mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
+
+  mds->notification_manager->push_notification(
+    mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_REM_XATTRIB, true, cur->is_dir());
 
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
@@ -7082,6 +7143,11 @@ void Server::handle_client_mknod(MDRequestRef& mdr)
 				    PREDIRTY_PRIMARY|PREDIRTY_DIR, 1);
   le->metablob.add_primary_dentry(dn, newi, true, true, true);
 
+  mds->notification_manager->push_notification(mds->get_nodeid(), newi,
+                                               CEPH_MDS_NOTIFY_CREATE |
+                                                   CEPH_MDS_NOTIFY_SET_ATTRIB,
+                                               true, newi->is_dir());
+
   journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(this, mdr, dn, newi));
   mds->balancer->maybe_fragment(dn->get_dir(), false);
 }
@@ -7093,7 +7159,6 @@ void Server::handle_client_mknod(MDRequestRef& mdr)
 void Server::handle_client_mkdir(MDRequestRef& mdr)
 {
   const cref_t<MClientRequest> &req = mdr->client_request;
-
   mdr->disable_lock_cache();
   CDentry *dn = rdlock_path_xlock_dentry(mdr, true);
   if (!dn)
@@ -7174,6 +7239,9 @@ void Server::handle_client_mkdir(MDRequestRef& mdr)
   // make sure this inode gets into the journal
   le->metablob.add_opened_ino(newi->ino());
 
+  mds->notification_manager->push_notification(
+    mds->get_nodeid(), newi, CEPH_MDS_NOTIFY_CREATE, true, newi->is_dir());
+
   journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(this, mdr, dn, newi));
 
   // We hit_dir (via hit_inode) in our finish callback, but by then we might
@@ -7237,6 +7305,9 @@ void Server::handle_client_symlink(MDRequestRef& mdr)
   journal_allocated_inos(mdr, &le->metablob);
   mdcache->predirty_journal_parents(mdr, &le->metablob, newi, dn->get_dir(), PREDIRTY_PRIMARY|PREDIRTY_DIR, 1);
   le->metablob.add_primary_dentry(dn, newi, true, true);
+
+  mds->notification_manager->push_notification(
+    mds->get_nodeid(), newi, CEPH_MDS_NOTIFY_CREATE, true, newi->is_dir());
 
   journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(this, mdr, dn, newi));
   mds->balancer->maybe_fragment(dir, false);
@@ -7369,6 +7440,10 @@ void Server::handle_client_link(MDRequestRef& mdr)
   // go!
   ceph_assert(g_conf()->mds_kill_link_at != 1);
 
+  mds->notification_manager->push_notification_link(
+    mds->get_nodeid(), targeti, destdn, CEPH_MDS_NOTIFY_SET_ATTRIB,
+    CEPH_MDS_NOTIFY_CREATE, targeti->is_dir());
+
   // local or remote?
   if (targeti->is_auth()) 
     _link_local(mdr, destdn, targeti, target_realm);
@@ -7434,7 +7509,6 @@ void Server::_link_local(MDRequestRef& mdr, CDentry *dn, CInode *targeti, SnapRe
 
   // do this after predirty_*, to avoid funky extra dnl arg
   dn->push_projected_linkage(targeti->ino(), targeti->d_type());
-
   journal_and_reply(mdr, targeti, dn, le,
 		    new C_MDS_link_local_finish(this, mdr, dn, targeti, dnpv, tipv, adjust_realm));
 }
@@ -7557,7 +7631,6 @@ void Server::_link_remote(MDRequestRef& mdr, bool inc, CDentry *dn, CInode *targ
     le->metablob.add_null_dentry(dn, true);
     dn->push_projected_linkage();
   }
-
   journal_and_reply(mdr, (inc ? targeti : nullptr), dn, le,
 		    new C_MDS_link_remote_finish(this, mdr, inc, dn, targeti));
 }
@@ -7963,7 +8036,6 @@ void Server::handle_client_unlink(MDRequestRef& mdr)
 {
   const cref_t<MClientRequest> &req = mdr->client_request;
   client_t client = mdr->get_client();
-
   // rmdir or unlink?
   bool rmdir = (req->get_op() == CEPH_MDS_OP_RMDIR);
 
@@ -8101,14 +8173,20 @@ void Server::handle_client_unlink(MDRequestRef& mdr)
       return;  // we're waiting for a witness.
   }
 
-  if (!rmdir && dnl->is_primary() && mdr->dn[0].size() == 1)
+  if (mds_allow_async_dirops && !rmdir && dnl->is_primary() && mdr->dn[0].size() == 1)
     mds->locker->create_lock_cache(mdr, diri);
+
+  mds->notification_manager->push_notification_link(
+      mds->get_nodeid(), in, dn, CEPH_MDS_NOTIFY_SET_ATTRIB,
+      CEPH_MDS_NOTIFY_DELETE, in->is_dir());
+
 
   // ok!
   if (dnl->is_remote() && !dnl->get_inode()->is_auth()) 
     _link_remote(mdr, false, dn, dnl->get_inode());
   else
     _unlink_local(mdr, dn, straydn);
+
 }
 
 class C_MDS_unlink_local_finish : public ServerLogContext {
@@ -8212,7 +8290,6 @@ void Server::_unlink_local(MDRequestRef& mdr, CDentry *dn, CDentry *straydn)
     ceph_assert(straydn);
     mdcache->project_subtree_rename(in, dn->get_dir(), straydn->get_dir());
   }
-
   journal_and_reply(mdr, 0, dn, le, new C_MDS_unlink_local_finish(this, mdr, dn, straydn));
 }
 
@@ -9138,6 +9215,9 @@ void Server::handle_client_rename(MDRequestRef& mdr)
 
   // -- commit locally --
   C_MDS_rename_finish *fin = new C_MDS_rename_finish(this, mdr, srcdn, destdn, straydn);
+
+  mds->notification_manager->push_notification_move(mds->get_nodeid(), srcdn,
+                                               destdn, srci->is_dir());
 
   journal_and_reply(mdr, srci, destdn, le, fin);
   mds->balancer->maybe_fragment(destdn->get_dir(), false);
@@ -11109,6 +11189,10 @@ void Server::handle_client_mksnap(MDRequestRef& mdr)
   le->metablob.add_table_transaction(TABLE_SNAP, stid);
   mdcache->predirty_journal_parents(mdr, &le->metablob, diri, 0, PREDIRTY_PRIMARY, false);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, diri);
+  
+  mds->notification_manager->push_notification_snap(
+    mds->get_nodeid(), diri, std::string(snapname),
+    CEPH_MDS_NOTIFY_CREATE | CEPH_MDS_NOTIFY_SET_ATTRIB, diri->is_dir());
 
   // journal the snaprealm changes
   submit_mdlog_entry(le, new C_MDS_mksnap_finish(this, mdr, diri, info),
@@ -11243,6 +11327,10 @@ void Server::handle_client_rmsnap(MDRequestRef& mdr)
   le->metablob.add_table_transaction(TABLE_SNAP, stid);
   mdcache->predirty_journal_parents(mdr, &le->metablob, diri, 0, PREDIRTY_PRIMARY, false);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, diri);
+
+  mds->notification_manager->push_notification_snap(
+    mds->get_nodeid(), diri, std::string(snapname),
+    CEPH_MDS_NOTIFY_DELETE | CEPH_MDS_NOTIFY_SET_ATTRIB, diri->is_dir());
 
   submit_mdlog_entry(le, new C_MDS_rmsnap_finish(this, mdr, diri, snapid),
                      mdr, __func__);
@@ -11466,7 +11554,7 @@ void Server::handle_client_readdir_snapdiff(MDRequestRef& mdr)
     offset_hash = (__u32)req->head.args.snapdiff.offset_hash;
   }
 
-  dout(10) << " frag " << fg << " offset '" << offset_str << "'"
+  dout(10) << __func__ << " frag " << fg << " offset '" << offset_str << "'"
     << " offset_hash " << offset_hash << " flags " << req_flags << dendl;
 
   // does the frag exist?
@@ -11536,7 +11624,7 @@ void Server::handle_client_readdir_snapdiff(MDRequestRef& mdr)
   unsigned max_bytes = req->head.args.snapdiff.max_bytes;
   if (!max_bytes)
     // make sure at least one item can be encoded
-    max_bytes = (512 << 10) + mds->mdsmap->get_max_xattr_size();
+    max_bytes = ((512 << 10) + mds->mdsmap->get_max_xattr_size()) << 1;
 
   // start final blob
   bufferlist dirbl;
@@ -11623,57 +11711,60 @@ void Server::_readdir_diff(
     std::swap(snapid, snapid_prev);
   }
   bool from_the_beginning = !offset_hash && offset_str.empty();
-  // skip all dns < dentry_key_t(snapid, offset_str, offset_hash)
-  dentry_key_t skip_key(snapid_prev, offset_str.c_str(), offset_hash);
+  // skip all dns <= dentry_key_t(*, offset_str, offset_hash)
+  dentry_key_t skip_key(CEPH_NOSNAP, offset_str.c_str(), offset_hash);
+  bool retry = false;
 
   bool end = build_snap_diff(
-    mdr,
-    dir,
-    bytes_left,
-    from_the_beginning ? nullptr : & skip_key,
-    snapid_prev,
-    snapid,
-    dnbl,
-    [&](CDentry* dn, CInode* in, bool exists) {
-      string name;
-      snapid_t effective_snapid;
-      const auto& dn_name = dn->get_name();
-      // provide the first snapid for removed entries and
-      // the last one for existent ones
-      effective_snapid = exists ? snapid : snapid_prev;
-      name.append(dn_name);
-      if ((int)(dnbl.length() + name.length() + sizeof(__u32) + sizeof(LeaseStat)) > bytes_left) {
-	dout(10) << " ran out of room, stopping at " << dnbl.length() << " < " << bytes_left << dendl;
-	return false;
-      }
+      mdr, dir, bytes_left, from_the_beginning ? nullptr : &skip_key,
+      snapid_prev, snapid, dnbl, &retry,
+      [&](const std::vector<SnapdiffEntryInfo> &dn_vec) {
+        uint64_t least_room_needed = 0;
+        for (const auto &entry_info : dn_vec) {
+          least_room_needed += (entry_info.dn->get_name().length() +
+                                sizeof(__u32) + sizeof(LeaseStat));
+        }
+        if (dnbl.length() + least_room_needed > (uint64_t)bytes_left) {
+          dout(10) << " ran out of room for name, stopping at " << dnbl.length()
+                   << " < " << bytes_left << dendl;
+          return false;
+        }
+        for (const auto &entry_info : dn_vec) {
+          auto dn = entry_info.dn;
+          auto in = entry_info.in;
+          auto exists = entry_info.exists;
+          string name;
+          snapid_t effective_snapid;
+          const auto &dn_name = dn->get_name();
+          // provide the first snapid for removed entries and
+          // the last one for existent ones
+          effective_snapid = exists ? snapid : snapid_prev;
+          name.append(dn_name);
+          auto diri = dir->get_inode();
+          auto hash = ceph_frag_value(diri->hash_dentry_name(dn_name));
+          dout(10) << "inc dn " << *dn << " as " << name << std::hex
+                   << " hash 0x" << hash << std::dec << " " << effective_snapid
+                   << dendl;
+          encode(name, dnbl);
+          mds->locker->issue_client_lease(dn, in, mdr, now, dnbl);
 
-      auto diri = dir->get_inode();
-      auto hash = ceph_frag_value(diri->hash_dentry_name(dn_name));
-      unsigned start_len = dnbl.length();
-      dout(10) << "inc dn " << *dn << " as " << name
-               << std::hex << " hash 0x" << hash << std::dec
-               << dendl;
-      encode(name, dnbl);
-      mds->locker->issue_client_lease(dn, in, mdr, now, dnbl);
+          // inode
+          dout(10) << "inc inode " << *in << " snap " << effective_snapid
+                   << dendl;
 
-      // inode
-      dout(10) << "inc inode " << *in << " snap "	<< effective_snapid << dendl;
-      int r = in->encode_inodestat(dnbl, mdr->session, realm, effective_snapid, bytes_left - (int)dnbl.length());
-      if (r < 0) {
-	// chop off dn->name, lease
-	dout(10) << " ran out of room, stopping at "
-	         << start_len << " < " << bytes_left << dendl;
-	bufferlist keep;
-	keep.substr_of(dnbl, 0, start_len);
-	dnbl.swap(keep);
-	return false;
-      }
-
-      // touch dn
-      mdcache->lru.lru_touch(dn);
-      ++numfiles;
-      return true;
-    });
+          // I know I am breaking rules of byte limit, but just adding at most
+          // two entries to get rid of rollback complexity in attempted fix:
+          // https://tracker.ceph.com/issues/72518
+          in->encode_inodestat(dnbl, mdr->session, realm, effective_snapid);
+          // touch dn
+          mdcache->lru.lru_touch(dn);
+          ++numfiles;
+        }
+        return true;
+      });
+  if (retry) {
+    return;
+  }
 
   __u16 flags = 0;
   if (req_flags & CEPH_READDIR_REPLY_BITFLAGS) {
@@ -11694,29 +11785,57 @@ bool Server::build_snap_diff(
   snapid_t snapid_prev,
   snapid_t snapid,
   const bufferlist& dnbl,
-  std::function<bool (CDentry*, CInode*, bool)> add_result_cb)
+  bool *retry,
+  std::function<bool(const std::vector<SnapdiffEntryInfo> &)>
+        add_result_cb)
 {
+  assert(retry);
   client_t client = mdr->client_request->get_source().num();
+  SnapdiffEntryInfo before;
 
-  struct EntryInfo {
-    CDentry* dn = nullptr;
-    CInode* in = nullptr;
-    utime_t mtime;
-
-    void reset() {
-      *this = EntryInfo();
+  auto insert_current = [&](SnapdiffEntryInfo &current,
+                            bool ignore_prev = false) {
+    if (before.dn) {
+      if (!ignore_prev) {
+        ceph_assert(before.dn->get_name() != current.dn->get_name());
+      } else {
+        ceph_assert(before.dn->get_name() == current.dn->get_name());
+      }
+      if (!ignore_prev && !add_result_cb({before})) {
+        return false;
+      }
+      before.reset();
     }
-  } before;
-
-  auto insert_deleted = [&](EntryInfo& ei) {
-    dout(20) << "build_snap_diff deleted file " << ei.dn->get_name() << " "
-      << ei.dn->first << "/" << ei.dn->last << dendl;
-    int r = add_result_cb(ei.dn, ei.in, false);
-    ei.reset();
-    return r;
+    if (!add_result_cb({current})) {
+      return false;
+    }
+    return true;
   };
 
-  auto it = !skip_key ? dir->begin() : dir->lower_bound(*skip_key);
+  auto insert_before = [&](SnapdiffEntryInfo& current) {
+    if (before.dn) {
+      ceph_assert(before.dn->get_name() != current.dn->get_name());
+      if (!add_result_cb({before})) {
+        return false;
+      }
+      before.reset();
+    }
+    before = current;
+    before.exists = false;
+    return true;
+  };
+
+  auto insert_both = [&](SnapdiffEntryInfo& current) {
+    ceph_assert(before.dn);
+    ceph_assert(before.dn->get_name() == current.dn->get_name());
+    if (!add_result_cb({before, current})) {
+      return false;
+    }
+    before.reset();
+    return true;
+  };
+
+  auto it = !skip_key ? dir->begin() : dir->upper_bound(*skip_key);
 
   while(it != dir->end()) {
     CDentry* dn = it->second;
@@ -11736,11 +11855,6 @@ bool Server::build_snap_diff(
     if (dn->last < snapid_prev || dn->first > snapid) {
       dout(20) << __func__ << " not in range, skipping" << dendl;
       continue;
-    }
-    if (skip_key) {
-      skip_key->snapid = dn->last;
-      if (!(*skip_key < dn->key()))
-	continue;
     }
 
     CInode* in = dnl->get_inode();
@@ -11773,6 +11887,7 @@ bool Server::build_snap_diff(
 	  mds->locker->drop_locks(mdr.get());
 	  mdr->drop_local_auth_pins();
 	  mdcache->open_remote_dentry(dn, dnp, new C_MDS_RetryRequest(mdcache, mdr));
+    *retry = true;
 	}
 	return false;
       }
@@ -11780,84 +11895,45 @@ bool Server::build_snap_diff(
     ceph_assert(in);
 
     utime_t mtime = in->get_inode()->mtime;
-
-    if (in->is_dir()) {
-
-      // we need to maintain the order of entries (determined by their name hashes)
-      // hence need to insert the previous entry if any immediately.
-      if (before.dn) {
-	if (!insert_deleted(before)) {
-	  break;
-	}
+    SnapdiffEntryInfo current{dn, in, true, mtime};
+    if (dn->first > snapid_prev && dn->last < snapid) {
+      continue;
+    } else if (dn->first <= snapid_prev && dn->last >= snapid) {
+      if (in->is_dir()) {
+        if (!insert_current(current)) {
+          return false;
+        }
       }
-
-      bool exists = true;
-      if (snapid_prev < dn->first && dn->last < snapid) {
-	dout(20) << __func__ << " skipping inner " << dn->get_name() << " "
-	  << dn->first << "/" << dn->last << dendl;
-	continue;
-      } else if (dn->first <= snapid_prev && dn->last < snapid) {
-	// dir deleted
-	dout(20) << __func__ << " deleted dir " << dn->get_name() << " "
-	  << dn->first << "/" << dn->last << dendl;
-	exists = false;
-      }
-      bool r = add_result_cb(dn, in, exists);
-      if (!r) {
-	break;
+    } else if (dn->first <= snapid_prev && dn->last < snapid) {
+      if (!insert_before(current)) {
+        return false;
       }
     } else {
-      if (snapid_prev >= dn->first && snapid <= dn->last) {
-	dout(20) << __func__ << " skipping unchanged " << dn->get_name() << " "
-	  << dn->first << "/" << dn->last << dendl;
-	continue;
-      } else if (snapid_prev < dn->first && snapid > dn->last) {
-	dout(20) << __func__ << " skipping inner modification " << dn->get_name() << " "
-	  << dn->first << "/" << dn->last << dendl;
-	continue;
-      }
+      ceph_assert(dn->first > snapid_prev && dn->last >= snapid);
       string_view name_before =
-        before.dn ? string_view(before.dn->get_name()) : string_view();
-      if (before.dn && dn->get_name() != name_before) {
-        if (!insert_deleted(before)) {
-          break;
+          before.dn ? string_view(before.dn->get_name()) : string_view();
+      if (name_before != dn->get_name()) {
+        if (!insert_current(current)) {
+          return false;
         }
-        before.reset();
-      }
-      if (snapid_prev >= dn->first && snapid_prev <= dn->last) {
-	dout(30) << __func__ << " dn_before " << dn->get_name() << " "
-	  << dn->first << "/" << dn->last << dendl;
-	before = EntryInfo {dn, in, mtime};
-	continue;
+      } else if (before.in->is_dir() || in->is_dir() ||
+          before.in->ino() != in->ino()) {
+        if (!insert_both(current)) {
+          return false;
+        }
+      } else if (before.mtime != mtime) {
+        if (!insert_current(current, true)) {
+          return false;
+        }
       } else {
-	if (before.dn && dn->get_name() == name_before) {
-	  if (mtime == before.mtime) {
-	    dout(30) << __func__ << " timestamp not changed " << dn->get_name() << " "
-	      << dn->first << "/" << dn->last
-	      << " " << mtime
-	      << dendl;
-	    before.reset();
-	    continue;
-	  } else {
-	    dout(30) << __func__ << " timestamp changed " << dn->get_name() << " "
-	      << dn->first << "/" << dn->last
-	      << " " << before.mtime << " vs. " << mtime
-	      << dendl;
-	    before.reset();
-	  }
-	}
-	dout(20) << __func__ << " new file " << dn->get_name() << " "
-	  << dn->first << "/" << dn->last
-	  << dendl;
-	ceph_assert(snapid >= dn->first && snapid <= dn->last);
-      }
-      if (!add_result_cb(dn, in, true)) {
-	break;
+        before.reset();
       }
     }
   }
   if (before.dn) {
-    insert_deleted(before);
+    if (!add_result_cb({before})) {
+      return false;
+    }
   }
-  return it == dir->end();
+  return true;
 }

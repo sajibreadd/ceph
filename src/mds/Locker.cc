@@ -91,7 +91,7 @@ void Locker::dispatch(const cref_t<Message> &m)
   case CEPH_MSG_CLIENT_CAPS:
     handle_client_caps(ref_cast<MClientCaps>(m));
     break;
-  case CEPH_MSG_CLIENT_CAPRELEASE:
+  case CEPH_MSG_CLIENT_CAPRELEASE: 
     handle_client_cap_release(ref_cast<MClientCapRelease>(m));
     break;
   case CEPH_MSG_CLIENT_LEASE:
@@ -742,16 +742,26 @@ void Locker::drop_non_rdlocks(MutationImpl *mut, set<CInode*> *pneed_issue)
     issue_caps_set(*pneed_issue);
 }
 
-void Locker::drop_rdlocks_for_early_reply(MutationImpl *mut)
+void Locker::handle_locks_for_early_reply(MutationImpl *mut)
 {
   set<CInode*> need_issue;
+  bool nudged = false;
+
+  dout(10) << __func__ << ": " << *mut << dendl;
 
   for (auto it = mut->locks.begin(); it != mut->locks.end(); ) {
+    SimpleLock *lock = it->lock;
+    if (!nudged) {
+      /* A request may finally early reply only after another request has
+       * triggered an unstable state change. We need to nudge the log now to
+       * move things along.
+       */
+      nudged = nudge_log(lock);
+    }
     if (!it->is_rdlock()) {
       ++it;
       continue;
     }
-    SimpleLock *lock = it->lock;
     // make later mksnap/setlayout (at other mds) wait for this unsafe request
     if (lock->get_type() == CEPH_LOCK_ISNAP ||
 	lock->get_type() == CEPH_LOCK_IPOLICY) {
@@ -1646,11 +1656,17 @@ bool Locker::rdlock_start(SimpleLock *lock, MDRequestRef& mut, bool as_anon)
   return false;
 }
 
-void Locker::nudge_log(SimpleLock *lock)
+bool Locker::nudge_log(SimpleLock *lock)
 {
-  dout(10) << "nudge_log " << *lock << " on " << *lock->get_parent() << dendl;
-  if (lock->get_parent()->is_auth() && lock->is_unstable_and_locked())    // as with xlockdone, or cap flush
+   // as with xlockdone, or cap flush
+  if (lock->get_parent()->is_auth() && lock->is_unstable_and_locked() && lock->has_any_waiter()) {
+    dout(10) << __func__ << " YES " << *lock << " on " << *lock->get_parent() << dendl;
     mds->mdlog->flush();
+    return true;
+  } else {
+    dout(20) << __func__ << " NO " << *lock << " on " << *lock->get_parent() << dendl;
+    return false;
+  }
 }
 
 void Locker::rdlock_finish(const MutationImpl::lock_iterator& it, MutationImpl *mut, bool *pneed_issue)
@@ -2893,6 +2909,8 @@ bool Locker::check_inode_max_size(CInode *in, bool force_wrlock,
       if (new_mtime > pi.inode->rstat.rctime)
 	pi.inode->rstat.rctime = new_mtime;
     }
+    mds->notification_manager->push_notification(
+      mds->get_nodeid(), in, CEPH_MDS_NOTIFY_MODIFY, false, in->is_dir());
   }
 
   // use EOpen if the file is still open; otherwise, use EUpdate.
@@ -3751,8 +3769,11 @@ void Locker::_update_cap_fields(CInode *in, int dirty, const cref_t<MClientCaps>
       dout(7) << "  mtime " << pi->mtime << " -> " << mtime
 	      << " for " << *in << dendl;
       pi->mtime = mtime;
-      if (mtime > pi->rstat.rctime)
-	pi->rstat.rctime = mtime;
+      if (mtime > pi->rstat.rctime) {
+	      pi->rstat.rctime = mtime;
+      }
+      mds->notification_manager->push_notification(
+        mds->get_nodeid(), in, CEPH_MDS_NOTIFY_MODIFY, false, in->is_dir());
     }
     if (in->is_file() &&   // ONLY if regular file
 	size > pi->size) {
@@ -3838,7 +3859,6 @@ bool Locker::_do_cap_update(CInode *in, Capability *cap,
   bool change_max = false;
   uint64_t old_max = latest->get_client_range(client);
   uint64_t new_max = old_max;
-  
   if (in->is_file()) {
     bool forced_change_max = false;
     dout(20) << "inode is file" << dendl;

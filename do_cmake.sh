@@ -69,7 +69,7 @@ fi
 cxx_compiler="g++"
 c_compiler="gcc"
 # 20 is used for more future-proof
-for i in $(seq 20 -1 11); do
+for i in $(seq 11 +1 20); do
   if type -t gcc-$i > /dev/null; then
     cxx_compiler="g++-$i"
     c_compiler="gcc-$i"
