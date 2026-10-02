@@ -589,3 +589,11 @@ options:
   - mds_client
   flags:
   - runtime
+- name: client_enable_readdir_cache
+  type: bool
+  level: advanced
+  desc: if this true, client readdir cache will be enabled
+  long_desc: if this true, client readdir cache will be enabled
+  default: true
+  services:
+  - mds_client

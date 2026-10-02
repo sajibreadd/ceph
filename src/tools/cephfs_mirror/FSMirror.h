@@ -93,8 +93,11 @@ public:
     return m_addrs;
   }
 
+  std::string get_daemon_id();
+
   // admin socket helpers
   void mirror_status(Formatter *f);
+  void client_status(Formatter *f);
 
   void reopen_logs();
 
